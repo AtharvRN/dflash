@@ -170,14 +170,6 @@ def main() -> None:
 
     if args.max_samples is not None and len(dataset) > args.max_samples:
         dataset = dataset.shuffle(seed=0).select(range(args.max_samples))
-    
-    target1 = AutoModelForCausalLM.from_pretrained(
-        "Qwen/Qwen3-Coder-30B-A3B-Instruct",
-        attn_implementation="flash_attention_2",
-        dtype=torch.float32,
-    ).to(device).eval()
-
-    time.sleep(2000)  # wait for all processes to be ready
 
     responses = []
     indices = range(dist.rank(), len(dataset), dist.size())
