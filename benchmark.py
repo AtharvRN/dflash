@@ -163,9 +163,6 @@ def main() -> None:
     ).to(device).eval()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
-    if tokenizer.mask_token_id is None:
-        tokenizer.add_special_tokens({"mask_token": "<|MASK|>"})
-
     dataset = load_and_process_dataset(args.dataset)
 
     if args.max_samples is not None and len(dataset) > args.max_samples:
@@ -187,7 +184,7 @@ def main() -> None:
                     model=draft_model,
                     target=target,
                     input_ids=input_ids,
-                    mask_token_id=tokenizer.mask_token_id,
+                    mask_token_id=draft_model.mask_token_id,
                     max_new_tokens=args.max_new_tokens,
                     block_size=block_size,
                     stop_token_ids=[tokenizer.eos_token_id],

@@ -160,6 +160,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.fc = nn.Linear(len(self.target_layer_ids) * config.hidden_size, config.hidden_size, bias=False)
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.block_size = config.block_size
+        self.mask_token_id = self.config.dflash_config.get("mask_token_id", None)
         self.post_init()
 
     def forward(
@@ -193,7 +194,6 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self,
         target: nn.Module,
         input_ids: torch.LongTensor,
-        mask_token_id: int,
         max_new_tokens: int,
         stop_token_ids: list[int],
         temperature: float,
@@ -205,7 +205,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         block_size = self.block_size
         output_ids = torch.full(
             (1, max_length + block_size),
-            mask_token_id,
+            self.mask_token_id,
             dtype=torch.long,
             device=target.device,
         )
@@ -267,7 +267,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             ):
                 break
         output_ids = output_ids[:, :max_length]
-        output_ids = output_ids[:, output_ids[0] != mask_token_id]
+        output_ids = output_ids[:, output_ids[0] != self.mask_token_id]
         if stop_token_ids is not None:
             stop_token_ids = torch.tensor(stop_token_ids, device=output_ids.device)
             stop_token_indices = torch.isin(output_ids[0][num_input_tokens:], stop_token_ids).nonzero(as_tuple=True)[0]

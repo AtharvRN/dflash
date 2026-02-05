@@ -92,12 +92,8 @@ target = AutoModelForCausalLM.from_pretrained(
     device_map="cuda:0"
 ).eval()
 
-# 3. Load Tokenizer
+# 3. Load Tokenizer and Prepare Input
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
-# Essential: Add the mask token required for diffusion steps
-tokenizer.add_special_tokens({"mask_token": "<|MASK|>"})
-
-# 4. Prepare Input
 prompt = "How many positive whole-number divisors does 196 have?"
 messages = [
     {"role": "user", "content": prompt}
@@ -111,14 +107,13 @@ text = tokenizer.apply_chat_template(
 )
 model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
 
-# 5. Run Speculative Decoding
+# 4. Run Speculative Decoding
 # The 'spec_generate' function is a custom method provided by the DFlash model
 generate_ids = model.spec_generate(
     input_ids=model_inputs["input_ids"], 
     max_new_tokens=2048, 
     temperature=0.0, 
     target=target, 
-    mask_token_id=tokenizer.mask_token_id, 
     stop_token_ids=[tokenizer.eos_token_id]
 )
 
