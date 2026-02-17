@@ -4,6 +4,7 @@ from typing import Any, List, Optional
 from torch import distributed as dist
 __all__ = [
     "init",
+    "destroy",
     "is_initialized",
     "size",
     "rank",
@@ -19,6 +20,17 @@ def init() -> None:
         warnings.warn("Environment variable `RANK` is not set. Skipping distributed initialization.")
         return
     dist.init_process_group(backend="nccl", init_method="env://")
+
+
+def destroy() -> None:
+    if not is_initialized():
+        return
+    try:
+        dist.barrier()
+    except Exception:
+        # Best effort barrier; still attempt to destroy to avoid NCCL warnings on exit.
+        pass
+    dist.destroy_process_group()
 
 
 def is_initialized() -> bool:

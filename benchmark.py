@@ -1,4 +1,5 @@
 import argparse
+import atexit
 import time
 import random
 from itertools import chain
@@ -148,6 +149,7 @@ def main() -> None:
     torch.backends.cudnn.benchmark = False
 
     dist.init()
+    atexit.register(dist.destroy)
     torch.cuda.set_device(dist.local_rank())
     device = torch.device(f"cuda:{dist.local_rank()}")
 
