@@ -1,5 +1,7 @@
 import argparse
 import atexit
+import builtins
+import os
 import time
 import random
 from itertools import chain
@@ -139,7 +141,34 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--local-files-only",
+        action="store_true",
+        help="Load model/tokenizer only from local cache; fail fast if missing.",
+    )
+    parser.add_argument(
+        "--log-all-ranks",
+        action="store_true",
+        help="Print setup timing logs from every rank (default: rank0 only).",
+    )
     args = parser.parse_args()
+
+    setup_t0 = time.perf_counter()
+
+    def setup_log(msg: str, *, pre_dist: bool = False) -> None:
+        if pre_dist:
+            builtins.print(f"[setup][pre-dist] +{time.perf_counter() - setup_t0:.2f}s {msg}", flush=True)
+            return
+        if args.log_all_ranks or dist.is_main():
+            builtins.print(
+                f"[setup][rank{dist.rank()}] +{time.perf_counter() - setup_t0:.2f}s {msg}",
+                flush=True,
+            )
+
+    setup_log(
+        f"pid={os.getpid()} starting; model={args.model_name_or_path}, draft={args.draft_name_or_path}",
+        pre_dist=True,
+    )
 
     random.seed(0)
     np.random.seed(0)
@@ -147,11 +176,14 @@ def main() -> None:
     torch.cuda.manual_seed_all(0)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    setup_log("random seeds configured", pre_dist=True)
 
+    setup_log("initializing distributed process group...", pre_dist=True)
     dist.init()
     atexit.register(dist.destroy)
     torch.cuda.set_device(dist.local_rank())
     device = torch.device(f"cuda:{dist.local_rank()}")
+    setup_log(f"distributed ready (world_size={dist.size()}, local_rank={dist.local_rank()}, device={device})")
 
     def has_flash_attn():
         try:
@@ -162,30 +194,54 @@ def main() -> None:
             return False
 
     installed_flash_attn = has_flash_attn()
+    setup_log(f"attention backend={'flash_attention_2' if installed_flash_attn else 'sdpa'}")
 
+    setup_log("loading target model...")
+    t_load_target = time.perf_counter()
     target = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         attn_implementation="flash_attention_2" if installed_flash_attn else "sdpa",
         dtype=torch.bfloat16,
+        local_files_only=args.local_files_only,
     ).to(device).eval()
+    setup_log(f"target model loaded in {time.perf_counter() - t_load_target:.2f}s")
 
+    setup_log("loading draft model...")
+    t_load_draft = time.perf_counter()
     draft_model = DFlashDraftModel.from_pretrained(
         args.draft_name_or_path,
         attn_implementation="flash_attention_2" if installed_flash_attn else "sdpa",
         dtype=torch.bfloat16,
+        local_files_only=args.local_files_only,
     ).to(device).eval()
+    setup_log(f"draft model loaded in {time.perf_counter() - t_load_draft:.2f}s")
 
     block_size = args.block_size if args.block_size is not None else draft_model.block_size
+    setup_log(f"effective block_size={block_size}")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+    setup_log("loading tokenizer...")
+    t_tokenizer = time.perf_counter()
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_name_or_path,
+        local_files_only=args.local_files_only,
+    )
+    setup_log(f"tokenizer loaded in {time.perf_counter() - t_tokenizer:.2f}s")
+
+    setup_log(f"loading dataset `{args.dataset}`...")
+    t_dataset = time.perf_counter()
     dataset = load_and_process_dataset(args.dataset)
+    setup_log(f"dataset loaded with {len(dataset)} rows in {time.perf_counter() - t_dataset:.2f}s")
 
     if args.max_samples is not None and len(dataset) > args.max_samples:
+        t_slice = time.perf_counter()
         dataset = dataset.shuffle(seed=0).select(range(args.max_samples))
+        setup_log(f"dataset reduced to {len(dataset)} rows in {time.perf_counter() - t_slice:.2f}s")
 
     responses = []
+    first_prompt_logged = False
     indices = range(dist.rank(), len(dataset), dist.size())
     for idx in tqdm(indices, disable=not dist.is_main()):
+        first_prompt_t0 = time.perf_counter()
         instance = dataset[idx]
         messages = []
         for turn_index, user_content in enumerate(instance["turns"]):
@@ -211,12 +267,17 @@ def main() -> None:
             output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
             messages.append({"role": "assistant", "content": output_text})
             responses.append(response)
+        if not first_prompt_logged:
+            setup_log(f"first local prompt finished in {time.perf_counter() - first_prompt_t0:.2f}s")
+            first_prompt_logged = True
 
     if dist.size() > 1:
+        setup_log("gathering responses from all ranks...")
         responses = dist.gather(responses, dst=0)
         if not dist.is_main():
             return
         responses = list(chain(*responses))
+        setup_log("gather complete")
 
     t1 = np.mean([r[1].time_per_output_token for r in responses])
     tb = np.mean([r[block_size].time_per_output_token for r in responses])
