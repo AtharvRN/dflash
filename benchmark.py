@@ -1,10 +1,12 @@
 import argparse
 import atexit
 import builtins
+import json
 import os
 import time
 import random
 from itertools import chain
+from pathlib import Path
 from types import SimpleNamespace
 from loguru import logger
 import numpy as np
@@ -151,6 +153,12 @@ def main() -> None:
         action="store_true",
         help="Print setup timing logs from every rank (default: rank0 only).",
     )
+    parser.add_argument(
+        "--save-outputs-path",
+        type=str,
+        default=None,
+        help="Optional JSONL path to save per-sample outputs and timing metrics.",
+    )
     args = parser.parse_args()
 
     setup_t0 = time.perf_counter()
@@ -238,6 +246,7 @@ def main() -> None:
         setup_log(f"dataset reduced to {len(dataset)} rows in {time.perf_counter() - t_slice:.2f}s")
 
     responses = []
+    output_records = []
     first_prompt_logged = False
     indices = range(dist.rank(), len(dataset), dist.size())
     for idx in tqdm(indices, disable=not dist.is_main()):
@@ -261,12 +270,44 @@ def main() -> None:
                     stop_token_ids=[tokenizer.eos_token_id],
                     temperature=args.temperature,
                 )
-            
+
+            baseline_response = response[1]
+            baseline_generated_ids = baseline_response.output_ids[0, baseline_response.num_input_tokens:]
+            baseline_output_text = tokenizer.decode(baseline_generated_ids, skip_special_tokens=True)
+
             spec_response = response[block_size]
             generated_ids = spec_response.output_ids[0, spec_response.num_input_tokens:]
             output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
             messages.append({"role": "assistant", "content": output_text})
             responses.append(response)
+
+            output_records.append(
+                {
+                    "rank": dist.rank(),
+                    "dataset_row_idx": idx,
+                    "turn_index": turn_index,
+                    "dataset": args.dataset,
+                    "prompt_text": user_content,
+                    "input_text": input_text,
+                    "block_size": block_size,
+                    "baseline": {
+                        "output_text": baseline_output_text,
+                        "num_input_tokens": baseline_response.num_input_tokens,
+                        "num_output_tokens": baseline_response.num_output_tokens,
+                        "ttft_s": baseline_response.time_to_first_token,
+                        "tpot_s": baseline_response.time_per_output_token,
+                        "acceptance_lengths": baseline_response.acceptance_lengths,
+                    },
+                    "speculative": {
+                        "output_text": output_text,
+                        "num_input_tokens": spec_response.num_input_tokens,
+                        "num_output_tokens": spec_response.num_output_tokens,
+                        "ttft_s": spec_response.time_to_first_token,
+                        "tpot_s": spec_response.time_per_output_token,
+                        "acceptance_lengths": spec_response.acceptance_lengths,
+                    },
+                }
+            )
         if not first_prompt_logged:
             setup_log(f"first local prompt finished in {time.perf_counter() - first_prompt_t0:.2f}s")
             first_prompt_logged = True
@@ -274,9 +315,11 @@ def main() -> None:
     if dist.size() > 1:
         setup_log("gathering responses from all ranks...")
         responses = dist.gather(responses, dst=0)
+        output_records = dist.gather(output_records, dst=0)
         if not dist.is_main():
             return
         responses = list(chain(*responses))
+        output_records = list(chain(*output_records))
         setup_log("gather complete")
 
     t1 = np.mean([r[1].time_per_output_token for r in responses])
@@ -289,6 +332,14 @@ def main() -> None:
     acceptance_lengths = list(chain(*[r[block_size].acceptance_lengths for r in responses]))
     histogram = [acceptance_lengths.count(b) / len(acceptance_lengths) for b in range(block_size + 1)]
     print(f"Acceptance length histogram: {[f'{x * 100:.1f}%' for x in histogram]}")
+
+    if args.save_outputs_path:
+        out_path = Path(args.save_outputs_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with out_path.open("w", encoding="utf-8") as f:
+            for row in output_records:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        print(f"Saved per-sample outputs to: {out_path}")
 
 if __name__ == "__main__":
     main()

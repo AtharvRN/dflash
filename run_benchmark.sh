@@ -46,6 +46,7 @@ LOG_DIR="${LOG_DIR:-logs}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 DRY_RUN="${DRY_RUN:-0}"
 CONTINUE_ON_ERROR="${CONTINUE_ON_ERROR:-0}"
+SAVE_OUTPUTS_DIR="${SAVE_OUTPUTS_DIR:-}"
 
 if [[ -n "${BLOCK_SIZE:-}" && -z "${BLOCK_SIZES:-}" ]]; then
   BLOCK_SIZES="${BLOCK_SIZE}"
@@ -72,6 +73,9 @@ else
 fi
 
 mkdir -p "${LOG_DIR}"
+if [[ -n "${SAVE_OUTPUTS_DIR}" ]]; then
+  mkdir -p "${SAVE_OUTPUTS_DIR}"
+fi
 
 echo "========================================================"
 echo "DFlash benchmark run"
@@ -83,6 +87,9 @@ echo "draft=${DRAFT}"
 echo "max_new_tokens=${MAX_NEW_TOKENS}"
 echo "temperature=${TEMPERATURE}"
 echo "tasks=${TASK_LIST[*]}"
+if [[ -n "${SAVE_OUTPUTS_DIR}" ]]; then
+  echo "save_outputs_dir=${SAVE_OUTPUTS_DIR}"
+fi
 if [[ ${#BLOCK_SIZE_LIST[@]} -eq 1 && -z "${BLOCK_SIZE_LIST[0]}" ]]; then
   echo "block_sizes=default_from_model"
 else
@@ -122,6 +129,9 @@ for task in "${TASK_LIST[@]}"; do
     )
     if [[ -n "${bs}" ]]; then
       cmd+=(--block-size "${bs}")
+    fi
+    if [[ -n "${SAVE_OUTPUTS_DIR}" ]]; then
+      cmd+=(--save-outputs-path "${SAVE_OUTPUTS_DIR}/${RUN_TAG}_${DATASET_NAME}_bs${bs_tag}.jsonl")
     fi
 
     echo "--------------------------------------------------------" | tee "${log_path}"
