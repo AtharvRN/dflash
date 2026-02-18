@@ -47,6 +47,7 @@ RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 DRY_RUN="${DRY_RUN:-0}"
 CONTINUE_ON_ERROR="${CONTINUE_ON_ERROR:-0}"
 SAVE_OUTPUTS_DIR="${SAVE_OUTPUTS_DIR:-}"
+SKIP_BASELINE="${SKIP_BASELINE:-0}"
 
 if [[ -n "${BLOCK_SIZE:-}" && -z "${BLOCK_SIZES:-}" ]]; then
   BLOCK_SIZES="${BLOCK_SIZE}"
@@ -87,6 +88,7 @@ echo "draft=${DRAFT}"
 echo "max_new_tokens=${MAX_NEW_TOKENS}"
 echo "temperature=${TEMPERATURE}"
 echo "tasks=${TASK_LIST[*]}"
+echo "skip_baseline=${SKIP_BASELINE}"
 if [[ -n "${SAVE_OUTPUTS_DIR}" ]]; then
   echo "save_outputs_dir=${SAVE_OUTPUTS_DIR}"
 fi
@@ -132,6 +134,9 @@ for task in "${TASK_LIST[@]}"; do
     fi
     if [[ -n "${SAVE_OUTPUTS_DIR}" ]]; then
       cmd+=(--save-outputs-path "${SAVE_OUTPUTS_DIR}/${RUN_TAG}_${DATASET_NAME}_bs${bs_tag}.jsonl")
+    fi
+    if [[ "${SKIP_BASELINE}" == "1" ]]; then
+      cmd+=(--skip-baseline)
     fi
 
     echo "--------------------------------------------------------" | tee "${log_path}"

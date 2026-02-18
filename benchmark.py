@@ -144,6 +144,11 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument(
+        "--skip-baseline",
+        action="store_true",
+        help="Skip per-sample baseline (bs=1) generation and run only speculative decode.",
+    )
+    parser.add_argument(
         "--local-files-only",
         action="store_true",
         help="Load model/tokenizer only from local cache; fail fast if missing.",
@@ -248,6 +253,7 @@ def main() -> None:
     responses = []
     output_records = []
     first_prompt_logged = False
+    baseline_enabled = not args.skip_baseline
     indices = range(dist.rank(), len(dataset), dist.size())
     for idx in tqdm(indices, disable=not dist.is_main()):
         first_prompt_t0 = time.perf_counter()
@@ -259,7 +265,8 @@ def main() -> None:
             input_ids = tokenizer.encode(input_text, return_tensors="pt").to(target.device)
 
             response = {}
-            for bs in [1, block_size]:
+            bs_candidates = [block_size] if args.skip_baseline else [1, block_size]
+            for bs in dict.fromkeys(bs_candidates):
                 response[bs] = dflash_generate(
                     model=draft_model,
                     target=target,
@@ -271,9 +278,11 @@ def main() -> None:
                     temperature=args.temperature,
                 )
 
-            baseline_response = response[1]
-            baseline_generated_ids = baseline_response.output_ids[0, baseline_response.num_input_tokens:]
-            baseline_output_text = tokenizer.decode(baseline_generated_ids, skip_special_tokens=True)
+            baseline_response = response.get(1)
+            baseline_output_text = None
+            if baseline_response is not None:
+                baseline_generated_ids = baseline_response.output_ids[0, baseline_response.num_input_tokens:]
+                baseline_output_text = tokenizer.decode(baseline_generated_ids, skip_special_tokens=True)
 
             spec_response = response[block_size]
             generated_ids = spec_response.output_ids[0, spec_response.num_input_tokens:]
@@ -290,7 +299,7 @@ def main() -> None:
                     "prompt_text": user_content,
                     "input_text": input_text,
                     "block_size": block_size,
-                    "baseline": {
+                    "baseline": None if baseline_response is None else {
                         "output_text": baseline_output_text,
                         "num_input_tokens": baseline_response.num_input_tokens,
                         "num_output_tokens": baseline_response.num_output_tokens,
@@ -322,9 +331,16 @@ def main() -> None:
         output_records = list(chain(*output_records))
         setup_log("gather complete")
 
-    t1 = np.mean([r[1].time_per_output_token for r in responses])
     tb = np.mean([r[block_size].time_per_output_token for r in responses])
-    print(f"Decoding speedup: {t1 / tb:.2f}")
+    if baseline_enabled:
+        t1 = np.mean([r[1].time_per_output_token for r in responses])
+        print(f"Baseline TPOT: {t1:.6f}")
+    print(f"Speculative TPOT: {tb:.6f}")
+
+    if baseline_enabled:
+        print(f"Decoding speedup: {t1 / tb:.2f}")
+    else:
+        print("Decoding speedup: N/A (baseline skipped)")
 
     tau = np.mean([np.mean(r[block_size].acceptance_lengths) for r in responses])
     print(f"Average Acceptance length: {tau:.2f}")

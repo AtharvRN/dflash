@@ -26,6 +26,14 @@ Output:
 - `logs/sweep_*/summary.csv`
 - per-block logs in the same folder
 
+To avoid duplicate baseline compute in every block-size run:
+
+```bash
+DATASET=aime25 MAX_SAMPLES=8 MAX_NEW_TOKENS=256 BLOCK_SIZES="4 8 12 16" NPROC=1 SKIP_BASELINE=1 ./run_block_sweep.sh
+```
+
+This runs one shared baseline pass (`bs=1`) and computes speedup for each block size using shared baseline TPOT.
+
 ## 3) Single-run explicit command (Transformers)
 
 ```bash
