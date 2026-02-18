@@ -56,6 +56,8 @@ torchrun --nproc_per_node=1 --master_port=29600 benchmark.py \
 ## 4) Dynamic block-size scheduler run (inference-time only)
 
 Uses candidates `{8,12,16}` by default and compares dynamic policy against baseline.
+Scheduler is EWMA throughput-based (`score = tau_hat / cycle_hat`) with hysteresis,
+cooldown, periodic probes, and low-accept fallback.
 
 ```bash
 python benchmark_dynamic_schedule.py \
@@ -66,11 +68,13 @@ python benchmark_dynamic_schedule.py \
   --max-new-tokens 2048 \
   --candidate-block-sizes 8,12,16 \
   --warmup-cycles 2 \
-  --decision-window 4 \
-  --tau-high 7.0 \
-  --tau-mid 6.0 \
+  --ewma-alpha 0.10 \
+  --switch-margin 0.05 \
   --required-streak 2 \
   --cooldown-cycles 2 \
+  --probe-interval 12 \
+  --low-accept-threshold 0.35 \
+  --low-accept-streak 2 \
   --save-outputs-path outputs/dynamic_aime25.jsonl
 ```
 

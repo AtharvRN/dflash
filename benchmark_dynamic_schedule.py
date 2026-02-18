@@ -5,7 +5,7 @@ import json
 import os
 import random
 import time
-from collections import Counter, deque
+from collections import Counter
 from itertools import chain
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,72 +35,141 @@ def parse_block_sizes(s: str) -> list[int]:
     return vals
 
 
-class RollingTauScheduler:
+class EWMAPerformanceScheduler:
     def __init__(
         self,
         *,
         candidates: list[int],
         warmup_cycles: int,
-        decision_window: int,
-        tau_high: float,
-        tau_mid: float,
+        ewma_alpha: float,
+        switch_margin: float,
         required_streak: int,
         cooldown_cycles: int,
+        probe_interval: int,
+        low_accept_threshold: float,
+        low_accept_streak: int,
     ) -> None:
         self.candidates = sorted(candidates)
-        self.low = self.candidates[0]
-        self.mid = self.candidates[len(self.candidates) // 2]
-        self.high = self.candidates[-1]
-        self.current = self.high
+        self.current = self.candidates[-1]
         self.warmup_cycles = int(max(0, warmup_cycles))
-        self.tau_hist: deque[float] = deque(maxlen=max(1, decision_window))
-        self.tau_high = float(tau_high)
-        self.tau_mid = float(tau_mid)
+        self.ewma_alpha = float(ewma_alpha)
+        if not (0.0 < self.ewma_alpha <= 1.0):
+            raise ValueError("ewma_alpha must be in (0, 1].")
+        self.switch_margin = float(max(0.0, switch_margin))
         self.required_streak = int(max(1, required_streak))
         self.cooldown_cycles = int(max(0, cooldown_cycles))
+        self.probe_interval = int(max(0, probe_interval))
+        self.low_accept_threshold = float(low_accept_threshold)
+        self.low_accept_streak = int(max(1, low_accept_streak))
+
         self.cooldown_left = 0
         self.pending_target = self.current
         self.pending_streak = 0
-        self.last_rolling_tau = None
+        self.low_accept_count = 0
+        self.last_probe_cycle = -1
+        self.probe_cursor = 0
 
-    def select(self, cycle_idx: int) -> int:
-        if cycle_idx < self.warmup_cycles:
-            return self.high
+        self.tau_hat = {b: None for b in self.candidates}
+        self.cycle_hat = {b: None for b in self.candidates}
+        self.score_hat = {b: None for b in self.candidates}
+        self.obs_count = {b: 0 for b in self.candidates}
+
+    def _ewma(self, old: float | None, new: float) -> float:
+        if old is None:
+            return float(new)
+        return float((1.0 - self.ewma_alpha) * old + self.ewma_alpha * new)
+
+    def _next_probe_candidate(self) -> int:
+        for _ in range(len(self.candidates)):
+            b = self.candidates[self.probe_cursor % len(self.candidates)]
+            self.probe_cursor += 1
+            if b != self.current:
+                return b
         return self.current
 
-    def update(self, tau: float, cycle_idx: int) -> None:
-        self.tau_hist.append(float(tau))
+    def _lower_neighbor(self, b: int) -> int:
+        idx = self.candidates.index(b)
+        return self.candidates[max(0, idx - 1)]
+
+    def select(self, cycle_idx: int) -> int:
+        # Warmup probes candidates round-robin to bootstrap estimates.
+        if cycle_idx < self.warmup_cycles:
+            return self.candidates[cycle_idx % len(self.candidates)]
+
+        # Periodic probing to prevent stale estimates.
+        if self.probe_interval > 0:
+            since_warmup = cycle_idx - self.warmup_cycles
+            if since_warmup >= 0 and (since_warmup % self.probe_interval == 0):
+                self.last_probe_cycle = cycle_idx
+                return self._next_probe_candidate()
+
+        return self.current
+
+    def update(self, *, tau: float, cycle_s: float, effective_bs: int, cycle_idx: int) -> None:
+        tau = float(tau)
+        cycle_s = float(cycle_s)
+        effective_bs = int(effective_bs)
+        if effective_bs not in self.tau_hat:
+            # Tail cycles can have bs=1 when remaining tokens are very small.
+            # Do not let these distort scheduler estimates built for candidate sizes.
+            return
+
+        self.tau_hat[effective_bs] = self._ewma(self.tau_hat[effective_bs], tau)
+        self.cycle_hat[effective_bs] = self._ewma(self.cycle_hat[effective_bs], cycle_s)
+        self.score_hat[effective_bs] = float(
+            self.tau_hat[effective_bs] / max(1e-12, self.cycle_hat[effective_bs])
+        )
+        self.obs_count[effective_bs] += 1
+
+        acceptance_ratio = tau / max(1.0, float(effective_bs))
+        if acceptance_ratio < self.low_accept_threshold and effective_bs == self.current:
+            self.low_accept_count += 1
+        else:
+            self.low_accept_count = 0
+
+        # Immediate conservative fallback on persistently poor acceptance.
+        if self.low_accept_count >= self.low_accept_streak:
+            lower = self._lower_neighbor(self.current)
+            if lower != self.current:
+                self.current = lower
+                self.pending_target = self.current
+                self.pending_streak = 0
+                self.cooldown_left = self.cooldown_cycles
+            self.low_accept_count = 0
+
         if cycle_idx < self.warmup_cycles:
             return
+
         if self.cooldown_left > 0:
             self.cooldown_left -= 1
             return
-        if len(self.tau_hist) < self.tau_hist.maxlen:
+
+        scored = [(b, s) for b, s in self.score_hat.items() if s is not None]
+        if not scored:
             return
 
-        rolling_tau = float(sum(self.tau_hist) / len(self.tau_hist))
-        self.last_rolling_tau = rolling_tau
+        best_b, best_score = max(scored, key=lambda x: x[1])
+        current_score = self.score_hat.get(self.current)
+        if current_score is None:
+            current_score = -float("inf")
 
-        if rolling_tau >= self.tau_high:
-            target = self.high
-        elif rolling_tau >= self.tau_mid:
-            target = self.mid
-        else:
-            target = self.low
+        improvement = best_score - current_score
+        rel_improvement = improvement / max(1e-12, abs(current_score))
+        eligible = rel_improvement > self.switch_margin
 
-        if target == self.current:
+        if best_b == self.current or not eligible:
             self.pending_target = self.current
             self.pending_streak = 0
             return
 
-        if target == self.pending_target:
+        if best_b == self.pending_target:
             self.pending_streak += 1
         else:
-            self.pending_target = target
+            self.pending_target = best_b
             self.pending_streak = 1
 
         if self.pending_streak >= self.required_streak:
-            self.current = target
+            self.current = best_b
             self.pending_streak = 0
             self.cooldown_left = self.cooldown_cycles
 
@@ -116,7 +185,7 @@ def dflash_generate_policy(
     stop_token_ids: list[int],
     temperature: float,
     fixed_block_size: int | None = None,
-    scheduler: RollingTauScheduler | None = None,
+    scheduler: EWMAPerformanceScheduler | None = None,
 ) -> SimpleNamespace:
     if fixed_block_size is None and scheduler is None:
         raise ValueError("Either fixed_block_size or scheduler must be provided.")
@@ -162,6 +231,7 @@ def dflash_generate_policy(
     cycle_idx = 0
 
     while start < max_length:
+        cycle_t0 = cuda_time()
         chosen_bs = fixed_block_size if fixed_block_size is not None else scheduler.select(cycle_idx)
         remaining = max_length - start
         bs = max(1, min(chosen_bs, remaining))
@@ -204,18 +274,24 @@ def dflash_generate_policy(
 
         acceptance_lengths.append(tau)
         used_block_sizes.append(bs)
+        cycle_s = cuda_time() - cycle_t0
+        if scheduler is not None:
+            scheduler.update(tau=tau, cycle_s=cycle_s, effective_bs=bs, cycle_idx=cycle_idx)
         cycle_trace.append(
             {
                 "cycle_idx": cycle_idx,
                 "start_idx": int(start),
                 "block_size": int(bs),
+                "chosen_block_size": int(chosen_bs),
                 "tau": int(tau),
-                "rolling_tau": None if scheduler is None else scheduler.last_rolling_tau,
+                "acceptance_ratio": float(tau / max(1, bs)),
+                "cycle_s": float(cycle_s),
+                "tau_hat": None if scheduler is None else scheduler.tau_hat.get(bs),
+                "cycle_hat": None if scheduler is None else scheduler.cycle_hat.get(bs),
+                "score_hat": None if scheduler is None else scheduler.score_hat.get(bs),
+                "current_block_size": None if scheduler is None else int(scheduler.current),
             }
         )
-
-        if scheduler is not None:
-            scheduler.update(tau, cycle_idx)
 
         start += tau
         past_key_values_target.crop(start)
@@ -280,11 +356,17 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--candidate-block-sizes", type=str, default="8,12,16")
     parser.add_argument("--warmup-cycles", type=int, default=2)
-    parser.add_argument("--decision-window", type=int, default=4)
-    parser.add_argument("--tau-high", type=float, default=7.0)
-    parser.add_argument("--tau-mid", type=float, default=6.0)
+    parser.add_argument("--ewma-alpha", type=float, default=0.10)
+    parser.add_argument("--switch-margin", type=float, default=0.05)
     parser.add_argument("--required-streak", type=int, default=2)
     parser.add_argument("--cooldown-cycles", type=int, default=2)
+    parser.add_argument("--probe-interval", type=int, default=12)
+    parser.add_argument("--low-accept-threshold", type=float, default=0.35)
+    parser.add_argument("--low-accept-streak", type=int, default=2)
+    # Backward-compatible legacy flags from the old rolling-tau scheduler.
+    parser.add_argument("--decision-window", type=int, default=4, help=argparse.SUPPRESS)
+    parser.add_argument("--tau-high", type=float, default=7.0, help=argparse.SUPPRESS)
+    parser.add_argument("--tau-mid", type=float, default=6.0, help=argparse.SUPPRESS)
     parser.add_argument("--skip-baseline", action="store_true")
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--log-all-ranks", action="store_true")
@@ -304,7 +386,14 @@ def main() -> None:
             )
 
     candidates = parse_block_sizes(args.candidate_block_sizes)
-    setup_log(f"pid={os.getpid()} starting; candidates={candidates}", pre_dist=True)
+    setup_log(
+        (
+            f"pid={os.getpid()} starting; candidates={candidates}; "
+            f"ewma_alpha={args.ewma_alpha}, switch_margin={args.switch_margin}, "
+            f"probe_interval={args.probe_interval}, low_accept_threshold={args.low_accept_threshold}"
+        ),
+        pre_dist=True,
+    )
 
     random.seed(0)
     np.random.seed(0)
@@ -381,14 +470,16 @@ def main() -> None:
                 baseline_response.wall_time_s = cuda_time() - t_base
                 responses_baseline.append(baseline_response)
 
-            scheduler = RollingTauScheduler(
+            scheduler = EWMAPerformanceScheduler(
                 candidates=candidates,
                 warmup_cycles=args.warmup_cycles,
-                decision_window=args.decision_window,
-                tau_high=args.tau_high,
-                tau_mid=args.tau_mid,
+                ewma_alpha=args.ewma_alpha,
+                switch_margin=args.switch_margin,
                 required_streak=args.required_streak,
                 cooldown_cycles=args.cooldown_cycles,
+                probe_interval=args.probe_interval,
+                low_accept_threshold=args.low_accept_threshold,
+                low_accept_streak=args.low_accept_streak,
             )
             t_dyn = cuda_time()
             dynamic_response = dflash_generate_policy(
@@ -434,6 +525,17 @@ def main() -> None:
                     },
                     "dynamic": {
                         "candidate_block_sizes": candidates,
+                        "scheduler": {
+                            "type": "ewma_performance",
+                            "warmup_cycles": args.warmup_cycles,
+                            "ewma_alpha": args.ewma_alpha,
+                            "switch_margin": args.switch_margin,
+                            "required_streak": args.required_streak,
+                            "cooldown_cycles": args.cooldown_cycles,
+                            "probe_interval": args.probe_interval,
+                            "low_accept_threshold": args.low_accept_threshold,
+                            "low_accept_streak": args.low_accept_streak,
+                        },
                         "output_text": dyn_output_text,
                         "num_input_tokens": dynamic_response.num_input_tokens,
                         "num_output_tokens": dynamic_response.num_output_tokens,
