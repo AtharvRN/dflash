@@ -134,6 +134,23 @@ def dflash_generate(
     )
 
 
+def summarize_mode(samples: list[SimpleNamespace]) -> dict[str, float]:
+    total_wall_s = float(np.sum([getattr(s, "wall_time_s") for s in samples]))
+    total_tokens = int(np.sum([s.num_output_tokens for s in samples]))
+    avg_ttft_s = float(np.mean([s.time_to_first_token for s in samples]))
+    avg_tpot_s = float(np.mean([s.time_per_output_token for s in samples]))
+    avg_wall_s = float(np.mean([getattr(s, "wall_time_s") for s in samples]))
+    tokens_per_sec = float(total_tokens / max(total_wall_s, 1e-8))
+    return {
+        "total_wall_s": total_wall_s,
+        "avg_wall_s": avg_wall_s,
+        "avg_ttft_s": avg_ttft_s,
+        "avg_tpot_s": avg_tpot_s,
+        "tokens_per_sec": tokens_per_sec,
+        "total_tokens": float(total_tokens),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name-or-path", type=str, required=True)
@@ -267,6 +284,7 @@ def main() -> None:
             response = {}
             bs_candidates = [block_size] if args.skip_baseline else [1, block_size]
             for bs in dict.fromkeys(bs_candidates):
+                t_call = cuda_time()
                 response[bs] = dflash_generate(
                     model=draft_model,
                     target=target,
@@ -277,6 +295,7 @@ def main() -> None:
                     stop_token_ids=[tokenizer.eos_token_id],
                     temperature=args.temperature,
                 )
+                response[bs].wall_time_s = cuda_time() - t_call
 
             baseline_response = response.get(1)
             baseline_output_text = None
@@ -303,6 +322,7 @@ def main() -> None:
                         "output_text": baseline_output_text,
                         "num_input_tokens": baseline_response.num_input_tokens,
                         "num_output_tokens": baseline_response.num_output_tokens,
+                        "wall_time_s": baseline_response.wall_time_s,
                         "ttft_s": baseline_response.time_to_first_token,
                         "tpot_s": baseline_response.time_per_output_token,
                         "acceptance_lengths": baseline_response.acceptance_lengths,
@@ -311,6 +331,7 @@ def main() -> None:
                         "output_text": output_text,
                         "num_input_tokens": spec_response.num_input_tokens,
                         "num_output_tokens": spec_response.num_output_tokens,
+                        "wall_time_s": spec_response.wall_time_s,
                         "ttft_s": spec_response.time_to_first_token,
                         "tpot_s": spec_response.time_per_output_token,
                         "acceptance_lengths": spec_response.acceptance_lengths,
@@ -331,14 +352,25 @@ def main() -> None:
         output_records = list(chain(*output_records))
         setup_log("gather complete")
 
-    tb = np.mean([r[block_size].time_per_output_token for r in responses])
+    spec_samples = [r[block_size] for r in responses]
+    spec_metrics = summarize_mode(spec_samples)
     if baseline_enabled:
-        t1 = np.mean([r[1].time_per_output_token for r in responses])
-        print(f"Baseline TPOT: {t1:.6f}")
-    print(f"Speculative TPOT: {tb:.6f}")
+        baseline_samples = [r[1] for r in responses]
+        baseline_metrics = summarize_mode(baseline_samples)
+        print(f"Baseline total_wall_s: {baseline_metrics['total_wall_s']:.6f}")
+        print(f"Baseline avg_wall_s: {baseline_metrics['avg_wall_s']:.6f}")
+        print(f"Baseline TTFT: {baseline_metrics['avg_ttft_s']:.6f}")
+        print(f"Baseline TPOT: {baseline_metrics['avg_tpot_s']:.6f}")
+        print(f"Baseline tokens_per_sec: {baseline_metrics['tokens_per_sec']:.6f}")
+
+    print(f"Speculative total_wall_s: {spec_metrics['total_wall_s']:.6f}")
+    print(f"Speculative avg_wall_s: {spec_metrics['avg_wall_s']:.6f}")
+    print(f"Speculative TTFT: {spec_metrics['avg_ttft_s']:.6f}")
+    print(f"Speculative TPOT: {spec_metrics['avg_tpot_s']:.6f}")
+    print(f"Speculative tokens_per_sec: {spec_metrics['tokens_per_sec']:.6f}")
 
     if baseline_enabled:
-        print(f"Decoding speedup: {t1 / tb:.2f}")
+        print(f"Decoding speedup: {baseline_metrics['avg_tpot_s'] / spec_metrics['avg_tpot_s']:.2f}")
     else:
         print("Decoding speedup: N/A (baseline skipped)")
 
@@ -348,6 +380,10 @@ def main() -> None:
     acceptance_lengths = list(chain(*[r[block_size].acceptance_lengths for r in responses]))
     histogram = [acceptance_lengths.count(b) / len(acceptance_lengths) for b in range(block_size + 1)]
     print(f"Acceptance length histogram: {[f'{x * 100:.1f}%' for x in histogram]}")
+    print(f"Hardware GPU: {torch.cuda.get_device_name(device)}")
+    print(f"Hardware CUDA: {torch.version.cuda}")
+    print(f"Hardware Torch: {torch.__version__}")
+    print(f"Hardware World Size: {dist.size()}")
 
     if args.save_outputs_path:
         out_path = Path(args.save_outputs_path)

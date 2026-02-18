@@ -25,6 +25,12 @@ DATASET=aime25 MAX_SAMPLES=8 MAX_NEW_TOKENS=256 BLOCK_SIZES="4 8 12 16" NPROC=1 
 Output:
 - `logs/sweep_*/summary.csv`
 - per-block logs in the same folder
+- `summary.csv` now includes hardware + absolute timing fields:
+  - `gpu_name`, `cuda_version`, `torch_version`
+  - `baseline_total_wall_s`, `speculative_total_wall_s`
+  - `baseline_tokens_per_sec`, `speculative_tokens_per_sec`
+  - `baseline_tpot`, `speculative_tpot`
+  - `baseline_ttft`, `speculative_ttft`
 
 To avoid duplicate baseline compute in every block-size run:
 
