@@ -75,6 +75,12 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument(
+        "--draft-steps",
+        type=int,
+        default=1,
+        help="Number of draft refinement passes per speculative cycle (default: 1).",
+    )
+    parser.add_argument(
         "--skip-baseline",
         action="store_true",
         help="Skip shared baseline generation (bs=1).",
@@ -94,6 +100,8 @@ def main() -> None:
         help="Optional CSV path for per-block aggregate metrics.",
     )
     args = parser.parse_args()
+    if args.draft_steps < 1:
+        raise ValueError("--draft-steps must be >= 1")
 
     block_sizes = parse_block_sizes(args.block_sizes)
     if (not args.skip_baseline) and 1 in block_sizes:
@@ -117,7 +125,7 @@ def main() -> None:
     setup_log(
         (
             f"pid={os.getpid()} starting; model={args.model_name_or_path}, "
-            f"draft={args.draft_name_or_path}, block_sizes={block_sizes}"
+            f"draft={args.draft_name_or_path}, block_sizes={block_sizes}, draft_steps={args.draft_steps}"
         ),
         pre_dist=True,
     )
@@ -230,6 +238,7 @@ def main() -> None:
                     stop_token_ids=[tokenizer.eos_token_id],
                     temperature=args.temperature,
                     collect_profile=False,
+                    draft_steps=args.draft_steps,
                 )
                 baseline_wall = cuda_time() - t_call
                 baseline_ids = baseline_resp.output_ids[0, baseline_resp.num_input_tokens:]
@@ -257,6 +266,7 @@ def main() -> None:
                     stop_token_ids=[tokenizer.eos_token_id],
                     temperature=args.temperature,
                     collect_profile=False,
+                    draft_steps=args.draft_steps,
                 )
                 spec_wall = cuda_time() - t_call
                 spec_ids = spec_resp.output_ids[0, spec_resp.num_input_tokens:]
@@ -336,6 +346,7 @@ def main() -> None:
         summary_rows.append(
             {
                 "dataset": args.dataset,
+                "draft_steps": args.draft_steps,
                 "max_samples": len(dataset),
                 "block_size": bs,
                 "speedup": speedup,

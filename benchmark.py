@@ -32,6 +32,7 @@ def dflash_generate(
     stop_token_ids: list[int],
     temperature: float = 0.0,
     collect_profile: bool = False,
+    draft_steps: int = 1,
 ) -> SimpleNamespace:
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
@@ -89,17 +90,34 @@ def dflash_generate(
             if collect_profile:
                 draft_events = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
                 draft_events[0].record()
-            noise_embedding = target.model.embed_tokens(block_output_ids)
-            draft_logits = target.lm_head(model(
-                target_hidden=target_hidden,
-                noise_embedding=noise_embedding,
-                position_ids=position_ids[:, past_key_values_draft.get_seq_length(): start + effective_block_size],
-                past_key_values=past_key_values_draft,
-                use_cache=True,
-                is_causal=False,
-            )[:, -effective_block_size+1:, :])
-            past_key_values_draft.crop(start)
-            block_output_ids[:, 1:] = sample(draft_logits)
+            # Multi-step draft refinement: repeatedly denoise/update the draft block
+            # before target verification.
+            use_draft_cache = draft_steps == 1
+            for _ in range(draft_steps):
+                noise_embedding = target.model.embed_tokens(block_output_ids)
+                if use_draft_cache:
+                    draft_position_ids = position_ids[
+                        :, past_key_values_draft.get_seq_length() : start + effective_block_size
+                    ]
+                    draft_past = past_key_values_draft
+                else:
+                    # Cache reuse across refinement steps is not valid here because each step
+                    # rewrites the same token range. Recompute on the local block positions.
+                    draft_position_ids = block_position_ids
+                    draft_past = None
+                draft_logits = target.lm_head(
+                    model(
+                        target_hidden=target_hidden,
+                        noise_embedding=noise_embedding,
+                        position_ids=draft_position_ids,
+                        past_key_values=draft_past,
+                        use_cache=use_draft_cache,
+                        is_causal=False,
+                    )[:, -effective_block_size + 1 :, :]
+                )
+                block_output_ids[:, 1:] = sample(draft_logits)
+            if use_draft_cache:
+                past_key_values_draft.crop(start)
             if collect_profile:
                 draft_events[1].record()
             if draft_prefill:
@@ -299,7 +317,15 @@ def main() -> None:
         action="store_true",
         help="Collect per-cycle profiling stats (target/draft/cycle timings).",
     )
+    parser.add_argument(
+        "--draft-steps",
+        type=int,
+        default=1,
+        help="Number of draft refinement passes per speculative cycle (default: 1).",
+    )
     args = parser.parse_args()
+    if args.draft_steps < 1:
+        raise ValueError("--draft-steps must be >= 1")
     collect_profile = args.collect_profile or (args.save_cycle_trace_path is not None)
 
     setup_t0 = time.perf_counter()
@@ -315,7 +341,10 @@ def main() -> None:
             )
 
     setup_log(
-        f"pid={os.getpid()} starting; model={args.model_name_or_path}, draft={args.draft_name_or_path}",
+        (
+            f"pid={os.getpid()} starting; model={args.model_name_or_path}, "
+            f"draft={args.draft_name_or_path}, draft_steps={args.draft_steps}"
+        ),
         pre_dist=True,
     )
 
@@ -415,6 +444,7 @@ def main() -> None:
                     stop_token_ids=[tokenizer.eos_token_id],
                     temperature=args.temperature,
                     collect_profile=collect_profile,
+                    draft_steps=args.draft_steps,
                 )
                 response[bs].wall_time_s = cuda_time() - t_call
 
@@ -457,6 +487,7 @@ def main() -> None:
                     "prompt_text": user_content,
                     "input_text": input_text,
                     "block_size": block_size,
+                    "draft_steps": args.draft_steps,
                     "baseline": None if baseline_response is None else {
                         "output_text": baseline_output_text,
                         "num_input_tokens": baseline_response.num_input_tokens,
@@ -544,6 +575,7 @@ def main() -> None:
     acceptance_lengths = list(chain(*[r[block_size].acceptance_lengths for r in responses]))
     histogram = [acceptance_lengths.count(b) / len(acceptance_lengths) for b in range(block_size + 1)]
     print(f"Acceptance length histogram: {[f'{x * 100:.1f}%' for x in histogram]}")
+    print(f"Draft steps per cycle: {args.draft_steps}")
     print(f"Hardware GPU: {torch.cuda.get_device_name(device)}")
     print(f"Hardware CUDA: {torch.version.cuda}")
     print(f"Hardware Torch: {torch.__version__}")
