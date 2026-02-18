@@ -92,8 +92,12 @@ def proposal_distribution_from_round(
         device=model.device,
     )
     block_output_ids[:, 0] = last_token[:, 0]
+    ctx_len = int(target_hidden.shape[1])
+    # DFlash attention builds K by concatenating context + noise tokens.
+    # Rotary embeddings therefore need positions covering both segments.
+    pos_start = max(0, current_pos - ctx_len)
     block_position_ids = torch.arange(
-        current_pos,
+        pos_start,
         current_pos + block_size,
         device=model.device,
     ).unsqueeze(0)
