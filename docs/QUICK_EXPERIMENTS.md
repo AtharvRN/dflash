@@ -53,7 +53,28 @@ torchrun --nproc_per_node=1 --master_port=29600 benchmark.py \
   --block-size 16
 ```
 
-## 4) SGLang quick throughput run
+## 4) Dynamic block-size scheduler run (inference-time only)
+
+Uses candidates `{8,12,16}` by default and compares dynamic policy against baseline.
+
+```bash
+python benchmark_dynamic_schedule.py \
+  --dataset aime25 \
+  --max-samples 30 \
+  --model-name-or-path Qwen/Qwen3-4B \
+  --draft-name-or-path z-lab/Qwen3-4B-DFlash-b16 \
+  --max-new-tokens 2048 \
+  --candidate-block-sizes 8,12,16 \
+  --warmup-cycles 2 \
+  --decision-window 4 \
+  --tau-high 7.0 \
+  --tau-mid 6.0 \
+  --required-streak 2 \
+  --cooldown-cycles 2 \
+  --save-outputs-path outputs/dynamic_aime25.jsonl
+```
+
+## 5) SGLang quick throughput run
 
 ```bash
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
