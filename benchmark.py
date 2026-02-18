@@ -31,6 +31,7 @@ def dflash_generate(
     block_size: int,
     stop_token_ids: list[int],
     temperature: float = 0.0,
+    collect_profile: bool = False,
 ) -> SimpleNamespace:
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
@@ -68,44 +69,84 @@ def dflash_generate(
     start = input_ids.shape[1]
     acceptance_lengths = []
     draft_prefill = True
+    cycle_trace = []
 
     while start < max_length:
-        block_output_ids = output_ids[:, start : start + block_size].clone()
-        block_position_ids = position_ids[:, start : start + block_size]
-        if block_size > 1:
+        cycle_start = None
+        cycle_end = None
+        draft_events = None
+        target_events = None
+        if collect_profile:
+            cycle_start = torch.cuda.Event(enable_timing=True)
+            cycle_end = torch.cuda.Event(enable_timing=True)
+            cycle_start.record()
+
+        remaining = max_length - start
+        effective_block_size = min(block_size, remaining)
+        block_output_ids = output_ids[:, start : start + effective_block_size].clone()
+        block_position_ids = position_ids[:, start : start + effective_block_size]
+        if effective_block_size > 1:
+            if collect_profile:
+                draft_events = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+                draft_events[0].record()
             noise_embedding = target.model.embed_tokens(block_output_ids)
             draft_logits = target.lm_head(model(
                 target_hidden=target_hidden,
                 noise_embedding=noise_embedding,
-                position_ids=position_ids[:, past_key_values_draft.get_seq_length(): start + block_size],
+                position_ids=position_ids[:, past_key_values_draft.get_seq_length(): start + effective_block_size],
                 past_key_values=past_key_values_draft,
                 use_cache=True,
                 is_causal=False,
-            )[:, -block_size+1:, :])
+            )[:, -effective_block_size+1:, :])
             past_key_values_draft.crop(start)
             block_output_ids[:, 1:] = sample(draft_logits)
+            if collect_profile:
+                draft_events[1].record()
             if draft_prefill:
                 draft_prefill = False
                 decode_start = cuda_time()
 
+        if collect_profile:
+            target_events = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+            target_events[0].record()
         output = target(
             block_output_ids,
             position_ids=block_position_ids,
             past_key_values=past_key_values_target,
             use_cache=True,
-            output_hidden_states=True if block_size > 1 else False,
+            output_hidden_states=True if effective_block_size > 1 else False,
         )
+        if collect_profile:
+            target_events[1].record()
 
         posterior = sample(output.logits, temperature)
         acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
         output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
         output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
 
-        acceptance_lengths.append(acceptance_length+1)
-        start += acceptance_length + 1
+        tau = acceptance_length + 1
+        acceptance_lengths.append(tau)
+        generated_tokens_before = start - num_input_tokens
+        if collect_profile:
+            cycle_end.record()
+            cycle_trace.append(
+                {
+                    "cycle_idx": int(len(acceptance_lengths) - 1),
+                    "generated_tokens_before": int(generated_tokens_before),
+                    "effective_block_size": int(effective_block_size),
+                    "tau": int(tau),
+                    "acceptance_ratio": float(tau / max(1, effective_block_size)),
+                    "_events": {
+                        "draft": draft_events,
+                        "target": target_events,
+                        "cycle": (cycle_start, cycle_end),
+                    },
+                }
+            )
+        start += tau
         past_key_values_target.crop(start)
-        if block_size > 1:
-            target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)[:, :acceptance_length + 1, :]
+        if effective_block_size > 1:
+            target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)[:, :tau, :]
         
         if stop_token_ids is not None and any(
             stop_token_id in output_ids[:, num_input_tokens:] for stop_token_id in stop_token_ids
@@ -124,6 +165,40 @@ def dflash_generate(
     total_decode_time = cuda_time() - decode_start
     time_per_output_token = total_decode_time / num_output_tokens
 
+    profile_summary = None
+    if collect_profile:
+        torch.cuda.synchronize()
+        target_prefill_s = float(time_to_first_token)
+        total_target_decode_s = 0.0
+        total_draft_decode_s = 0.0
+        total_cycle_s = 0.0
+        for row in cycle_trace:
+            draft_events = row["_events"]["draft"]
+            target_events = row["_events"]["target"]
+            cycle_events = row["_events"]["cycle"]
+            draft_s = 0.0
+            if draft_events is not None:
+                draft_s = draft_events[0].elapsed_time(draft_events[1]) / 1000.0
+            target_s = target_events[0].elapsed_time(target_events[1]) / 1000.0
+            cycle_s = cycle_events[0].elapsed_time(cycle_events[1]) / 1000.0
+            row["draft_s"] = float(draft_s)
+            row["target_s"] = float(target_s)
+            row["cycle_s"] = float(cycle_s)
+            row.pop("_events", None)
+            total_draft_decode_s += draft_s
+            total_target_decode_s += target_s
+            total_cycle_s += cycle_s
+        profile_summary = {
+            "target_prefill_s": float(target_prefill_s),
+            "target_decode_s": float(total_target_decode_s),
+            "draft_decode_s": float(total_draft_decode_s),
+            "cycle_decode_s_sum": float(total_cycle_s),
+            "decode_wall_s": float(total_decode_time),
+            "profiled_cycles": int(len(cycle_trace)),
+            "draft_share_decode": float(total_draft_decode_s / max(1e-12, total_draft_decode_s + total_target_decode_s)),
+            "target_share_decode": float(total_target_decode_s / max(1e-12, total_draft_decode_s + total_target_decode_s)),
+        }
+
     return SimpleNamespace(
         output_ids=output_ids,
         num_input_tokens=num_input_tokens,
@@ -131,6 +206,8 @@ def dflash_generate(
         time_to_first_token=time_to_first_token,
         time_per_output_token=time_per_output_token,
         acceptance_lengths=acceptance_lengths,
+        cycle_trace=cycle_trace,
+        profile_summary=profile_summary,
     )
 
 
@@ -148,6 +225,36 @@ def summarize_mode(samples: list[SimpleNamespace]) -> dict[str, float]:
         "avg_tpot_s": avg_tpot_s,
         "tokens_per_sec": tokens_per_sec,
         "total_tokens": float(total_tokens),
+    }
+
+
+def summarize_profile(samples: list[SimpleNamespace]) -> dict[str, float] | None:
+    profiles = [getattr(s, "profile_summary", None) for s in samples]
+    profiles = [p for p in profiles if p is not None]
+    if not profiles:
+        return None
+
+    total_target_prefill_s = float(np.sum([p["target_prefill_s"] for p in profiles]))
+    total_target_decode_s = float(np.sum([p["target_decode_s"] for p in profiles]))
+    total_draft_decode_s = float(np.sum([p["draft_decode_s"] for p in profiles]))
+    total_cycle_decode_s = float(np.sum([p["cycle_decode_s_sum"] for p in profiles]))
+    total_decode_wall_s = float(np.sum([p["decode_wall_s"] for p in profiles]))
+    total_cycles = int(np.sum([p["profiled_cycles"] for p in profiles]))
+    denom = max(1e-12, total_draft_decode_s + total_target_decode_s)
+
+    return {
+        "total_target_prefill_s": total_target_prefill_s,
+        "total_target_decode_s": total_target_decode_s,
+        "total_draft_decode_s": total_draft_decode_s,
+        "total_cycle_decode_s": total_cycle_decode_s,
+        "total_decode_wall_s": total_decode_wall_s,
+        "total_profiled_cycles": float(total_cycles),
+        "draft_share_decode": float(total_draft_decode_s / denom),
+        "target_share_decode": float(total_target_decode_s / denom),
+        "avg_target_prefill_s": float(total_target_prefill_s / len(profiles)),
+        "avg_target_decode_s": float(total_target_decode_s / len(profiles)),
+        "avg_draft_decode_s": float(total_draft_decode_s / len(profiles)),
+        "avg_decode_wall_s": float(total_decode_wall_s / len(profiles)),
     }
 
 
@@ -181,7 +288,19 @@ def main() -> None:
         default=None,
         help="Optional JSONL path to save per-sample outputs and timing metrics.",
     )
+    parser.add_argument(
+        "--save-cycle-trace-path",
+        type=str,
+        default=None,
+        help="Optional JSONL path to save per-cycle trace rows (tau, draft/target/cycle timing, token index).",
+    )
+    parser.add_argument(
+        "--collect-profile",
+        action="store_true",
+        help="Collect per-cycle profiling stats (target/draft/cycle timings).",
+    )
     args = parser.parse_args()
+    collect_profile = args.collect_profile or (args.save_cycle_trace_path is not None)
 
     setup_t0 = time.perf_counter()
 
@@ -269,6 +388,7 @@ def main() -> None:
 
     responses = []
     output_records = []
+    cycle_trace_records = []
     first_prompt_logged = False
     baseline_enabled = not args.skip_baseline
     indices = range(dist.rank(), len(dataset), dist.size())
@@ -294,6 +414,7 @@ def main() -> None:
                     block_size=bs,
                     stop_token_ids=[tokenizer.eos_token_id],
                     temperature=args.temperature,
+                    collect_profile=collect_profile,
                 )
                 response[bs].wall_time_s = cuda_time() - t_call
 
@@ -308,6 +429,24 @@ def main() -> None:
             output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
             messages.append({"role": "assistant", "content": output_text})
             responses.append(response)
+
+            if args.save_cycle_trace_path:
+                for mode_name, mode_bs in [("baseline", 1), ("speculative", block_size)]:
+                    mode_resp = response.get(mode_bs)
+                    if mode_resp is None:
+                        continue
+                    for row in getattr(mode_resp, "cycle_trace", []):
+                        cycle_trace_records.append(
+                            {
+                                "rank": dist.rank(),
+                                "dataset": args.dataset,
+                                "dataset_row_idx": idx,
+                                "turn_index": turn_index,
+                                "mode": mode_name,
+                                "block_size": int(mode_bs),
+                                **row,
+                            }
+                        )
 
             output_records.append(
                 {
@@ -326,6 +465,7 @@ def main() -> None:
                         "ttft_s": baseline_response.time_to_first_token,
                         "tpot_s": baseline_response.time_per_output_token,
                         "acceptance_lengths": baseline_response.acceptance_lengths,
+                        "profile_summary": baseline_response.profile_summary,
                     },
                     "speculative": {
                         "output_text": output_text,
@@ -335,6 +475,7 @@ def main() -> None:
                         "ttft_s": spec_response.time_to_first_token,
                         "tpot_s": spec_response.time_per_output_token,
                         "acceptance_lengths": spec_response.acceptance_lengths,
+                        "profile_summary": spec_response.profile_summary,
                     },
                 }
             )
@@ -346,10 +487,14 @@ def main() -> None:
         setup_log("gathering responses from all ranks...")
         responses = dist.gather(responses, dst=0)
         output_records = dist.gather(output_records, dst=0)
+        if args.save_cycle_trace_path:
+            cycle_trace_records = dist.gather(cycle_trace_records, dst=0)
         if not dist.is_main():
             return
         responses = list(chain(*responses))
         output_records = list(chain(*output_records))
+        if args.save_cycle_trace_path:
+            cycle_trace_records = list(chain(*cycle_trace_records))
         setup_log("gather complete")
 
     spec_samples = [r[block_size] for r in responses]
@@ -374,6 +519,25 @@ def main() -> None:
     else:
         print("Decoding speedup: N/A (baseline skipped)")
 
+    if collect_profile:
+        spec_profile = summarize_profile(spec_samples)
+        if spec_profile is not None:
+            print(f"Speculative profile avg_target_prefill_s: {spec_profile['avg_target_prefill_s']:.6f}")
+            print(f"Speculative profile avg_target_decode_s: {spec_profile['avg_target_decode_s']:.6f}")
+            print(f"Speculative profile avg_draft_decode_s: {spec_profile['avg_draft_decode_s']:.6f}")
+            print(f"Speculative profile target_share_decode: {spec_profile['target_share_decode']:.4f}")
+            print(f"Speculative profile draft_share_decode: {spec_profile['draft_share_decode']:.4f}")
+            print(f"Speculative profile total_profiled_cycles: {int(spec_profile['total_profiled_cycles'])}")
+        if baseline_enabled:
+            baseline_profile = summarize_profile(baseline_samples)
+            if baseline_profile is not None:
+                print(f"Baseline profile avg_target_prefill_s: {baseline_profile['avg_target_prefill_s']:.6f}")
+                print(f"Baseline profile avg_target_decode_s: {baseline_profile['avg_target_decode_s']:.6f}")
+                print(f"Baseline profile avg_draft_decode_s: {baseline_profile['avg_draft_decode_s']:.6f}")
+                print(f"Baseline profile target_share_decode: {baseline_profile['target_share_decode']:.4f}")
+                print(f"Baseline profile draft_share_decode: {baseline_profile['draft_share_decode']:.4f}")
+                print(f"Baseline profile total_profiled_cycles: {int(baseline_profile['total_profiled_cycles'])}")
+
     tau = np.mean([np.mean(r[block_size].acceptance_lengths) for r in responses])
     print(f"Average Acceptance length: {tau:.2f}")
 
@@ -392,6 +556,14 @@ def main() -> None:
             for row in output_records:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
         print(f"Saved per-sample outputs to: {out_path}")
+
+    if args.save_cycle_trace_path:
+        trace_path = Path(args.save_cycle_trace_path)
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        with trace_path.open("w", encoding="utf-8") as f:
+            for row in cycle_trace_records:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        print(f"Saved per-cycle trace to: {trace_path}")
 
 if __name__ == "__main__":
     main()
