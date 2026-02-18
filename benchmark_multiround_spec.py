@@ -18,7 +18,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 import distributed as dist
-from model import DFlashDraftModel, extract_context_feature, load_and_process_dataset, sample
+from model import DFlashDraftModel, extract_context_feature, load_and_process_dataset
 
 
 def cuda_time() -> float:
@@ -52,8 +52,68 @@ def summarize_mode(samples: list[SimpleNamespace]) -> dict[str, float]:
     }
 
 
+def softmax_probs(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+    probs = torch.softmax(logits.float() / temperature, dim=-1)
+    return probs
+
+
+def normalize_probs(probs: torch.Tensor) -> torch.Tensor:
+    probs = torch.clamp(probs, min=0.0)
+    denom = probs.sum(dim=-1, keepdim=True)
+    return probs / torch.clamp(denom, min=1e-12)
+
+
+def sample_from_probs(probs: torch.Tensor) -> torch.Tensor:
+    probs = normalize_probs(probs)
+    return torch.multinomial(probs, num_samples=1)
+
+
 @torch.inference_mode()
-def dflash_generate_multiround(
+def proposal_distribution_from_round(
+    *,
+    model: DFlashDraftModel,
+    target: AutoModelForCausalLM,
+    target_hidden: torch.Tensor,
+    last_token: torch.Tensor,
+    current_pos: int,
+    block_size: int,
+    mask_token_id: int,
+    temperature: float,
+    target_probs: torch.Tensor,
+) -> torch.Tensor:
+    # Round block size 1 means "proposal = current target distribution".
+    if block_size == 1:
+        return target_probs
+
+    block_output_ids = torch.full(
+        (1, block_size),
+        mask_token_id,
+        dtype=torch.long,
+        device=model.device,
+    )
+    block_output_ids[:, 0] = last_token[:, 0]
+    block_position_ids = torch.arange(
+        current_pos,
+        current_pos + block_size,
+        device=model.device,
+    ).unsqueeze(0)
+
+    noise_embedding = target.model.embed_tokens(block_output_ids)
+    draft_hidden = model(
+        target_hidden=target_hidden,
+        noise_embedding=noise_embedding,
+        position_ids=block_position_ids,
+        past_key_values=None,
+        use_cache=False,
+        is_causal=False,
+    )
+    draft_logits = target.lm_head(draft_hidden[:, -block_size + 1 :, :])
+    next_token_logits = draft_logits[:, 0, :]
+    return softmax_probs(next_token_logits, temperature)
+
+
+@torch.inference_mode()
+def dflash_generate_multiround_exact(
     *,
     model: DFlashDraftModel,
     target: AutoModelForCausalLM,
@@ -61,133 +121,121 @@ def dflash_generate_multiround(
     mask_token_id: int,
     max_new_tokens: int,
     round_block_sizes: list[int],
-    continue_ratio: float,
     stop_token_ids: list[int],
-    temperature: float = 0.0,
+    temperature: float,
 ) -> SimpleNamespace:
-    max_block_size = max(round_block_sizes)
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
-
     output_ids = torch.full(
-        (1, max_length + max_block_size),
+        (1, max_length + 1),
         mask_token_id,
         dtype=torch.long,
         device=model.device,
     )
     position_ids = torch.arange(output_ids.shape[1], device=model.device).unsqueeze(0)
     past_key_values_target = DynamicCache()
-    past_key_values_draft = DynamicCache()
+
+    output_ids[:, :num_input_tokens] = input_ids
+    stop_ids = set(stop_token_ids or [])
 
     prefill_start = cuda_time()
-    output = target(
+    prefill_output = target(
         input_ids,
         position_ids=position_ids[:, :num_input_tokens],
         past_key_values=past_key_values_target,
         use_cache=True,
         logits_to_keep=1,
-        output_hidden_states=True if max_block_size > 1 else False,
+        output_hidden_states=False,
     )
-
-    output_ids[:, :num_input_tokens] = input_ids
-    output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(output.logits, temperature)
-    target_hidden = None
-    if max_block_size > 1:
-        target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)
-
+    first_probs = softmax_probs(prefill_output.logits[:, -1, :], temperature)
+    first_token = sample_from_probs(first_probs)
+    output_ids[:, num_input_tokens] = first_token[:, 0]
     time_to_first_token = cuda_time() - prefill_start
 
     decode_start = cuda_time()
-    start = input_ids.shape[1]
-    draft_prefill = True
-
-    acceptance_lengths: list[int] = []
-    used_block_sizes: list[int] = []
+    accepted_rounds: list[int] = []
     round_trace: list[dict] = []
-    macro_steps = 0
-    stop_hit = False
 
-    while start < max_length and not stop_hit:
-        macro_steps += 1
-        for round_idx, configured_bs in enumerate(round_block_sizes):
-            if start >= max_length:
-                break
+    current_pos = num_input_tokens
+    stop_hit = int(first_token.item()) in stop_ids
 
-            remaining = max_length - start
-            bs = min(configured_bs, remaining)
-            block_output_ids = output_ids[:, start : start + bs].clone()
-            block_position_ids = position_ids[:, start : start + bs]
+    while (current_pos + 1) < max_length and not stop_hit:
+        last_token = output_ids[:, current_pos : current_pos + 1]
+        step_output = target(
+            last_token,
+            position_ids=position_ids[:, current_pos : current_pos + 1],
+            past_key_values=past_key_values_target,
+            use_cache=True,
+            logits_to_keep=1,
+            output_hidden_states=True,
+        )
+        target_probs = softmax_probs(step_output.logits[:, -1, :], temperature)
+        target_hidden = extract_context_feature(step_output.hidden_states, model.target_layer_ids)
+        residual = target_probs.clone()
 
-            if bs > 1:
-                noise_embedding = target.model.embed_tokens(block_output_ids)
-                draft_logits = target.lm_head(
-                    model(
-                        target_hidden=target_hidden,
-                        noise_embedding=noise_embedding,
-                        position_ids=position_ids[:, past_key_values_draft.get_seq_length() : start + bs],
-                        past_key_values=past_key_values_draft,
-                        use_cache=True,
-                        is_causal=False,
-                    )[:, -bs + 1 :, :]
-                )
-                past_key_values_draft.crop(start)
-                block_output_ids[:, 1:] = sample(draft_logits, temperature)
-                if draft_prefill:
-                    draft_prefill = False
-                    decode_start = cuda_time()
+        step_idx = current_pos - num_input_tokens + 1
+        chosen_token = None
+        accepted_round_idx = len(round_block_sizes) + 1
 
-            output = target(
-                block_output_ids,
-                position_ids=block_position_ids,
-                past_key_values=past_key_values_target,
-                use_cache=True,
-                output_hidden_states=True if max_block_size > 1 else False,
+        for round_idx, configured_bs in enumerate(round_block_sizes, start=1):
+            proposal_probs = proposal_distribution_from_round(
+                model=model,
+                target=target,
+                target_hidden=target_hidden,
+                last_token=last_token,
+                current_pos=current_pos,
+                block_size=configured_bs,
+                mask_token_id=mask_token_id,
+                temperature=temperature,
+                target_probs=target_probs,
             )
 
-            posterior = sample(output.logits, temperature)
-            acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
-            tau = acceptance_length + 1
-            acceptance_ratio = float(tau / max(1, bs))
+            sampled_token = sample_from_probs(proposal_probs)
+            sampled_token_id = int(sampled_token.item())
+            q_t = float(proposal_probs[0, sampled_token_id].item())
+            p_t = float(residual[0, sampled_token_id].item())
+            accept_prob = min(1.0, p_t / max(q_t, 1e-12))
+            u = float(torch.rand((), device=model.device).item())
+            accepted = u < accept_prob
 
-            output_ids[:, start : start + tau] = block_output_ids[:, :tau]
-            output_ids[:, start + tau] = posterior[:, acceptance_length]
-
-            acceptance_lengths.append(tau)
-            used_block_sizes.append(bs)
             round_trace.append(
                 {
-                    "macro_step": macro_steps,
-                    "round_idx": round_idx,
+                    "step_idx": int(step_idx),
+                    "round_idx": int(round_idx),
                     "configured_block_size": int(configured_bs),
-                    "effective_block_size": int(bs),
-                    "tau": int(tau),
-                    "acceptance_ratio": acceptance_ratio,
-                    "continue_ratio_threshold": continue_ratio,
+                    "token_id": sampled_token_id,
+                    "proposal_prob": q_t,
+                    "residual_prob": p_t,
+                    "accept_prob": accept_prob,
+                    "u": u,
+                    "accepted": bool(accepted),
                 }
             )
 
-            start += tau
-            past_key_values_target.crop(start)
-            if max_block_size > 1:
-                target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)[:, :tau, :]
-
-            if stop_token_ids is not None and any(
-                stop_token_id in output_ids[:, num_input_tokens:] for stop_token_id in stop_token_ids
-            ):
-                stop_hit = True
+            if accepted:
+                chosen_token = sampled_token
+                accepted_round_idx = round_idx
                 break
 
-            # End this macro-step early if current round quality is low.
-            if acceptance_ratio < continue_ratio:
-                break
+            residual = torch.clamp(residual - proposal_probs, min=0.0)
+            residual_mass = float(residual.sum().item())
+            if residual_mass <= 1e-12:
+                residual = target_probs.clone()
+            else:
+                residual = residual / residual_mass
 
-    output_ids = output_ids[:, :max_length]
+        if chosen_token is None:
+            chosen_token = sample_from_probs(residual)
+
+        current_pos += 1
+        output_ids[:, current_pos] = chosen_token[:, 0]
+        accepted_rounds.append(accepted_round_idx)
+
+        if int(chosen_token.item()) in stop_ids:
+            stop_hit = True
+
+    output_ids = output_ids[:, : current_pos + 1]
     output_ids = output_ids[:, output_ids[0] != mask_token_id]
-    if stop_token_ids is not None:
-        stop_tensor = torch.tensor(stop_token_ids, device=output_ids.device)
-        stop_idx = torch.isin(output_ids[0][num_input_tokens:], stop_tensor).nonzero(as_tuple=True)[0]
-        if stop_idx.numel() > 0:
-            output_ids = output_ids[:, : num_input_tokens + stop_idx[0] + 1]
 
     num_output_tokens = output_ids.shape[1] - num_input_tokens
     total_decode_time = cuda_time() - decode_start
@@ -199,33 +247,33 @@ def dflash_generate_multiround(
         num_output_tokens=num_output_tokens,
         time_to_first_token=time_to_first_token,
         time_per_output_token=time_per_output_token,
-        acceptance_lengths=acceptance_lengths,
-        used_block_sizes=used_block_sizes,
+        accepted_rounds=accepted_rounds,
         round_trace=round_trace,
-        macro_steps=macro_steps,
     )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Simple multi-round DFlash speculative inference benchmark.")
+    parser = argparse.ArgumentParser(description="Exact multi-round speculative sampling benchmark for DFlash.")
     parser.add_argument("--model-name-or-path", type=str, required=True)
     parser.add_argument("--draft-name-or-path", type=str, required=True)
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--round-block-sizes", type=str, default="16,12")
     parser.add_argument(
-        "--continue-ratio",
+        "--temperature",
         type=float,
-        default=0.55,
-        help="If tau/effective_block_size < continue_ratio, stop remaining rounds in this macro-step.",
+        default=1.0,
+        help="Sampling temperature for both target and proposal distributions. Must be > 0 for exact sampling.",
     )
+    parser.add_argument("--round-block-sizes", type=str, default="16,12")
     parser.add_argument("--skip-baseline", action="store_true")
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--log-all-ranks", action="store_true")
     parser.add_argument("--save-outputs-path", type=str, default=None)
     args = parser.parse_args()
+
+    if args.temperature <= 0.0:
+        raise ValueError("Exact multi-round speculative sampling requires --temperature > 0.0.")
 
     round_blocks = parse_round_blocks(args.round_block_sizes)
     setup_t0 = time.perf_counter()
@@ -248,6 +296,7 @@ def main() -> None:
     torch.cuda.manual_seed_all(0)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    setup_log("random seeds configured", pre_dist=True)
 
     dist.init()
     atexit.register(dist.destroy)
@@ -258,12 +307,14 @@ def main() -> None:
     def has_flash_attn() -> bool:
         try:
             import flash_attn  # noqa: F401
+
             return True
         except ImportError:
             logger.warning("flash_attn is not installed. Falling back to torch.sdpa.")
             return False
 
     installed_flash_attn = has_flash_attn()
+    setup_log(f"attention backend={'flash_attention_2' if installed_flash_attn else 'sdpa'}")
 
     setup_log("loading target model...")
     target = AutoModelForCausalLM.from_pretrained(
@@ -280,6 +331,8 @@ def main() -> None:
         dtype=torch.bfloat16,
         local_files_only=args.local_files_only,
     ).to(device).eval()
+    if draft_model.mask_token_id is None:
+        raise ValueError("Draft model has no mask_token_id in config; cannot run DFlash proposal rounds.")
 
     setup_log("loading tokenizer and dataset...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, local_files_only=args.local_files_only)
@@ -291,55 +344,60 @@ def main() -> None:
     responses_baseline = []
     responses_multiround = []
     output_records = []
+    first_prompt_logged = False
     indices = range(dist.rank(), len(dataset), dist.size())
 
     for idx in tqdm(indices, disable=not dist.is_main()):
+        first_prompt_t0 = time.perf_counter()
         instance = dataset[idx]
         messages = []
         for turn_index, user_content in enumerate(instance["turns"]):
             messages.append({"role": "user", "content": user_content})
-            input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+            input_text = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
             input_ids = tokenizer.encode(input_text, return_tensors="pt").to(target.device)
 
             baseline_response = None
             if not args.skip_baseline:
                 t_base = cuda_time()
-                baseline_response = dflash_generate_multiround(
+                baseline_response = dflash_generate_multiround_exact(
                     model=draft_model,
                     target=target,
                     input_ids=input_ids,
                     mask_token_id=draft_model.mask_token_id,
                     max_new_tokens=args.max_new_tokens,
-                    round_block_sizes=[1],
-                    continue_ratio=-1.0,
-                    stop_token_ids=[tokenizer.eos_token_id],
+                    round_block_sizes=[],
+                    stop_token_ids=[tokenizer.eos_token_id] if tokenizer.eos_token_id is not None else [],
                     temperature=args.temperature,
                 )
                 baseline_response.wall_time_s = cuda_time() - t_base
                 responses_baseline.append(baseline_response)
 
             t_multi = cuda_time()
-            multi_response = dflash_generate_multiround(
+            multi_response = dflash_generate_multiround_exact(
                 model=draft_model,
                 target=target,
                 input_ids=input_ids,
                 mask_token_id=draft_model.mask_token_id,
                 max_new_tokens=args.max_new_tokens,
                 round_block_sizes=round_blocks,
-                continue_ratio=args.continue_ratio,
-                stop_token_ids=[tokenizer.eos_token_id],
+                stop_token_ids=[tokenizer.eos_token_id] if tokenizer.eos_token_id is not None else [],
                 temperature=args.temperature,
             )
             multi_response.wall_time_s = cuda_time() - t_multi
             responses_multiround.append(multi_response)
 
-            generated_ids = multi_response.output_ids[0, multi_response.num_input_tokens:]
+            generated_ids = multi_response.output_ids[0, multi_response.num_input_tokens :]
             output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
             messages.append({"role": "assistant", "content": output_text})
 
             baseline_text = None
             if baseline_response is not None:
-                baseline_ids = baseline_response.output_ids[0, baseline_response.num_input_tokens:]
+                baseline_ids = baseline_response.output_ids[0, baseline_response.num_input_tokens :]
                 baseline_text = tokenizer.decode(baseline_ids, skip_special_tokens=True)
 
             output_records.append(
@@ -362,20 +420,20 @@ def main() -> None:
                     },
                     "multiround": {
                         "round_block_sizes": round_blocks,
-                        "continue_ratio": args.continue_ratio,
                         "output_text": output_text,
                         "num_input_tokens": multi_response.num_input_tokens,
                         "num_output_tokens": multi_response.num_output_tokens,
                         "wall_time_s": multi_response.wall_time_s,
                         "ttft_s": multi_response.time_to_first_token,
                         "tpot_s": multi_response.time_per_output_token,
-                        "acceptance_lengths": multi_response.acceptance_lengths,
-                        "used_block_sizes": multi_response.used_block_sizes,
+                        "accepted_rounds": multi_response.accepted_rounds,
                         "round_trace": multi_response.round_trace,
-                        "macro_steps": multi_response.macro_steps,
                     },
                 }
             )
+        if not first_prompt_logged:
+            setup_log(f"first local prompt finished in {time.perf_counter() - first_prompt_t0:.2f}s")
+            first_prompt_logged = True
 
     if dist.size() > 1:
         responses_multiround = dist.gather(responses_multiround, dst=0)
@@ -407,23 +465,22 @@ def main() -> None:
     else:
         print("Decoding speedup: N/A (baseline skipped)")
 
-    tau = np.mean([np.mean(r.acceptance_lengths) for r in responses_multiround])
-    print(f"Average Acceptance length: {tau:.2f}")
+    accepted_rounds = list(chain(*[r.accepted_rounds for r in responses_multiround]))
+    if accepted_rounds:
+        avg_round = float(np.mean(accepted_rounds))
+        max_round = len(round_blocks) + 1
+        round_hist = [accepted_rounds.count(i) / len(accepted_rounds) for i in range(1, max_round + 1)]
+        round_labels = [f"round_{i}" for i in range(1, len(round_blocks) + 1)] + ["residual"]
+        print(f"Average accepted round index: {avg_round:.3f}")
+        print(f"Accepted round histogram ({round_labels}): {[f'{x * 100:.1f}%' for x in round_hist]}")
 
-    max_bs = max(round_blocks)
-    all_tau = list(chain(*[r.acceptance_lengths for r in responses_multiround]))
-    histogram = [all_tau.count(b) / len(all_tau) for b in range(max_bs + 1)]
-    print(f"Acceptance length histogram: {[f'{x * 100:.1f}%' for x in histogram]}")
-
-    block_usage = Counter(chain(*[r.used_block_sizes for r in responses_multiround]))
-    block_usage_sorted = {k: block_usage[k] for k in sorted(block_usage)}
-    total_rounds = float(sum(block_usage_sorted.values()))
-    block_usage_pct = {k: (v / total_rounds) for k, v in block_usage_sorted.items()} if total_rounds > 0 else {}
-    print(f"Multiround block usage counts: {block_usage_sorted}")
-    print(f"Multiround block usage pct: {block_usage_pct}")
-
-    macro_steps = [r.macro_steps for r in responses_multiround]
-    print(f"Multiround avg macro_steps per sample: {float(np.mean(macro_steps)):.3f}")
+        usage = Counter(accepted_rounds)
+        usage_sorted = {k: usage[k] for k in sorted(usage)}
+        usage_pct = {k: (v / len(accepted_rounds)) for k, v in usage_sorted.items()}
+        print(f"Accepted round counts: {usage_sorted}")
+        print(f"Accepted round pct: {usage_pct}")
+    else:
+        print("Accepted round histogram: N/A (no decode steps after first token)")
 
     print(f"Hardware GPU: {torch.cuda.get_device_name(device)}")
     print(f"Hardware CUDA: {torch.version.cuda}")

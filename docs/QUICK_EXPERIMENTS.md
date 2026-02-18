@@ -89,12 +89,13 @@ python benchmark_sglang.py \
   --output-md sglang_quick.md
 ```
 
-## 6) Multi-round speculative framework (simple)
+## 6) Multi-round speculative sampling (exact accept/reject)
 
-This adds a simple EAGLE-style multi-round loop to DFlash inference:
-- Configure round block sizes, e.g. `16,12`
-- In each macro-step, run rounds in order
-- Stop remaining rounds in that macro-step if `tau / effective_block_size < continue_ratio`
+This implements the exact multi-round acceptance-residual algorithm:
+- Sample proposal token `t_i` from round proposal distribution `q_i`
+- Accept with probability `min(1, p(t_i) / q_i(t_i))`
+- If rejected, update residual `p <- norm(max(0, p - q_i))`
+- If all rounds reject, sample from final residual
 
 ```bash
 python benchmark_multiround_spec.py \
@@ -103,8 +104,8 @@ python benchmark_multiround_spec.py \
   --model-name-or-path Qwen/Qwen3-4B \
   --draft-name-or-path z-lab/Qwen3-4B-DFlash-b16 \
   --max-new-tokens 512 \
+  --temperature 1.0 \
   --round-block-sizes 16,12 \
-  --continue-ratio 0.55 \
   --save-outputs-path outputs/multiround_aime25.jsonl
 ```
 
