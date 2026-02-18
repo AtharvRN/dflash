@@ -89,6 +89,25 @@ python benchmark_sglang.py \
   --output-md sglang_quick.md
 ```
 
+## 6) Multi-round speculative framework (simple)
+
+This adds a simple EAGLE-style multi-round loop to DFlash inference:
+- Configure round block sizes, e.g. `16,12`
+- In each macro-step, run rounds in order
+- Stop remaining rounds in that macro-step if `tau / effective_block_size < continue_ratio`
+
+```bash
+python benchmark_multiround_spec.py \
+  --dataset aime25 \
+  --max-samples 8 \
+  --model-name-or-path Qwen/Qwen3-4B \
+  --draft-name-or-path z-lab/Qwen3-4B-DFlash-b16 \
+  --max-new-tokens 512 \
+  --round-block-sizes 16,12 \
+  --continue-ratio 0.55 \
+  --save-outputs-path outputs/multiround_aime25.jsonl
+```
+
 ## Suggested first experiment matrix (for scheduling signal)
 
 Run block sweep on 3 categories:
