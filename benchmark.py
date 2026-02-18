@@ -102,8 +102,11 @@ def dflash_generate(
                     draft_past = past_key_values_draft
                 else:
                     # Cache reuse across refinement steps is not valid here because each step
-                    # rewrites the same token range. Recompute on the local block positions.
-                    draft_position_ids = block_position_ids
+                    # rewrites the same token range. Recompute with explicit context+block
+                    # positions so RoPE length matches key length (ctx_len + block_len).
+                    ctx_len = int(target_hidden.shape[1])
+                    ctx_start = max(0, start - ctx_len)
+                    draft_position_ids = position_ids[:, ctx_start : start + effective_block_size]
                     draft_past = None
                 draft_logits = target.lm_head(
                     model(
