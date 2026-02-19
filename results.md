@@ -123,3 +123,51 @@ Saved local analysis artifacts:
 - `outputs/analysis_remote_dynamic_aime25_ewma/per_block_realized_throughput.csv`
 - `outputs/analysis_remote_dynamic_aime25_ewma/tau_vs_cycle_colored_block.png`
 - `outputs/analysis_remote_dynamic_aime25_ewma/rolling_tau_cycle_time.png`
+
+## 7) Suffix-Seed Experiments (Latest Pulled from Pod)
+
+Source files pulled from pod:
+- `outputs/remote_suffix_none_aime25.jsonl`
+- `outputs/remote_suffix_sparse_aime25.jsonl`
+- `outputs/remote_suffix_dense_aime25.jsonl`
+
+Important run-context note:
+- Latest `sparse` and `dense` files were generated with `--skip-baseline`, so those files do not contain their own baseline rows.
+- To compare all modes consistently, derived speedups for `sparse` and `dense` are normalized against the `none` baseline from the same pulled batch.
+
+| Mode | `seed_max_tokens` | Baseline in file | Spec TPOT (s) | Spec Tokens/s | Tau | Seeded tokens/cycle | Reported Speedup | Derived Speedup vs `none` baseline |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| none | -1 | yes | 0.006258 | 158.176 | 7.92 | 0.000 | 6.44x | 6.44x |
+| sparse | 2 | no | 0.011713 | 84.678 | 4.27 | 1.914 | N/A | 3.44x |
+| dense | -1 | no | 0.019733 | 50.720 | 2.52 | 13.442 | N/A | 2.04x |
+
+Takeaways from pulled suffix-seed runs:
+- Any suffix seeding currently degrades performance vs `none`.
+- Degradation tracks acceptance collapse:
+  - `none`: `tau=7.92`
+  - `sparse`: `tau=4.27`
+  - `dense`: `tau=2.52`
+- Dense seeding is the most harmful in these runs, with very high seed intensity (`13.442` seeded tokens/cycle).
+
+Saved local analysis artifacts:
+- `outputs/analysis_remote_suffix_seed/summary.md`
+- `outputs/analysis_remote_suffix_seed/summary.json`
+- `outputs/analysis_remote_suffix_seed/summary_table.csv`
+
+## 8) Latest Implementation Update (Candidate-Generation Testbed)
+
+Added a new research benchmark script:
+- `benchmark_candidate_solutions.py`
+
+Purpose:
+- test whether per-cycle draft candidate diversity can improve accepted length (`tau`) for DFlash.
+
+Current behavior:
+- run normal DFlash draft pass for a block,
+- branch early uncertain positions (`--branch-depth`, optional `--branch-margin-threshold`),
+- build bounded candidate set (`--branch-top-k`, `--max-candidates`),
+- verify candidates with target and commit the best-by-`tau` candidate.
+
+Status:
+- implementation complete; no production speed claims yet.
+- this is intended for controlled ablations against fixed-block baseline.
