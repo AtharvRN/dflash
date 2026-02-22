@@ -42,6 +42,14 @@ def summarize_mode(samples: list[SimpleNamespace]) -> dict[str, float]:
     }
 
 
+def clone_dynamic_cache(cache: DynamicCache) -> DynamicCache:
+    # Clone tensors to avoid mutating the live prefix cache when expanding batch
+    # for candidate verification.
+    legacy = cache.to_legacy_cache()
+    cloned_legacy = tuple((k.clone(), v.clone()) for k, v in legacy)
+    return DynamicCache.from_legacy_cache(cloned_legacy)
+
+
 def select_branch_positions(
     draft_logits: torch.Tensor,
     effective_block_size: int,
@@ -237,18 +245,31 @@ def dflash_generate_candidate_solutions(
 
         candidate_count_sum += len(candidate_blocks)
 
+        # Verify all candidates in one target call by expanding batch.
+        num_candidates = len(candidate_blocks)
+        stacked_candidates = torch.cat(candidate_blocks, dim=0)
+        stacked_position_ids = block_position_ids.repeat(num_candidates, 1)
+        verify_cache = clone_dynamic_cache(past_key_values_target)
+        if num_candidates > 1:
+            verify_cache.batch_repeat_interleave(num_candidates)
+
+        verify_output = target(
+            stacked_candidates,
+            position_ids=stacked_position_ids,
+            past_key_values=verify_cache,
+            use_cache=True,
+            output_hidden_states=True if effective_block_size > 1 else False,
+        )
+        candidate_verify_calls += 1
+
+        posterior_all = sample(verify_output.logits, temperature)
+        acceptance_lengths_all = (
+            (stacked_candidates[:, 1:] == posterior_all[:, :-1]).cumprod(dim=1).sum(dim=1)
+        )
+
         candidate_evals = []
-        for meta, candidate_block in zip(candidate_meta, candidate_blocks):
-            verify_output = target(
-                candidate_block,
-                position_ids=block_position_ids,
-                past_key_values=past_key_values_target,
-                use_cache=True,
-                output_hidden_states=False,
-            )
-            candidate_verify_calls += 1
-            posterior = sample(verify_output.logits, temperature)
-            acceptance_length = (candidate_block[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
+        for cand_idx, meta in enumerate(candidate_meta):
+            acceptance_length = int(acceptance_lengths_all[cand_idx].item())
             tau = acceptance_length + 1
             candidate_evals.append(
                 {
@@ -256,27 +277,22 @@ def dflash_generate_candidate_solutions(
                     "tau": int(tau),
                     "draft_score": float(meta["draft_score"]),
                     "acceptance_length": int(acceptance_length),
-                    "posterior": posterior,
                 }
             )
-            past_key_values_target.crop(start)
 
         best = max(candidate_evals, key=lambda x: (x["tau"], x["draft_score"], -x["candidate_idx"]))
         chosen_candidate_idx = int(best["candidate_idx"])
         chosen_candidate_block = candidate_blocks[chosen_candidate_idx]
-
-        # Commit chosen candidate by running target once from the prefix cache state.
-        output = target(
-            chosen_candidate_block,
-            position_ids=block_position_ids,
-            past_key_values=past_key_values_target,
-            use_cache=True,
-            output_hidden_states=True if effective_block_size > 1 else False,
-        )
-        candidate_verify_calls += 1
-        posterior = sample(output.logits, temperature)
-        acceptance_length = (chosen_candidate_block[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
+        posterior = posterior_all[chosen_candidate_idx : chosen_candidate_idx + 1]
+        acceptance_length = int(acceptance_lengths_all[chosen_candidate_idx].item())
         tau = acceptance_length + 1
+
+        # Keep only chosen branch cache for next cycle.
+        if num_candidates > 1:
+            verify_cache.batch_select_indices(
+                torch.tensor([chosen_candidate_idx], dtype=torch.long, device=stacked_candidates.device)
+            )
+        past_key_values_target = verify_cache
 
         output_ids[:, start : start + tau] = chosen_candidate_block[:, :tau]
         output_ids[:, start + tau] = posterior[:, acceptance_length]
@@ -300,7 +316,8 @@ def dflash_generate_candidate_solutions(
         start += tau
         past_key_values_target.crop(start)
         if effective_block_size > 1:
-            target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)[:, :tau, :]
+            chosen_hidden_states = [h[chosen_candidate_idx : chosen_candidate_idx + 1] for h in verify_output.hidden_states]
+            target_hidden = extract_context_feature(chosen_hidden_states, model.target_layer_ids)[:, :tau, :]
 
         if stop_token_ids is not None and any(
             stop_token_id in output_ids[:, num_input_tokens:] for stop_token_id in stop_token_ids
