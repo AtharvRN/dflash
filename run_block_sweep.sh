@@ -14,6 +14,7 @@ SUMMARY_CSV="${SUMMARY_CSV:-${LOG_DIR}/summary.csv}"
 SAVE_OUTPUTS_DIR="${SAVE_OUTPUTS_DIR:-}"
 DRY_RUN="${DRY_RUN:-0}"
 SKIP_BASELINE="${SKIP_BASELINE:-0}"
+SHARED_BASELINE_IF_SKIP="${SHARED_BASELINE_IF_SKIP:-0}"
 
 if [[ -n "${BLOCK_SIZES:-}" ]]; then
   read -r -a BS_LIST <<< "${BLOCK_SIZES}"
@@ -38,6 +39,7 @@ echo "Running block-size sweep"
 echo "dataset=${DATASET} max_samples=${MAX_SAMPLES} max_new_tokens=${MAX_NEW_TOKENS}"
 echo "block_sizes=${BS_LIST[*]} nproc=${NPROC_RESOLVED} logs=${LOG_DIR}"
 echo "skip_baseline=${SKIP_BASELINE}"
+echo "shared_baseline_if_skip=${SHARED_BASELINE_IF_SKIP}"
 if [[ -n "${SAVE_OUTPUTS_DIR}" ]]; then
   echo "save_outputs_dir=${SAVE_OUTPUTS_DIR}"
 fi
@@ -50,7 +52,7 @@ BASELINE_TOKS_PER_SEC="NA"
 BASELINE_GPU_NAME="NA"
 BASELINE_CUDA_VERSION="NA"
 BASELINE_TORCH_VERSION="NA"
-if [[ "${SKIP_BASELINE}" == "1" ]]; then
+if [[ "${SKIP_BASELINE}" == "1" && "${SHARED_BASELINE_IF_SKIP}" == "1" ]]; then
   baseline_log_path="${LOG_DIR}/${DATASET}_baseline_bs1.log"
   baseline_output_path=""
   if [[ -n "${SAVE_OUTPUTS_DIR}" ]]; then
@@ -228,7 +230,7 @@ for bs in "${BS_LIST[@]}"; do
   if [[ -z "${torch_version}" ]]; then
     torch_version="${BASELINE_TORCH_VERSION}"
   fi
-  if [[ "${SKIP_BASELINE}" == "1" && -n "${speculative_tpot}" && "${BASELINE_TPOT}" != "NA" && "${BASELINE_TPOT}" != "DRY_RUN" ]]; then
+  if [[ "${SKIP_BASELINE}" == "1" && "${SHARED_BASELINE_IF_SKIP}" == "1" && -n "${speculative_tpot}" && "${BASELINE_TPOT}" != "NA" && "${BASELINE_TPOT}" != "DRY_RUN" ]]; then
     speedup="$(awk -v b="${BASELINE_TPOT}" -v s="${speculative_tpot}" 'BEGIN { if (s > 0) printf "%.2f", b / s; else print "NA" }')"
   fi
   histogram="$(grep -E 'Acceptance length histogram:' "${log_path}" | tail -1 | sed 's/^.*Acceptance length histogram: //')"

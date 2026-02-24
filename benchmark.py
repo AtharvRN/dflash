@@ -8,14 +8,33 @@ import random
 from itertools import chain
 from pathlib import Path
 from types import SimpleNamespace
+
+_BOOT_T0 = time.perf_counter()
+builtins.print(f"[boot] +0.00s entering benchmark.py pid={os.getpid()}", flush=True)
+_IMPORT_DEBUG = os.environ.get("DFLASH_IMPORT_DEBUG", "0") == "1"
+
+
+def _boot_import_log(msg: str) -> None:
+    if _IMPORT_DEBUG:
+        builtins.print(f"[boot][imports] +{time.perf_counter() - _BOOT_T0:.2f}s {msg}", flush=True)
+
+
+_boot_import_log("importing loguru")
 from loguru import logger
+_boot_import_log("importing numpy")
 import numpy as np
+_boot_import_log("importing torch")
 import torch
+_boot_import_log("importing rich/tqdm")
 from rich import print
 from tqdm import tqdm
+_boot_import_log("importing transformers")
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+_boot_import_log("importing local model modules")
 from model import DFlashDraftModel, sample, load_and_process_dataset, extract_context_feature
+_boot_import_log("importing distributed utils")
 import distributed as dist
+_boot_import_log("all imports finished")
 
 def cuda_time() -> float:
     torch.cuda.synchronize()

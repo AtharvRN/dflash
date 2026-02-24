@@ -10,15 +10,31 @@ from itertools import chain
 from pathlib import Path
 from types import SimpleNamespace
 
+_BOOT_T0 = time.perf_counter()
+builtins.print(f"[boot] +0.00s entering benchmark_dynamic_schedule.py pid={os.getpid()}", flush=True)
+_IMPORT_DEBUG = os.environ.get("DFLASH_IMPORT_DEBUG", "0") == "1"
+
+
+def _boot_import_log(msg: str) -> None:
+    if _IMPORT_DEBUG:
+        builtins.print(f"[boot][imports] +{time.perf_counter() - _BOOT_T0:.2f}s {msg}", flush=True)
+
+
+_boot_import_log("importing numpy")
 import numpy as np
+_boot_import_log("importing torch")
 import torch
+_boot_import_log("importing loguru/rich/tqdm")
 from loguru import logger
 from rich import print
 from tqdm import tqdm
+_boot_import_log("importing transformers")
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
+_boot_import_log("importing local modules")
 import distributed as dist
 from model import DFlashDraftModel, extract_context_feature, load_and_process_dataset, sample
+_boot_import_log("all imports finished")
 
 
 def cuda_time() -> float:
@@ -40,6 +56,7 @@ class EWMAPerformanceScheduler:
         self,
         *,
         candidates: list[int],
+        scheduler_mode: str,
         warmup_cycles: int,
         ewma_alpha: float,
         switch_margin: float,
@@ -48,8 +65,16 @@ class EWMAPerformanceScheduler:
         probe_interval: int,
         low_accept_threshold: float,
         low_accept_streak: int,
+        adl_rho: float,
+        adl_delta: float,
+        adl_k_min: int,
+        adl_k_max: int,
+        adl_neighborhood: int,
     ) -> None:
         self.candidates = sorted(candidates)
+        self.scheduler_mode = str(scheduler_mode)
+        if self.scheduler_mode not in {"ewma", "adl_ewma"}:
+            raise ValueError("scheduler_mode must be one of {'ewma', 'adl_ewma'}.")
         self.current = self.candidates[-1]
         self.warmup_cycles = int(max(0, warmup_cycles))
         self.ewma_alpha = float(ewma_alpha)
@@ -61,6 +86,18 @@ class EWMAPerformanceScheduler:
         self.probe_interval = int(max(0, probe_interval))
         self.low_accept_threshold = float(low_accept_threshold)
         self.low_accept_streak = int(max(1, low_accept_streak))
+
+        self.adl_rho = float(adl_rho)
+        if not (0.0 < self.adl_rho <= 1.0):
+            raise ValueError("adl_rho must be in (0, 1].")
+        self.adl_delta = float(adl_delta)
+        if self.adl_delta < 0.0:
+            raise ValueError("adl_delta must be >= 0.")
+        self.adl_k_min = int(adl_k_min)
+        self.adl_k_max = int(adl_k_max)
+        if self.adl_k_min > self.adl_k_max:
+            raise ValueError("adl_k_min must be <= adl_k_max.")
+        self.adl_neighborhood = int(max(0, adl_neighborhood))
 
         self.cooldown_left = 0
         self.pending_target = self.current
@@ -74,10 +111,20 @@ class EWMAPerformanceScheduler:
         self.score_hat = {b: None for b in self.candidates}
         self.obs_count = {b: 0 for b in self.candidates}
 
+        # DiffuSpec-style ADL state (used when scheduler_mode == "adl_ewma").
+        self.adl_lgen_hat: float | None = None
+        self.adl_lacc_hat: float | None = None
+        self.adl_target_k: int = int(np.clip(self.current, self.adl_k_min, self.adl_k_max))
+        self.adl_target_bs: int = self._nearest_candidate(self.adl_target_k)
+
     def _ewma(self, old: float | None, new: float) -> float:
+        return self._ewma_alpha(old, new, self.ewma_alpha)
+
+    @staticmethod
+    def _ewma_alpha(old: float | None, new: float, alpha: float) -> float:
         if old is None:
             return float(new)
-        return float((1.0 - self.ewma_alpha) * old + self.ewma_alpha * new)
+        return float((1.0 - alpha) * old + alpha * new)
 
     def _next_probe_candidate(self) -> int:
         for _ in range(len(self.candidates)):
@@ -90,6 +137,13 @@ class EWMAPerformanceScheduler:
     def _lower_neighbor(self, b: int) -> int:
         idx = self.candidates.index(b)
         return self.candidates[max(0, idx - 1)]
+
+    def _nearest_candidate(self, k: int) -> int:
+        return min(self.candidates, key=lambda b: (abs(b - k), -b))
+
+    def _adl_candidate_pool(self) -> set[int]:
+        center = self.adl_target_bs
+        return {b for b in self.candidates if abs(b - center) <= self.adl_neighborhood}
 
     def select(self, cycle_idx: int) -> int:
         # Warmup probes candidates round-robin to bootstrap estimates.
@@ -105,7 +159,15 @@ class EWMAPerformanceScheduler:
 
         return self.current
 
-    def update(self, *, tau: float, cycle_s: float, effective_bs: int, cycle_idx: int) -> None:
+    def update(
+        self,
+        *,
+        tau: float,
+        cycle_s: float,
+        effective_bs: int,
+        cycle_idx: int,
+        l_gen: float | None = None,
+    ) -> None:
         tau = float(tau)
         cycle_s = float(cycle_s)
         effective_bs = int(effective_bs)
@@ -120,6 +182,21 @@ class EWMAPerformanceScheduler:
             self.tau_hat[effective_bs] / max(1e-12, self.cycle_hat[effective_bs])
         )
         self.obs_count[effective_bs] += 1
+
+        if self.scheduler_mode == "adl_ewma" and l_gen is not None:
+            l_gen = float(l_gen)
+            self.adl_lgen_hat = self._ewma_alpha(self.adl_lgen_hat, l_gen, self.adl_rho)
+            self.adl_lacc_hat = self._ewma_alpha(self.adl_lacc_hat, tau, self.adl_rho)
+            growth = self.adl_delta if self.adl_lacc_hat >= self.adl_lgen_hat else 0.0
+            k_next = int(
+                np.clip(
+                    np.ceil(self.adl_lgen_hat + growth),
+                    self.adl_k_min,
+                    self.adl_k_max,
+                )
+            )
+            self.adl_target_k = k_next
+            self.adl_target_bs = self._nearest_candidate(k_next)
 
         acceptance_ratio = tau / max(1.0, float(effective_bs))
         if acceptance_ratio < self.low_accept_threshold and effective_bs == self.current:
@@ -147,6 +224,12 @@ class EWMAPerformanceScheduler:
         scored = [(b, s) for b, s in self.score_hat.items() if s is not None]
         if not scored:
             return
+
+        if self.scheduler_mode == "adl_ewma":
+            local_pool = self._adl_candidate_pool()
+            local_scored = [(b, s) for b, s in scored if b in local_pool]
+            if local_scored:
+                scored = local_scored
 
         best_b, best_score = max(scored, key=lambda x: x[1])
         current_score = self.score_hat.get(self.current)
@@ -219,6 +302,9 @@ def dflash_generate_policy(
     target_hidden = None
     if max_block_size > 1:
         target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)
+    stop_token_tensor = None
+    if stop_token_ids is not None and len(stop_token_ids) > 0:
+        stop_token_tensor = torch.tensor(stop_token_ids, device=output_ids.device)
 
     time_to_first_token = cuda_time() - prefill_start
 
@@ -235,6 +321,7 @@ def dflash_generate_policy(
         chosen_bs = fixed_block_size if fixed_block_size is not None else scheduler.select(cycle_idx)
         remaining = max_length - start
         bs = max(1, min(chosen_bs, remaining))
+        l_gen = float(bs)
 
         block_output_ids = output_ids[:, start : start + bs].clone()
         block_position_ids = position_ids[:, start : start + bs]
@@ -253,6 +340,13 @@ def dflash_generate_policy(
             )
             past_key_values_draft.crop(start)
             block_output_ids[:, 1:] = sample(draft_logits, temperature)
+
+            if stop_token_tensor is not None:
+                eos_pos = torch.isin(block_output_ids[0, 1:], stop_token_tensor).nonzero(as_tuple=True)[0]
+                if eos_pos.numel() > 0:
+                    # DiffuSpec-style EOS-aware generated length adapted to DFlash's tau scale.
+                    # l_gen is in [1, bs], where bs means no early EOS in drafted positions.
+                    l_gen = float(min(int(eos_pos[0].item()) + 1, bs))
             if draft_prefill:
                 draft_prefill = False
                 decode_start = cuda_time()
@@ -276,7 +370,13 @@ def dflash_generate_policy(
         used_block_sizes.append(bs)
         cycle_s = cuda_time() - cycle_t0
         if scheduler is not None:
-            scheduler.update(tau=tau, cycle_s=cycle_s, effective_bs=bs, cycle_idx=cycle_idx)
+            scheduler.update(
+                tau=tau,
+                cycle_s=cycle_s,
+                effective_bs=bs,
+                cycle_idx=cycle_idx,
+                l_gen=l_gen,
+            )
         cycle_trace.append(
             {
                 "cycle_idx": cycle_idx,
@@ -284,12 +384,17 @@ def dflash_generate_policy(
                 "block_size": int(bs),
                 "chosen_block_size": int(chosen_bs),
                 "tau": int(tau),
+                "l_gen": float(l_gen),
                 "acceptance_ratio": float(tau / max(1, bs)),
                 "cycle_s": float(cycle_s),
                 "tau_hat": None if scheduler is None else scheduler.tau_hat.get(bs),
                 "cycle_hat": None if scheduler is None else scheduler.cycle_hat.get(bs),
                 "score_hat": None if scheduler is None else scheduler.score_hat.get(bs),
                 "current_block_size": None if scheduler is None else int(scheduler.current),
+                "adl_lgen_hat": None if scheduler is None else scheduler.adl_lgen_hat,
+                "adl_lacc_hat": None if scheduler is None else scheduler.adl_lacc_hat,
+                "adl_target_k": None if scheduler is None else int(scheduler.adl_target_k),
+                "adl_target_bs": None if scheduler is None else int(scheduler.adl_target_bs),
             }
         )
 
@@ -355,6 +460,7 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--candidate-block-sizes", type=str, default="8,12,16")
+    parser.add_argument("--scheduler-mode", type=str, default="ewma", choices=["ewma", "adl_ewma"])
     parser.add_argument("--warmup-cycles", type=int, default=2)
     parser.add_argument("--ewma-alpha", type=float, default=0.10)
     parser.add_argument("--switch-margin", type=float, default=0.05)
@@ -363,6 +469,16 @@ def main() -> None:
     parser.add_argument("--probe-interval", type=int, default=12)
     parser.add_argument("--low-accept-threshold", type=float, default=0.35)
     parser.add_argument("--low-accept-streak", type=int, default=2)
+    parser.add_argument("--adl-rho", type=float, default=0.30)
+    parser.add_argument("--adl-delta", type=float, default=2.0)
+    parser.add_argument("--adl-k-min", type=int, default=None)
+    parser.add_argument("--adl-k-max", type=int, default=None)
+    parser.add_argument(
+        "--adl-neighborhood",
+        type=int,
+        default=4,
+        help="Search scored candidates within +/- this many tokens around ADL target block size.",
+    )
     # Backward-compatible legacy flags from the old rolling-tau scheduler.
     parser.add_argument("--decision-window", type=int, default=4, help=argparse.SUPPRESS)
     parser.add_argument("--tau-high", type=float, default=7.0, help=argparse.SUPPRESS)
@@ -386,11 +502,16 @@ def main() -> None:
             )
 
     candidates = parse_block_sizes(args.candidate_block_sizes)
+    adl_k_min = min(candidates) if args.adl_k_min is None else int(args.adl_k_min)
+    adl_k_max = max(candidates) if args.adl_k_max is None else int(args.adl_k_max)
     setup_log(
         (
             f"pid={os.getpid()} starting; candidates={candidates}; "
+            f"mode={args.scheduler_mode}; "
             f"ewma_alpha={args.ewma_alpha}, switch_margin={args.switch_margin}, "
-            f"probe_interval={args.probe_interval}, low_accept_threshold={args.low_accept_threshold}"
+            f"probe_interval={args.probe_interval}, low_accept_threshold={args.low_accept_threshold}, "
+            f"adl_rho={args.adl_rho}, adl_delta={args.adl_delta}, "
+            f"adl_k_min={adl_k_min}, adl_k_max={adl_k_max}, adl_neighborhood={args.adl_neighborhood}"
         ),
         pre_dist=True,
     )
@@ -472,6 +593,7 @@ def main() -> None:
 
             scheduler = EWMAPerformanceScheduler(
                 candidates=candidates,
+                scheduler_mode=args.scheduler_mode,
                 warmup_cycles=args.warmup_cycles,
                 ewma_alpha=args.ewma_alpha,
                 switch_margin=args.switch_margin,
@@ -480,6 +602,11 @@ def main() -> None:
                 probe_interval=args.probe_interval,
                 low_accept_threshold=args.low_accept_threshold,
                 low_accept_streak=args.low_accept_streak,
+                adl_rho=args.adl_rho,
+                adl_delta=args.adl_delta,
+                adl_k_min=adl_k_min,
+                adl_k_max=adl_k_max,
+                adl_neighborhood=args.adl_neighborhood,
             )
             t_dyn = cuda_time()
             dynamic_response = dflash_generate_policy(
@@ -526,7 +653,7 @@ def main() -> None:
                     "dynamic": {
                         "candidate_block_sizes": candidates,
                         "scheduler": {
-                            "type": "ewma_performance",
+                            "type": args.scheduler_mode,
                             "warmup_cycles": args.warmup_cycles,
                             "ewma_alpha": args.ewma_alpha,
                             "switch_margin": args.switch_margin,
@@ -535,6 +662,11 @@ def main() -> None:
                             "probe_interval": args.probe_interval,
                             "low_accept_threshold": args.low_accept_threshold,
                             "low_accept_streak": args.low_accept_streak,
+                            "adl_rho": args.adl_rho,
+                            "adl_delta": args.adl_delta,
+                            "adl_k_min": adl_k_min,
+                            "adl_k_max": adl_k_max,
+                            "adl_neighborhood": args.adl_neighborhood,
                         },
                         "output_text": dyn_output_text,
                         "num_input_tokens": dynamic_response.num_input_tokens,
