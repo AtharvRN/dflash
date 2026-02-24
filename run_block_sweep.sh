@@ -196,19 +196,19 @@ for bs in "${BS_LIST[@]}"; do
     continue
   fi
 
-  speedup="$(grep -Eo 'Decoding speedup: [0-9.]+$' "${log_path}" | tail -1 | awk '{print $3}')"
-  tau="$(grep -Eo 'Average Acceptance length: [0-9.]+$' "${log_path}" | tail -1 | awk '{print $4}')"
-  speculative_total_wall_s="$(grep -Eo 'Speculative total_wall_s: [0-9.]+$' "${log_path}" | tail -1 | awk '{print $3}')"
-  speculative_tokens_per_sec="$(grep -Eo 'Speculative tokens_per_sec: [0-9.]+$' "${log_path}" | tail -1 | awk '{print $3}')"
-  speculative_tpot="$(grep -Eo 'Speculative TPOT: [0-9.]+$' "${log_path}" | tail -1 | awk '{print $3}')"
-  speculative_ttft="$(grep -Eo 'Speculative TTFT: [0-9.]+$' "${log_path}" | tail -1 | awk '{print $3}')"
-  gpu_name="$(grep -E '^Hardware GPU:' "${log_path}" | tail -1 | sed 's/^Hardware GPU: //')"
-  cuda_version="$(grep -E '^Hardware CUDA:' "${log_path}" | tail -1 | sed 's/^Hardware CUDA: //')"
-  torch_version="$(grep -E '^Hardware Torch:' "${log_path}" | tail -1 | sed 's/^Hardware Torch: //')"
-  baseline_total_wall_s="$(grep -Eo 'Baseline total_wall_s: [0-9.]+$' "${log_path}" | tail -1 | awk '{print $3}')"
-  baseline_tokens_per_sec="$(grep -Eo 'Baseline tokens_per_sec: [0-9.]+$' "${log_path}" | tail -1 | awk '{print $3}')"
-  baseline_tpot_from_log="$(grep -Eo 'Baseline TPOT: [0-9.]+$' "${log_path}" | tail -1 | awk '{print $3}')"
-  baseline_ttft_from_log="$(grep -Eo 'Baseline TTFT: [0-9.]+$' "${log_path}" | tail -1 | awk '{print $3}')"
+  speedup="$( (grep -Eo 'Decoding speedup: [0-9.]+$' "${log_path}" || true) | tail -1 | awk '{print $3}')"
+  tau="$( (grep -Eo 'Average Acceptance length: [0-9.]+$' "${log_path}" || true) | tail -1 | awk '{print $4}')"
+  speculative_total_wall_s="$( (grep -Eo 'Speculative total_wall_s: [0-9.]+$' "${log_path}" || true) | tail -1 | awk '{print $3}')"
+  speculative_tokens_per_sec="$( (grep -Eo 'Speculative tokens_per_sec: [0-9.]+$' "${log_path}" || true) | tail -1 | awk '{print $3}')"
+  speculative_tpot="$( (grep -Eo 'Speculative TPOT: [0-9.]+$' "${log_path}" || true) | tail -1 | awk '{print $3}')"
+  speculative_ttft="$( (grep -Eo 'Speculative TTFT: [0-9.]+$' "${log_path}" || true) | tail -1 | awk '{print $3}')"
+  gpu_name="$( (grep -E '^Hardware GPU:' "${log_path}" || true) | tail -1 | sed 's/^Hardware GPU: //')"
+  cuda_version="$( (grep -E '^Hardware CUDA:' "${log_path}" || true) | tail -1 | sed 's/^Hardware CUDA: //')"
+  torch_version="$( (grep -E '^Hardware Torch:' "${log_path}" || true) | tail -1 | sed 's/^Hardware Torch: //')"
+  baseline_total_wall_s="$( (grep -Eo 'Baseline total_wall_s: [0-9.]+$' "${log_path}" || true) | tail -1 | awk '{print $3}')"
+  baseline_tokens_per_sec="$( (grep -Eo 'Baseline tokens_per_sec: [0-9.]+$' "${log_path}" || true) | tail -1 | awk '{print $3}')"
+  baseline_tpot_from_log="$( (grep -Eo 'Baseline TPOT: [0-9.]+$' "${log_path}" || true) | tail -1 | awk '{print $3}')"
+  baseline_ttft_from_log="$( (grep -Eo 'Baseline TTFT: [0-9.]+$' "${log_path}" || true) | tail -1 | awk '{print $3}')"
   if [[ -z "${baseline_tpot_from_log}" ]]; then
     baseline_tpot_from_log="${BASELINE_TPOT}"
   fi
@@ -233,7 +233,7 @@ for bs in "${BS_LIST[@]}"; do
   if [[ "${SKIP_BASELINE}" == "1" && "${SHARED_BASELINE_IF_SKIP}" == "1" && -n "${speculative_tpot}" && "${BASELINE_TPOT}" != "NA" && "${BASELINE_TPOT}" != "DRY_RUN" ]]; then
     speedup="$(awk -v b="${BASELINE_TPOT}" -v s="${speculative_tpot}" 'BEGIN { if (s > 0) printf "%.2f", b / s; else print "NA" }')"
   fi
-  histogram="$(grep -E 'Acceptance length histogram:' "${log_path}" | tail -1 | sed 's/^.*Acceptance length histogram: //')"
+  histogram="$( (grep -E 'Acceptance length histogram:' "${log_path}" || true) | tail -1 | sed 's/^.*Acceptance length histogram: //')"
   speedup="${speedup:-NA}"
   tau="${tau:-NA}"
   speculative_total_wall_s="${speculative_total_wall_s:-NA}"
