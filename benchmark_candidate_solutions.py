@@ -5,6 +5,7 @@ import json
 import os
 import random
 import time
+from collections import Counter
 from itertools import chain
 from pathlib import Path
 from types import SimpleNamespace
@@ -378,6 +379,41 @@ def build_uncertainty_sparse_rank_candidates(
     return candidates, metadata, [int(p) for p in selected_block_positions.tolist()]
 
 
+def resolve_cycle_max_candidates(
+    *,
+    enabled: bool,
+    max_candidates: int,
+    cycle_idx: int,
+    last_accept_ratio: float | None,
+    budgets: tuple[int, int, int],
+    accept_thresholds: tuple[float, float],
+    warmup_cycles: int,
+    probe_interval: int,
+) -> int:
+    if not enabled:
+        return int(max_candidates)
+
+    low_budget, mid_budget, high_budget = budgets
+    high_accept, mid_accept = accept_thresholds
+
+    if cycle_idx < warmup_cycles:
+        return int(max(1, min(max_candidates, high_budget)))
+
+    if probe_interval > 0 and cycle_idx > 0 and (cycle_idx % probe_interval == 0):
+        return int(max(1, min(max_candidates, high_budget)))
+
+    if last_accept_ratio is None:
+        selected = high_budget
+    elif last_accept_ratio >= high_accept:
+        selected = low_budget
+    elif last_accept_ratio >= mid_accept:
+        selected = mid_budget
+    else:
+        selected = high_budget
+
+    return int(max(1, min(max_candidates, selected)))
+
+
 @torch.inference_mode()
 def dflash_generate_candidate_solutions(
     model: DFlashDraftModel,
@@ -394,6 +430,11 @@ def dflash_generate_candidate_solutions(
     candidate_mode: str,
     fixed_prefix_len: int,
     sparse_max_positions: int,
+    adaptive_candidates: bool,
+    adaptive_budgets: tuple[int, int, int],
+    adaptive_accept_thresholds: tuple[float, float],
+    adaptive_warmup_cycles: int,
+    adaptive_probe_interval: int,
     temperature: float = 0.0,
     collect_profile: bool = False,
 ) -> SimpleNamespace:
@@ -438,6 +479,8 @@ def dflash_generate_candidate_solutions(
     candidate_count_sum = 0
     candidate_verify_calls = 0
     first_prompt_cycle_done = False
+    last_accept_ratio = None
+    adaptive_budget_counts: Counter[int] = Counter()
 
     while start < max_length:
         cycle_start = None
@@ -451,6 +494,18 @@ def dflash_generate_candidate_solutions(
 
         remaining = max_length - start
         effective_block_size = min(block_size, remaining)
+        cycle_idx = len(acceptance_lengths)
+        cycle_max_candidates = resolve_cycle_max_candidates(
+            enabled=adaptive_candidates,
+            max_candidates=max_candidates,
+            cycle_idx=cycle_idx,
+            last_accept_ratio=last_accept_ratio,
+            budgets=adaptive_budgets,
+            accept_thresholds=adaptive_accept_thresholds,
+            warmup_cycles=adaptive_warmup_cycles,
+            probe_interval=adaptive_probe_interval,
+        )
+        adaptive_budget_counts[cycle_max_candidates] += 1
         block_output_ids = output_ids[:, start : start + effective_block_size].clone()
         block_position_ids = position_ids[:, start : start + effective_block_size]
 
@@ -481,7 +536,7 @@ def dflash_generate_candidate_solutions(
                     draft_logits=draft_logits,
                     fixed_prefix_len=fixed_prefix_len,
                     rank_top_k=branch_top_k,
-                    max_candidates=max_candidates,
+                    max_candidates=cycle_max_candidates,
                 )
             elif candidate_mode == "uncertainty_sparse_rank":
                 candidate_blocks, candidate_meta, selected_positions = build_uncertainty_sparse_rank_candidates(
@@ -489,7 +544,7 @@ def dflash_generate_candidate_solutions(
                     draft_logits=draft_logits,
                     fixed_prefix_len=fixed_prefix_len,
                     rank_top_k=branch_top_k,
-                    max_candidates=max_candidates,
+                    max_candidates=cycle_max_candidates,
                     sparse_max_positions=sparse_max_positions,
                     margin_threshold=margin_threshold,
                 )
@@ -505,7 +560,7 @@ def dflash_generate_candidate_solutions(
                     draft_logits=draft_logits,
                     selected_positions=selected_positions,
                     branch_top_k=branch_top_k,
-                    max_candidates=max_candidates,
+                    max_candidates=cycle_max_candidates,
                 )
             if collect_profile:
                 draft_events[1].record()
@@ -573,6 +628,7 @@ def dflash_generate_candidate_solutions(
             "tau": int(tau),
             "acceptance_ratio": float(tau / max(1, effective_block_size)),
             "num_candidates": int(len(candidate_blocks)),
+            "cycle_max_candidates": int(cycle_max_candidates),
             "selected_positions": [int(x) for x in selected_positions],
             "chosen_candidate_idx": int(chosen_candidate_idx),
             "candidate_taus": [int(x) for x in tau_all.tolist()],
@@ -587,6 +643,7 @@ def dflash_generate_candidate_solutions(
                 "cycle": (cycle_start, cycle_end),
             }
         cycle_trace.append(cycle_row)
+        last_accept_ratio = float(tau / max(1, effective_block_size))
 
         start += tau
         past_key_values_target.crop(start)
@@ -620,6 +677,12 @@ def dflash_generate_candidate_solutions(
         "candidate_mode": str(candidate_mode),
         "fixed_prefix_len": int(fixed_prefix_len),
         "sparse_max_positions": int(sparse_max_positions),
+        "adaptive_candidates": bool(adaptive_candidates),
+        "adaptive_budgets": [int(x) for x in adaptive_budgets],
+        "adaptive_accept_thresholds": [float(x) for x in adaptive_accept_thresholds],
+        "adaptive_warmup_cycles": int(adaptive_warmup_cycles),
+        "adaptive_probe_interval": int(adaptive_probe_interval),
+        "adaptive_budget_counts": {str(k): int(v) for k, v in sorted(adaptive_budget_counts.items())},
         "avg_candidates_per_cycle": float(avg_candidates_per_cycle),
         "candidate_verify_calls": int(candidate_verify_calls),
         "candidate_count_sum": int(candidate_count_sum),
@@ -719,6 +782,35 @@ def main() -> None:
         default=4,
         help="For uncertainty_sparse_rank: max uncertain suffix positions to include in alternative pool.",
     )
+    parser.add_argument(
+        "--adaptive-candidates",
+        action="store_true",
+        help="Enable per-cycle adaptive max-candidate budget driven by previous acceptance ratio.",
+    )
+    parser.add_argument(
+        "--adaptive-budgets",
+        type=str,
+        default="1,4,8",
+        help="Comma-separated low,mid,high candidate budgets (e.g. 1,4,8).",
+    )
+    parser.add_argument(
+        "--adaptive-accept-thresholds",
+        type=str,
+        default="0.85,0.65",
+        help="Comma-separated high,mid acceptance-ratio thresholds for budget switching.",
+    )
+    parser.add_argument(
+        "--adaptive-warmup-cycles",
+        type=int,
+        default=4,
+        help="Cycles to run with high candidate budget before adaptation starts.",
+    )
+    parser.add_argument(
+        "--adaptive-probe-interval",
+        type=int,
+        default=16,
+        help="If >0, force high candidate budget every N cycles for exploration.",
+    )
     parser.add_argument("--skip-baseline", action="store_true")
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--log-all-ranks", action="store_true")
@@ -741,9 +833,34 @@ def main() -> None:
         raise ValueError("--fixed-prefix-len must be >= 0")
     if args.sparse_max_positions < 1:
         raise ValueError("--sparse-max-positions must be >= 1")
+    if args.adaptive_warmup_cycles < 0:
+        raise ValueError("--adaptive-warmup-cycles must be >= 0")
+    if args.adaptive_probe_interval < 0:
+        raise ValueError("--adaptive-probe-interval must be >= 0")
     if args.temperature >= 1e-5:
         raise ValueError("This research script currently supports only --temperature 0.0")
     collect_profile = args.collect_profile or (args.save_cycle_trace_path is not None)
+
+    try:
+        adaptive_budget_vals = tuple(int(x.strip()) for x in args.adaptive_budgets.split(",") if x.strip())
+    except ValueError as exc:
+        raise ValueError("--adaptive-budgets must be comma-separated integers.") from exc
+    if len(adaptive_budget_vals) != 3:
+        raise ValueError("--adaptive-budgets must contain exactly 3 values: low,mid,high.")
+    if any(v < 1 for v in adaptive_budget_vals):
+        raise ValueError("--adaptive-budgets values must be >= 1.")
+
+    try:
+        adaptive_threshold_vals = tuple(float(x.strip()) for x in args.adaptive_accept_thresholds.split(",") if x.strip())
+    except ValueError as exc:
+        raise ValueError("--adaptive-accept-thresholds must be comma-separated floats.") from exc
+    if len(adaptive_threshold_vals) != 2:
+        raise ValueError("--adaptive-accept-thresholds must contain exactly 2 values: high,mid.")
+    high_accept, mid_accept = adaptive_threshold_vals
+    if not (0.0 <= mid_accept <= 1.0 and 0.0 <= high_accept <= 1.0):
+        raise ValueError("--adaptive-accept-thresholds values must be in [0,1].")
+    if high_accept < mid_accept:
+        raise ValueError("--adaptive-accept-thresholds must satisfy high >= mid.")
 
     setup_t0 = time.perf_counter()
 
@@ -762,7 +879,11 @@ def main() -> None:
             f"pid={os.getpid()} starting; "
             f"candidate_mode={args.candidate_mode}, fixed_prefix_len={args.fixed_prefix_len}, "
             f"branch_depth={args.branch_depth}, top_k={args.branch_top_k}, max_candidates={args.max_candidates}, "
-            f"margin_threshold={args.branch_margin_threshold}, sparse_max_positions={args.sparse_max_positions}"
+            f"margin_threshold={args.branch_margin_threshold}, sparse_max_positions={args.sparse_max_positions}, "
+            f"adaptive_candidates={args.adaptive_candidates}, adaptive_budgets={adaptive_budget_vals}, "
+            f"adaptive_accept_thresholds={adaptive_threshold_vals}, "
+            f"adaptive_warmup_cycles={args.adaptive_warmup_cycles}, "
+            f"adaptive_probe_interval={args.adaptive_probe_interval}"
         ),
         pre_dist=True,
     )
@@ -874,6 +995,11 @@ def main() -> None:
                     candidate_mode=args.candidate_mode,
                     fixed_prefix_len=args.fixed_prefix_len,
                     sparse_max_positions=args.sparse_max_positions,
+                    adaptive_candidates=args.adaptive_candidates,
+                    adaptive_budgets=adaptive_budget_vals,
+                    adaptive_accept_thresholds=adaptive_threshold_vals,
+                    adaptive_warmup_cycles=args.adaptive_warmup_cycles,
+                    adaptive_probe_interval=args.adaptive_probe_interval,
                     temperature=args.temperature,
                     collect_profile=collect_profile,
                 )
@@ -925,6 +1051,11 @@ def main() -> None:
                     "candidate_mode": args.candidate_mode,
                     "fixed_prefix_len": args.fixed_prefix_len,
                     "sparse_max_positions": args.sparse_max_positions,
+                    "adaptive_candidates": args.adaptive_candidates,
+                    "adaptive_budgets": [int(x) for x in adaptive_budget_vals],
+                    "adaptive_accept_thresholds": [float(x) for x in adaptive_threshold_vals],
+                    "adaptive_warmup_cycles": args.adaptive_warmup_cycles,
+                    "adaptive_probe_interval": args.adaptive_probe_interval,
                     "baseline": None
                     if baseline_response is None
                     else {
@@ -1020,6 +1151,7 @@ def main() -> None:
 
     avg_candidates_per_cycle = float(np.mean([r[block_size].candidate_summary["avg_candidates_per_cycle"] for r in responses]))
     avg_verify_calls = float(np.mean([r[block_size].candidate_summary["candidate_verify_calls"] for r in responses]))
+    adaptive_enabled = bool(np.any([r[block_size].candidate_summary.get("adaptive_candidates", False) for r in responses]))
     print(f"Candidate avg_candidates_per_cycle: {avg_candidates_per_cycle:.3f}")
     print(f"Candidate avg_verify_calls_per_sample: {avg_verify_calls:.1f}")
     print(f"Candidate mode: {args.candidate_mode}")
@@ -1029,6 +1161,24 @@ def main() -> None:
     print(f"Candidate branch_top_k: {args.branch_top_k}")
     print(f"Candidate max_candidates: {args.max_candidates}")
     print(f"Candidate margin_threshold: {args.branch_margin_threshold}")
+    print(f"Candidate adaptive_enabled: {adaptive_enabled}")
+    if adaptive_enabled:
+        aggregate_budget_counts: Counter[int] = Counter()
+        for r in responses:
+            raw_counts = r[block_size].candidate_summary.get("adaptive_budget_counts", {})
+            for k, v in raw_counts.items():
+                aggregate_budget_counts[int(k)] += int(v)
+        total_budget_cycles = int(sum(aggregate_budget_counts.values()))
+        budget_pct = {
+            int(k): (float(v) / max(1, total_budget_cycles))
+            for k, v in sorted(aggregate_budget_counts.items())
+        }
+        print(f"Candidate adaptive_budgets: {[int(x) for x in adaptive_budget_vals]}")
+        print(f"Candidate adaptive_accept_thresholds: {[float(x) for x in adaptive_threshold_vals]}")
+        print(f"Candidate adaptive_warmup_cycles: {args.adaptive_warmup_cycles}")
+        print(f"Candidate adaptive_probe_interval: {args.adaptive_probe_interval}")
+        print(f"Candidate adaptive_budget_counts: {dict(sorted(aggregate_budget_counts.items()))}")
+        print(f"Candidate adaptive_budget_pct: {budget_pct}")
 
     print(f"Hardware GPU: {torch.cuda.get_device_name(device)}")
     print(f"Hardware CUDA: {torch.version.cuda}")

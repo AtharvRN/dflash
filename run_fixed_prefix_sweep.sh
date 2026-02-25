@@ -21,6 +21,7 @@ RUN_VANILLA_REF="${RUN_VANILLA_REF:-1}"
 COLLECT_PROFILE="${COLLECT_PROFILE:-1}"
 SAVE_CYCLE_TRACE="${SAVE_CYCLE_TRACE:-${COLLECT_PROFILE}}"
 LOCAL_FILES_ONLY="${LOCAL_FILES_ONLY:-0}"
+CANDIDATE_EXTRA_ARGS="${CANDIDATE_EXTRA_ARGS:-}"
 
 if [[ -n "${FIXED_PREFIX_LENS:-}" ]]; then
   read -r -a PREFIX_LIST <<< "${FIXED_PREFIX_LENS}"
@@ -89,6 +90,9 @@ echo "Running fixed-prefix candidate sweep"
 echo "dataset=${DATASET} max_samples=${MAX_SAMPLES} block_size=${BLOCK_SIZE} max_new_tokens=${MAX_NEW_TOKENS}"
 echo "fixed_prefix_lens=${PREFIX_LIST[*]} top_k_list=${TOPK_LIST[*]} max_candidates_list=${MAXC_LIST[*]}"
 echo "candidate_mode=${CANDIDATE_MODE} sparse_max_positions=${SPARSE_MAX_POSITIONS}"
+if [[ -n "${CANDIDATE_EXTRA_ARGS}" ]]; then
+  echo "candidate_extra_args=${CANDIDATE_EXTRA_ARGS}"
+fi
 echo "collect_profile=${COLLECT_PROFILE} run_baseline=${RUN_BASELINE} run_vanilla_ref=${RUN_VANILLA_REF} logs=${LOG_DIR}"
 
 if [[ "${RUN_BASELINE}" == "1" ]]; then
@@ -236,6 +240,10 @@ for prefix_len in "${PREFIX_LIST[@]}"; do
         --max-candidates "${max_c}"
         --skip-baseline
       )
+      if [[ -n "${CANDIDATE_EXTRA_ARGS}" ]]; then
+        read -r -a EXTRA_ARGS_ARR <<< "${CANDIDATE_EXTRA_ARGS}"
+        cmd+=("${EXTRA_ARGS_ARR[@]}")
+      fi
       if [[ "${LOCAL_FILES_ONLY}" == "1" ]]; then
         cmd+=(--local-files-only)
       fi
