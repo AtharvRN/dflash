@@ -238,3 +238,26 @@ Status legend:
 - Notes:
   - this is intentionally a strong stress-test construction, not a probability-optimal search policy.
   - useful to measure whether larger candidate diversity can raise realized acceptance despite coarse suffix variants.
+
+## 15) Fixed-Prefix Candidate Path Optimization (1/2/3)
+- Status: `implemented`
+- Scope:
+  - optimize `benchmark_candidate_solutions.py` for `--candidate-mode fixed_prefix_rank`.
+- Changes made:
+  - (1) removed `log_softmax` ranking in candidate construction:
+    - rank selection now uses raw-logit `topk` (same ordering, lower cost).
+  - (2) vectorized candidate construction on GPU:
+    - one batched `topk` over suffix positions,
+    - one tensorized write to construct all rank-variants at once.
+  - (3) reduced Python scalar/list work in hot path:
+    - removed per-position token loops for candidate assembly,
+    - replaced Python `max` over candidate dicts with tensorized composite score selection.
+- Expected effect:
+  - lower `avg_draft_decode_s` in fixed-prefix mode,
+  - same semantics for candidate set (greedy + rank-2/3/4 suffix variants).
+- Next validation:
+  - rerun same command as prior fixed-prefix experiment and compare:
+    - `Speculative profile avg_draft_decode_s`
+    - `Speculative TPOT`
+    - `Speculative tokens_per_sec`
+    - `Average Acceptance length`

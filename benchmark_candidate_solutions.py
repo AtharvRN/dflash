@@ -209,7 +209,7 @@ def build_fixed_prefix_rank_candidates(
 
     # Number of total candidates to emit (including greedy base).
     # Example: top-4 => greedy + (rank-2, rank-3, rank-4) = 4 total.
-    candidate_total = min(max_candidates, rank_top_k)
+    candidate_total = min(max_candidates, rank_top_k, int(draft_logits.shape[-1]))
     if candidate_total <= 1:
         return (
             [base_block_output_ids.clone()],
@@ -217,65 +217,33 @@ def build_fixed_prefix_rank_candidates(
             suffix_positions,
         )
 
-    log_probs = torch.log_softmax(draft_logits.float(), dim=-1)
-    rank_table: dict[int, tuple[list[int], list[float]]] = {}
-    for pos in suffix_positions:
-        values, indices = torch.topk(log_probs[0, pos - 1], k=candidate_total, dim=-1)
-        rank_table[pos] = (
-            [int(x) for x in indices.tolist()],
-            [float(x) for x in values.tolist()],
-        )
+    suffix_len = len(suffix_positions)
+    suffix_start = suffix_positions[0]
 
-    candidates: list[torch.Tensor] = []
+    # Ranking uses raw logits: top-k token indices are identical to log-softmax top-k,
+    # but avoids expensive full-vocab normalization.
+    suffix_logits = draft_logits[:, suffix_start - 1 :, :]
+    topk_values, topk_indices = torch.topk(suffix_logits, k=candidate_total, dim=-1)
+    # [1, suffix_len, candidate_total] -> [candidate_total, suffix_len]
+    suffix_tokens_by_rank = topk_indices[0].transpose(0, 1).contiguous()
+    suffix_scores_by_rank = topk_values[0].transpose(0, 1).sum(dim=1)
+
+    # Build all candidates in one tensor op:
+    # row r uses rank-(r+1) token at each suffix position.
+    stacked = base_block_output_ids.expand(candidate_total, -1).clone()
+    stacked[:, suffix_start:] = suffix_tokens_by_rank
+
+    candidates = [stacked[i : i + 1] for i in range(candidate_total)]
     metadata: list[dict] = []
-    seen: set[tuple[int, ...]] = set()
-
-    # Always include greedy base candidate first.
-    base_score = 0.0
-    for pos in suffix_positions:
-        token_id = int(base_block_output_ids[0, pos].item())
-        base_score += float(log_probs[0, pos - 1, token_id].item())
-    base_key = tuple(int(x) for x in base_block_output_ids[0, 1:].tolist())
-    seen.add(base_key)
-    candidates.append(base_block_output_ids.clone())
-    metadata.append(
-        {
-            "candidate_idx": 0,
-            "draft_score": float(base_score),
-            "replaced_positions": [],
-            "rank_variant": 1,
-        }
-    )
-
-    # Add rank-2, rank-3, ... variants on the suffix.
-    for rank_idx in range(1, candidate_total):
-        candidate = base_block_output_ids.clone()
-        replaced_positions: list[int] = []
-        score = 0.0
-        for pos in suffix_positions:
-            token_ids, token_scores = rank_table[pos]
-            token_id = int(token_ids[rank_idx])
-            old_id = int(candidate[0, pos].item())
-            if old_id != token_id:
-                replaced_positions.append(pos)
-            candidate[0, pos] = token_id
-            score += float(token_scores[rank_idx])
-
-        key = tuple(int(x) for x in candidate[0, 1:].tolist())
-        if key in seen:
-            continue
-        seen.add(key)
-        candidates.append(candidate)
+    for rank_idx in range(candidate_total):
         metadata.append(
             {
-                "candidate_idx": len(candidates) - 1,
-                "draft_score": float(score),
-                "replaced_positions": replaced_positions,
+                "candidate_idx": rank_idx,
+                "draft_score": float(suffix_scores_by_rank[rank_idx].item()),
+                "replaced_positions": [] if rank_idx == 0 else suffix_positions,
                 "rank_variant": int(rank_idx + 1),
             }
         )
-        if len(candidates) >= max_candidates:
-            break
 
     return candidates, metadata, suffix_positions
 
@@ -430,21 +398,17 @@ def dflash_generate_candidate_solutions(
             (stacked_candidates[:, 1:] == posterior_all[:, :-1]).cumprod(dim=1).sum(dim=1)
         )
 
-        candidate_evals = []
-        for cand_idx, meta in enumerate(candidate_meta):
-            acceptance_length = int(acceptance_lengths_all[cand_idx].item())
-            tau = acceptance_length + 1
-            candidate_evals.append(
-                {
-                    "candidate_idx": int(meta["candidate_idx"]),
-                    "tau": int(tau),
-                    "draft_score": float(meta["draft_score"]),
-                    "acceptance_length": int(acceptance_length),
-                }
-            )
-
-        best = max(candidate_evals, key=lambda x: (x["tau"], x["draft_score"], -x["candidate_idx"]))
-        chosen_candidate_idx = int(best["candidate_idx"])
+        tau_all = acceptance_lengths_all + 1
+        draft_scores = torch.tensor(
+            [float(meta["draft_score"]) for meta in candidate_meta],
+            device=acceptance_lengths_all.device,
+            dtype=torch.float32,
+        )
+        candidate_indices = torch.arange(num_candidates, device=acceptance_lengths_all.device, dtype=torch.float32)
+        # Lexicographic selection:
+        # 1) maximize tau, 2) maximize draft_score, 3) minimize candidate_idx.
+        composite = tau_all.float() * 1e6 + draft_scores - candidate_indices * 1e-3
+        chosen_candidate_idx = int(torch.argmax(composite).item())
         chosen_candidate_block = candidate_blocks[chosen_candidate_idx]
         posterior = posterior_all[chosen_candidate_idx : chosen_candidate_idx + 1]
         acceptance_length = int(acceptance_lengths_all[chosen_candidate_idx].item())
@@ -470,8 +434,8 @@ def dflash_generate_candidate_solutions(
             "num_candidates": int(len(candidate_blocks)),
             "selected_positions": [int(x) for x in selected_positions],
             "chosen_candidate_idx": int(chosen_candidate_idx),
-            "candidate_taus": [int(x["tau"]) for x in candidate_evals],
-            "candidate_draft_scores": [float(x["draft_score"]) for x in candidate_evals],
+            "candidate_taus": [int(x) for x in tau_all.tolist()],
+            "candidate_draft_scores": [float(x) for x in draft_scores.tolist()],
             "candidate_rank_variants": [int(x.get("rank_variant", 1)) for x in candidate_meta],
         }
         if collect_profile:
