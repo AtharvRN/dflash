@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DATASET="${DATASET:-aime25}"
+MAX_SAMPLES="${MAX_SAMPLES:-30}"
+MODEL="${MODEL:-Qwen/Qwen3-4B}"
+DRAFT="${DRAFT:-z-lab/Qwen3-4B-DFlash-b16}"
+BLOCK_SIZE="${BLOCK_SIZE:-16}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-2048}"
+TEMPERATURE="${TEMPERATURE:-0.0}"
+RUN_TAG="${RUN_TAG:-fixed_prefix_sweep_$(date +%Y%m%d_%H%M%S)}"
+LOG_DIR="${LOG_DIR:-logs/${RUN_TAG}}"
+SUMMARY_CSV="${SUMMARY_CSV:-${LOG_DIR}/summary.csv}"
+SAVE_OUTPUTS_DIR="${SAVE_OUTPUTS_DIR:-outputs}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+DRY_RUN="${DRY_RUN:-0}"
+RUN_BASELINE="${RUN_BASELINE:-1}"
+COLLECT_PROFILE="${COLLECT_PROFILE:-1}"
+
+if [[ -n "${FIXED_PREFIX_LENS:-}" ]]; then
+  read -r -a PREFIX_LIST <<< "${FIXED_PREFIX_LENS}"
+else
+  PREFIX_LIST=(4 5 6 7 8)
+fi
+
+if [[ -n "${TOP_K_LIST:-}" ]]; then
+  read -r -a TOPK_LIST <<< "${TOP_K_LIST}"
+else
+  TOPK_LIST=(2 3 4)
+fi
+
+if [[ -n "${MAX_CANDIDATES_LIST:-}" ]]; then
+  read -r -a MAXC_LIST <<< "${MAX_CANDIDATES_LIST}"
+else
+  MAXC_LIST=(2 3 4)
+fi
+
+mkdir -p "${LOG_DIR}"
+if [[ -n "${SAVE_OUTPUTS_DIR}" ]]; then
+  mkdir -p "${SAVE_OUTPUTS_DIR}"
+fi
+
+cat > "${SUMMARY_CSV}" <<'EOF'
+dataset,max_samples,block_size,candidate_mode,fixed_prefix_len,branch_top_k,max_candidates,e2e_speedup,tpot_speedup,throughput_gain,tau,speculative_total_wall_s,speculative_tokens_per_sec,speculative_tpot,speculative_ttft,spec_avg_target_decode_s,spec_avg_draft_decode_s,spec_target_share,spec_draft_share,spec_total_profiled_cycles,avg_candidates_per_cycle,avg_verify_calls_per_sample,baseline_total_wall_s,baseline_tokens_per_sec,baseline_tpot,log_path,output_jsonl_path,cycle_jsonl_path
+EOF
+
+is_number() {
+  [[ "${1:-}" =~ ^[0-9]+([.][0-9]+)?$ ]]
+}
+
+ratio_or_na() {
+  local num="${1:-}"
+  local den="${2:-}"
+  if is_number "${num}" && is_number "${den}"; then
+    awk -v n="${num}" -v d="${den}" 'BEGIN { if (d > 0) printf "%.6f", n / d; else print "NA" }'
+  else
+    echo "NA"
+  fi
+}
+
+extract_metric() {
+  local pattern="$1"
+  local log_path="$2"
+  (grep -Eo "${pattern}" "${log_path}" || true) | tail -1 | awk '{print $NF}'
+}
+
+extract_after_colon() {
+  local pattern="$1"
+  local log_path="$2"
+  (grep -E "^${pattern}" "${log_path}" || true) | tail -1 | sed "s/^${pattern}: //"
+}
+
+BASELINE_TOTAL_WALL_S="NA"
+BASELINE_TOKENS_PER_SEC="NA"
+BASELINE_TPOT="NA"
+BASELINE_LOG_PATH="${LOG_DIR}/${DATASET}_baseline_bs1.log"
+
+echo "Running fixed-prefix candidate sweep"
+echo "dataset=${DATASET} max_samples=${MAX_SAMPLES} block_size=${BLOCK_SIZE} max_new_tokens=${MAX_NEW_TOKENS}"
+echo "fixed_prefix_lens=${PREFIX_LIST[*]} top_k_list=${TOPK_LIST[*]} max_candidates_list=${MAXC_LIST[*]}"
+echo "collect_profile=${COLLECT_PROFILE} run_baseline=${RUN_BASELINE} logs=${LOG_DIR}"
+
+if [[ "${RUN_BASELINE}" == "1" ]]; then
+  baseline_out_path=""
+  if [[ -n "${SAVE_OUTPUTS_DIR}" ]]; then
+    baseline_out_path="${SAVE_OUTPUTS_DIR}/${RUN_TAG}_${DATASET}_baseline_bs1.jsonl"
+  fi
+  baseline_cmd=(
+    "${PYTHON_BIN}"
+    benchmark.py
+    --dataset "${DATASET}"
+    --max-samples "${MAX_SAMPLES}"
+    --model-name-or-path "${MODEL}"
+    --draft-name-or-path "${DRAFT}"
+    --block-size 1
+    --max-new-tokens "${MAX_NEW_TOKENS}"
+    --temperature "${TEMPERATURE}"
+  )
+  if [[ "${COLLECT_PROFILE}" == "1" ]]; then
+    baseline_cmd+=(--collect-profile)
+  fi
+  if [[ -n "${baseline_out_path}" ]]; then
+    baseline_cmd+=(--save-outputs-path "${baseline_out_path}")
+  fi
+
+  echo "--------------------------------------------------------" | tee "${BASELINE_LOG_PATH}"
+  printf "Launch baseline: " | tee -a "${BASELINE_LOG_PATH}"
+  printf "%q " "${baseline_cmd[@]}" | tee -a "${BASELINE_LOG_PATH}"
+  printf "\n" | tee -a "${BASELINE_LOG_PATH}"
+  echo "--------------------------------------------------------" | tee -a "${BASELINE_LOG_PATH}"
+
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    BASELINE_TOTAL_WALL_S="DRY_RUN"
+    BASELINE_TOKENS_PER_SEC="DRY_RUN"
+    BASELINE_TPOT="DRY_RUN"
+  else
+    set +e
+    "${baseline_cmd[@]}" 2>&1 | tee -a "${BASELINE_LOG_PATH}"
+    status=${PIPESTATUS[0]}
+    set -e
+    if [[ "${status}" -ne 0 ]]; then
+      echo "Baseline run failed (status=${status})." | tee -a "${BASELINE_LOG_PATH}"
+      exit "${status}"
+    fi
+    BASELINE_TOTAL_WALL_S="$(extract_metric 'Baseline total_wall_s: [0-9.]+' "${BASELINE_LOG_PATH}")"
+    BASELINE_TOKENS_PER_SEC="$(extract_metric 'Baseline tokens_per_sec: [0-9.]+' "${BASELINE_LOG_PATH}")"
+    BASELINE_TPOT="$(extract_metric 'Baseline TPOT: [0-9.]+' "${BASELINE_LOG_PATH}")"
+    BASELINE_TOTAL_WALL_S="${BASELINE_TOTAL_WALL_S:-NA}"
+    BASELINE_TOKENS_PER_SEC="${BASELINE_TOKENS_PER_SEC:-NA}"
+    BASELINE_TPOT="${BASELINE_TPOT:-NA}"
+    echo "Shared baseline: total_wall_s=${BASELINE_TOTAL_WALL_S} tokens_per_sec=${BASELINE_TOKENS_PER_SEC} tpot=${BASELINE_TPOT}"
+  fi
+fi
+
+for prefix_len in "${PREFIX_LIST[@]}"; do
+  for top_k in "${TOPK_LIST[@]}"; do
+    for max_c in "${MAXC_LIST[@]}"; do
+      if (( max_c > top_k )); then
+        echo "Skipping config prefix=${prefix_len} top_k=${top_k} max_candidates=${max_c} (max_candidates > top_k)"
+        continue
+      fi
+
+      cfg_tag="p${prefix_len}_k${top_k}_c${max_c}"
+      log_path="${LOG_DIR}/${DATASET}_${cfg_tag}.log"
+      out_path=""
+      cycle_path=""
+      if [[ -n "${SAVE_OUTPUTS_DIR}" ]]; then
+        out_path="${SAVE_OUTPUTS_DIR}/${RUN_TAG}_${DATASET}_${cfg_tag}.jsonl"
+        cycle_path="${SAVE_OUTPUTS_DIR}/${RUN_TAG}_${DATASET}_${cfg_tag}_cycle.jsonl"
+      fi
+
+      cmd=(
+        "${PYTHON_BIN}"
+        benchmark_candidate_solutions.py
+        --dataset "${DATASET}"
+        --max-samples "${MAX_SAMPLES}"
+        --model-name-or-path "${MODEL}"
+        --draft-name-or-path "${DRAFT}"
+        --block-size "${BLOCK_SIZE}"
+        --max-new-tokens "${MAX_NEW_TOKENS}"
+        --temperature "${TEMPERATURE}"
+        --candidate-mode fixed_prefix_rank
+        --fixed-prefix-len "${prefix_len}"
+        --branch-top-k "${top_k}"
+        --max-candidates "${max_c}"
+        --skip-baseline
+      )
+      if [[ "${COLLECT_PROFILE}" == "1" ]]; then
+        cmd+=(--collect-profile)
+      fi
+      if [[ -n "${out_path}" ]]; then
+        cmd+=(--save-outputs-path "${out_path}")
+      fi
+      if [[ -n "${cycle_path}" ]]; then
+        cmd+=(--save-cycle-trace-path "${cycle_path}")
+      fi
+
+      echo "--------------------------------------------------------" | tee "${log_path}"
+      printf "Launch: " | tee -a "${log_path}"
+      printf "%q " "${cmd[@]}" | tee -a "${log_path}"
+      printf "\n" | tee -a "${log_path}"
+      echo "--------------------------------------------------------" | tee -a "${log_path}"
+
+      if [[ "${DRY_RUN}" == "1" ]]; then
+        echo "${DATASET},${MAX_SAMPLES},${BLOCK_SIZE},fixed_prefix_rank,${prefix_len},${top_k},${max_c},DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,${BASELINE_TOTAL_WALL_S},${BASELINE_TOKENS_PER_SEC},${BASELINE_TPOT},${log_path},${out_path:-NA},${cycle_path:-NA}" >> "${SUMMARY_CSV}"
+        continue
+      fi
+
+      set +e
+      "${cmd[@]}" 2>&1 | tee -a "${log_path}"
+      status=${PIPESTATUS[0]}
+      set -e
+      if [[ "${status}" -ne 0 ]]; then
+        echo "${DATASET},${MAX_SAMPLES},${BLOCK_SIZE},fixed_prefix_rank,${prefix_len},${top_k},${max_c},ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,${BASELINE_TOTAL_WALL_S},${BASELINE_TOKENS_PER_SEC},${BASELINE_TPOT},${log_path},${out_path:-NA},${cycle_path:-NA}" >> "${SUMMARY_CSV}"
+        continue
+      fi
+
+      tau="$(extract_metric 'Average Acceptance length: [0-9.]+' "${log_path}")"
+      spec_wall="$(extract_metric 'Speculative total_wall_s: [0-9.]+' "${log_path}")"
+      spec_tps="$(extract_metric 'Speculative tokens_per_sec: [0-9.]+' "${log_path}")"
+      spec_tpot="$(extract_metric 'Speculative TPOT: [0-9.]+' "${log_path}")"
+      spec_ttft="$(extract_metric 'Speculative TTFT: [0-9.]+' "${log_path}")"
+      spec_target_decode="$(extract_metric 'Speculative profile avg_target_decode_s: [0-9.]+' "${log_path}")"
+      spec_draft_decode="$(extract_metric 'Speculative profile avg_draft_decode_s: [0-9.]+' "${log_path}")"
+      spec_target_share="$(extract_metric 'Speculative profile target_share_decode: [0-9.]+' "${log_path}")"
+      spec_draft_share="$(extract_metric 'Speculative profile draft_share_decode: [0-9.]+' "${log_path}")"
+      spec_cycles="$(extract_metric 'Speculative profile total_profiled_cycles: [0-9.]+' "${log_path}")"
+      avg_cands="$(extract_metric 'Candidate avg_candidates_per_cycle: [0-9.]+' "${log_path}")"
+      avg_verify_calls="$(extract_metric 'Candidate avg_verify_calls_per_sample: [0-9.]+' "${log_path}")"
+
+      tau="${tau:-NA}"
+      spec_wall="${spec_wall:-NA}"
+      spec_tps="${spec_tps:-NA}"
+      spec_tpot="${spec_tpot:-NA}"
+      spec_ttft="${spec_ttft:-NA}"
+      spec_target_decode="${spec_target_decode:-NA}"
+      spec_draft_decode="${spec_draft_decode:-NA}"
+      spec_target_share="${spec_target_share:-NA}"
+      spec_draft_share="${spec_draft_share:-NA}"
+      spec_cycles="${spec_cycles:-NA}"
+      avg_cands="${avg_cands:-NA}"
+      avg_verify_calls="${avg_verify_calls:-NA}"
+
+      e2e_speedup="$(ratio_or_na "${BASELINE_TOTAL_WALL_S}" "${spec_wall}")"
+      tpot_speedup="$(ratio_or_na "${BASELINE_TPOT}" "${spec_tpot}")"
+      throughput_gain="$(ratio_or_na "${spec_tps}" "${BASELINE_TOKENS_PER_SEC}")"
+
+      echo "${DATASET},${MAX_SAMPLES},${BLOCK_SIZE},fixed_prefix_rank,${prefix_len},${top_k},${max_c},${e2e_speedup},${tpot_speedup},${throughput_gain},${tau},${spec_wall},${spec_tps},${spec_tpot},${spec_ttft},${spec_target_decode},${spec_draft_decode},${spec_target_share},${spec_draft_share},${spec_cycles},${avg_cands},${avg_verify_calls},${BASELINE_TOTAL_WALL_S},${BASELINE_TOKENS_PER_SEC},${BASELINE_TPOT},${log_path},${out_path:-NA},${cycle_path:-NA}" >> "${SUMMARY_CSV}"
+    done
+  done
+done
+
+echo "Sweep complete. Summary: ${SUMMARY_CSV}"
