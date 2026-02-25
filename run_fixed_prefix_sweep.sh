@@ -15,7 +15,10 @@ SAVE_OUTPUTS_DIR="${SAVE_OUTPUTS_DIR:-outputs}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DRY_RUN="${DRY_RUN:-0}"
 RUN_BASELINE="${RUN_BASELINE:-1}"
+RUN_VANILLA_REF="${RUN_VANILLA_REF:-1}"
 COLLECT_PROFILE="${COLLECT_PROFILE:-1}"
+SAVE_CYCLE_TRACE="${SAVE_CYCLE_TRACE:-${COLLECT_PROFILE}}"
+LOCAL_FILES_ONLY="${LOCAL_FILES_ONLY:-0}"
 
 if [[ -n "${FIXED_PREFIX_LENS:-}" ]]; then
   read -r -a PREFIX_LIST <<< "${FIXED_PREFIX_LENS}"
@@ -41,7 +44,7 @@ if [[ -n "${SAVE_OUTPUTS_DIR}" ]]; then
 fi
 
 cat > "${SUMMARY_CSV}" <<'EOF'
-dataset,max_samples,block_size,candidate_mode,fixed_prefix_len,branch_top_k,max_candidates,e2e_speedup,tpot_speedup,throughput_gain,tau,speculative_total_wall_s,speculative_tokens_per_sec,speculative_tpot,speculative_ttft,spec_avg_target_decode_s,spec_avg_draft_decode_s,spec_target_share,spec_draft_share,spec_total_profiled_cycles,avg_candidates_per_cycle,avg_verify_calls_per_sample,baseline_total_wall_s,baseline_tokens_per_sec,baseline_tpot,log_path,output_jsonl_path,cycle_jsonl_path
+dataset,max_samples,block_size,candidate_mode,fixed_prefix_len,branch_top_k,max_candidates,e2e_speedup_vs_bs1,tpot_speedup_vs_bs1,throughput_gain_vs_bs1,e2e_speedup_vs_vanilla_bs,tpot_speedup_vs_vanilla_bs,throughput_gain_vs_vanilla_bs,tau,speculative_total_wall_s,speculative_tokens_per_sec,speculative_tpot,speculative_ttft,spec_avg_target_decode_s,spec_avg_draft_decode_s,spec_target_share,spec_draft_share,spec_total_profiled_cycles,avg_candidates_per_cycle,avg_verify_calls_per_sample,baseline_total_wall_s,baseline_tokens_per_sec,baseline_tpot,vanilla_total_wall_s,vanilla_tokens_per_sec,vanilla_tpot,baseline_log_path,vanilla_log_path,log_path,output_jsonl_path,cycle_jsonl_path
 EOF
 
 is_number() {
@@ -70,15 +73,20 @@ extract_after_colon() {
   (grep -E "^${pattern}" "${log_path}" || true) | tail -1 | sed "s/^${pattern}: //"
 }
 
-BASELINE_TOTAL_WALL_S="NA"
-BASELINE_TOKENS_PER_SEC="NA"
-BASELINE_TPOT="NA"
+# Allow reusing an externally supplied shared baseline when RUN_BASELINE=0.
+BASELINE_TOTAL_WALL_S="${BASELINE_TOTAL_WALL_S:-NA}"
+BASELINE_TOKENS_PER_SEC="${BASELINE_TOKENS_PER_SEC:-NA}"
+BASELINE_TPOT="${BASELINE_TPOT:-NA}"
 BASELINE_LOG_PATH="${LOG_DIR}/${DATASET}_baseline_bs1.log"
+VANILLA_TOTAL_WALL_S="${VANILLA_TOTAL_WALL_S:-NA}"
+VANILLA_TOKENS_PER_SEC="${VANILLA_TOKENS_PER_SEC:-NA}"
+VANILLA_TPOT="${VANILLA_TPOT:-NA}"
+VANILLA_LOG_PATH="${LOG_DIR}/${DATASET}_vanilla_bs${BLOCK_SIZE}.log"
 
 echo "Running fixed-prefix candidate sweep"
 echo "dataset=${DATASET} max_samples=${MAX_SAMPLES} block_size=${BLOCK_SIZE} max_new_tokens=${MAX_NEW_TOKENS}"
 echo "fixed_prefix_lens=${PREFIX_LIST[*]} top_k_list=${TOPK_LIST[*]} max_candidates_list=${MAXC_LIST[*]}"
-echo "collect_profile=${COLLECT_PROFILE} run_baseline=${RUN_BASELINE} logs=${LOG_DIR}"
+echo "collect_profile=${COLLECT_PROFILE} run_baseline=${RUN_BASELINE} run_vanilla_ref=${RUN_VANILLA_REF} logs=${LOG_DIR}"
 
 if [[ "${RUN_BASELINE}" == "1" ]]; then
   baseline_out_path=""
@@ -96,6 +104,9 @@ if [[ "${RUN_BASELINE}" == "1" ]]; then
     --max-new-tokens "${MAX_NEW_TOKENS}"
     --temperature "${TEMPERATURE}"
   )
+  if [[ "${LOCAL_FILES_ONLY}" == "1" ]]; then
+    baseline_cmd+=(--local-files-only)
+  fi
   if [[ "${COLLECT_PROFILE}" == "1" ]]; then
     baseline_cmd+=(--collect-profile)
   fi
@@ -132,6 +143,62 @@ if [[ "${RUN_BASELINE}" == "1" ]]; then
   fi
 fi
 
+if [[ "${RUN_VANILLA_REF}" == "1" ]]; then
+  vanilla_out_path=""
+  if [[ -n "${SAVE_OUTPUTS_DIR}" ]]; then
+    vanilla_out_path="${SAVE_OUTPUTS_DIR}/${RUN_TAG}_${DATASET}_vanilla_bs${BLOCK_SIZE}.jsonl"
+  fi
+  vanilla_cmd=(
+    "${PYTHON_BIN}"
+    benchmark.py
+    --dataset "${DATASET}"
+    --max-samples "${MAX_SAMPLES}"
+    --model-name-or-path "${MODEL}"
+    --draft-name-or-path "${DRAFT}"
+    --block-size "${BLOCK_SIZE}"
+    --max-new-tokens "${MAX_NEW_TOKENS}"
+    --temperature "${TEMPERATURE}"
+    --skip-baseline
+  )
+  if [[ "${LOCAL_FILES_ONLY}" == "1" ]]; then
+    vanilla_cmd+=(--local-files-only)
+  fi
+  if [[ "${COLLECT_PROFILE}" == "1" ]]; then
+    vanilla_cmd+=(--collect-profile)
+  fi
+  if [[ -n "${vanilla_out_path}" ]]; then
+    vanilla_cmd+=(--save-outputs-path "${vanilla_out_path}")
+  fi
+
+  echo "--------------------------------------------------------" | tee "${VANILLA_LOG_PATH}"
+  printf "Launch vanilla reference (bs=%s): " "${BLOCK_SIZE}" | tee -a "${VANILLA_LOG_PATH}"
+  printf "%q " "${vanilla_cmd[@]}" | tee -a "${VANILLA_LOG_PATH}"
+  printf "\n" | tee -a "${VANILLA_LOG_PATH}"
+  echo "--------------------------------------------------------" | tee -a "${VANILLA_LOG_PATH}"
+
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    VANILLA_TOTAL_WALL_S="DRY_RUN"
+    VANILLA_TOKENS_PER_SEC="DRY_RUN"
+    VANILLA_TPOT="DRY_RUN"
+  else
+    set +e
+    "${vanilla_cmd[@]}" 2>&1 | tee -a "${VANILLA_LOG_PATH}"
+    status=${PIPESTATUS[0]}
+    set -e
+    if [[ "${status}" -ne 0 ]]; then
+      echo "Vanilla reference run failed (status=${status})." | tee -a "${VANILLA_LOG_PATH}"
+      exit "${status}"
+    fi
+    VANILLA_TOTAL_WALL_S="$(extract_metric 'Speculative total_wall_s: [0-9.]+' "${VANILLA_LOG_PATH}")"
+    VANILLA_TOKENS_PER_SEC="$(extract_metric 'Speculative tokens_per_sec: [0-9.]+' "${VANILLA_LOG_PATH}")"
+    VANILLA_TPOT="$(extract_metric 'Speculative TPOT: [0-9.]+' "${VANILLA_LOG_PATH}")"
+    VANILLA_TOTAL_WALL_S="${VANILLA_TOTAL_WALL_S:-NA}"
+    VANILLA_TOKENS_PER_SEC="${VANILLA_TOKENS_PER_SEC:-NA}"
+    VANILLA_TPOT="${VANILLA_TPOT:-NA}"
+    echo "Vanilla reference: total_wall_s=${VANILLA_TOTAL_WALL_S} tokens_per_sec=${VANILLA_TOKENS_PER_SEC} tpot=${VANILLA_TPOT}"
+  fi
+fi
+
 for prefix_len in "${PREFIX_LIST[@]}"; do
   for top_k in "${TOPK_LIST[@]}"; do
     for max_c in "${MAXC_LIST[@]}"; do
@@ -165,14 +232,19 @@ for prefix_len in "${PREFIX_LIST[@]}"; do
         --max-candidates "${max_c}"
         --skip-baseline
       )
+      if [[ "${LOCAL_FILES_ONLY}" == "1" ]]; then
+        cmd+=(--local-files-only)
+      fi
       if [[ "${COLLECT_PROFILE}" == "1" ]]; then
         cmd+=(--collect-profile)
       fi
       if [[ -n "${out_path}" ]]; then
         cmd+=(--save-outputs-path "${out_path}")
       fi
-      if [[ -n "${cycle_path}" ]]; then
+      if [[ "${SAVE_CYCLE_TRACE}" == "1" && -n "${cycle_path}" ]]; then
         cmd+=(--save-cycle-trace-path "${cycle_path}")
+      else
+        cycle_path=""
       fi
 
       echo "--------------------------------------------------------" | tee "${log_path}"
@@ -182,7 +254,7 @@ for prefix_len in "${PREFIX_LIST[@]}"; do
       echo "--------------------------------------------------------" | tee -a "${log_path}"
 
       if [[ "${DRY_RUN}" == "1" ]]; then
-        echo "${DATASET},${MAX_SAMPLES},${BLOCK_SIZE},fixed_prefix_rank,${prefix_len},${top_k},${max_c},DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,${BASELINE_TOTAL_WALL_S},${BASELINE_TOKENS_PER_SEC},${BASELINE_TPOT},${log_path},${out_path:-NA},${cycle_path:-NA}" >> "${SUMMARY_CSV}"
+        echo "${DATASET},${MAX_SAMPLES},${BLOCK_SIZE},fixed_prefix_rank,${prefix_len},${top_k},${max_c},DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,${BASELINE_TOTAL_WALL_S},${BASELINE_TOKENS_PER_SEC},${BASELINE_TPOT},${VANILLA_TOTAL_WALL_S},${VANILLA_TOKENS_PER_SEC},${VANILLA_TPOT},${BASELINE_LOG_PATH},${VANILLA_LOG_PATH},${log_path},${out_path:-NA},${cycle_path:-NA}" >> "${SUMMARY_CSV}"
         continue
       fi
 
@@ -191,7 +263,7 @@ for prefix_len in "${PREFIX_LIST[@]}"; do
       status=${PIPESTATUS[0]}
       set -e
       if [[ "${status}" -ne 0 ]]; then
-        echo "${DATASET},${MAX_SAMPLES},${BLOCK_SIZE},fixed_prefix_rank,${prefix_len},${top_k},${max_c},ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,${BASELINE_TOTAL_WALL_S},${BASELINE_TOKENS_PER_SEC},${BASELINE_TPOT},${log_path},${out_path:-NA},${cycle_path:-NA}" >> "${SUMMARY_CSV}"
+        echo "${DATASET},${MAX_SAMPLES},${BLOCK_SIZE},fixed_prefix_rank,${prefix_len},${top_k},${max_c},ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,${BASELINE_TOTAL_WALL_S},${BASELINE_TOKENS_PER_SEC},${BASELINE_TPOT},${VANILLA_TOTAL_WALL_S},${VANILLA_TOKENS_PER_SEC},${VANILLA_TPOT},${BASELINE_LOG_PATH},${VANILLA_LOG_PATH},${log_path},${out_path:-NA},${cycle_path:-NA}" >> "${SUMMARY_CSV}"
         continue
       fi
 
@@ -221,11 +293,14 @@ for prefix_len in "${PREFIX_LIST[@]}"; do
       avg_cands="${avg_cands:-NA}"
       avg_verify_calls="${avg_verify_calls:-NA}"
 
-      e2e_speedup="$(ratio_or_na "${BASELINE_TOTAL_WALL_S}" "${spec_wall}")"
-      tpot_speedup="$(ratio_or_na "${BASELINE_TPOT}" "${spec_tpot}")"
-      throughput_gain="$(ratio_or_na "${spec_tps}" "${BASELINE_TOKENS_PER_SEC}")"
+      e2e_speedup_bs1="$(ratio_or_na "${BASELINE_TOTAL_WALL_S}" "${spec_wall}")"
+      tpot_speedup_bs1="$(ratio_or_na "${BASELINE_TPOT}" "${spec_tpot}")"
+      throughput_gain_bs1="$(ratio_or_na "${spec_tps}" "${BASELINE_TOKENS_PER_SEC}")"
+      e2e_speedup_vanilla="$(ratio_or_na "${VANILLA_TOTAL_WALL_S}" "${spec_wall}")"
+      tpot_speedup_vanilla="$(ratio_or_na "${VANILLA_TPOT}" "${spec_tpot}")"
+      throughput_gain_vanilla="$(ratio_or_na "${spec_tps}" "${VANILLA_TOKENS_PER_SEC}")"
 
-      echo "${DATASET},${MAX_SAMPLES},${BLOCK_SIZE},fixed_prefix_rank,${prefix_len},${top_k},${max_c},${e2e_speedup},${tpot_speedup},${throughput_gain},${tau},${spec_wall},${spec_tps},${spec_tpot},${spec_ttft},${spec_target_decode},${spec_draft_decode},${spec_target_share},${spec_draft_share},${spec_cycles},${avg_cands},${avg_verify_calls},${BASELINE_TOTAL_WALL_S},${BASELINE_TOKENS_PER_SEC},${BASELINE_TPOT},${log_path},${out_path:-NA},${cycle_path:-NA}" >> "${SUMMARY_CSV}"
+      echo "${DATASET},${MAX_SAMPLES},${BLOCK_SIZE},fixed_prefix_rank,${prefix_len},${top_k},${max_c},${e2e_speedup_bs1},${tpot_speedup_bs1},${throughput_gain_bs1},${e2e_speedup_vanilla},${tpot_speedup_vanilla},${throughput_gain_vanilla},${tau},${spec_wall},${spec_tps},${spec_tpot},${spec_ttft},${spec_target_decode},${spec_draft_decode},${spec_target_share},${spec_draft_share},${spec_cycles},${avg_cands},${avg_verify_calls},${BASELINE_TOTAL_WALL_S},${BASELINE_TOKENS_PER_SEC},${BASELINE_TPOT},${VANILLA_TOTAL_WALL_S},${VANILLA_TOKENS_PER_SEC},${VANILLA_TPOT},${BASELINE_LOG_PATH},${VANILLA_LOG_PATH},${log_path},${out_path:-NA},${cycle_path:-NA}" >> "${SUMMARY_CSV}"
     done
   done
 done
