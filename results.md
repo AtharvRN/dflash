@@ -523,3 +523,83 @@ Interpretation:
 Saved local analysis artifacts:
 - `outputs/analysis_fixed_prefix_tuning_20260225/summary.csv`
 - `outputs/analysis_fixed_prefix_tuning_20260225/summary.md`
+
+## 17) Rerun of Old Fixed-Prefix Settings (`p6`, `p7`) on A100
+
+Run tag:
+- `logs/fixed_prefix_sweep_20260225_033258/`
+
+Config:
+- Dataset: `aime25`, `max_samples=30`, `max_new_tokens=2048`
+- Method: `candidate_mode=fixed_prefix_rank`, `branch_top_k=4`, `max_candidates=4`
+- Tested: `fixed_prefix_len in {6,7}`
+
+Matched baseline from same run:
+- `bs=1` total wall: `2437.238799`
+- `bs=1` TPOT: `0.043839`
+- `bs=1` tokens/s: `22.705613`
+
+Raw speculative metrics:
+
+| Prefix | Total Wall (s) | TPOT (s) | Tokens/s | Tau | Avg Target Decode (s/sample) | Avg Draft Decode (s/sample) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 6 | 416.679801 | 0.007598 | 130.371090 | 7.56 | 10.491714 | 1.999206 |
+| 7 | 411.389279 | 0.007456 | 133.289813 | 7.63 | 10.433355 | 1.924455 |
+
+Derived vs same-run baseline:
+
+| Prefix | E2E Wall Speedup | TPOT Speedup | Throughput Gain |
+|---:|---:|---:|---:|
+| 6 | 5.85x | 5.77x | 5.74x |
+| 7 | 5.92x | 5.88x | 5.87x |
+
+Interpretation:
+- This rerun confirms the earlier trend: long fixed prefixes (`6`, `7`) remain clearly worse than shallow settings.
+- `prefix=7` is slightly better than `prefix=6`, but both are still well below the best shallow run (`prefix=2` in Section 16: TPOT `0.006818`, tokens/s `145.973`, tau `7.86`).
+
+## 18) Adaptive Candidate Budget (`fixed_prefix_rank`, `p2`, AIME25 full 30)
+
+Run A (adaptive 1/4/8):
+- Command core:
+  - `--candidate-mode fixed_prefix_rank --fixed-prefix-len 2 --branch-top-k 4 --max-candidates 8`
+  - `--adaptive-candidates --adaptive-budgets 1,4,8 --adaptive-accept-thresholds 0.85,0.65 --adaptive-warmup-cycles 4 --adaptive-probe-interval 16`
+- Results:
+  - `Speculative total_wall_s`: `435.822242`
+  - `Speculative TPOT`: `0.007584`
+  - `Speculative tokens_per_sec`: `125.291907`
+  - `Average Acceptance length (tau)`: `7.57`
+  - `avg_target_decode_s`: `10.552797`
+  - `avg_draft_decode_s`: `2.084895`
+  - `avg_candidates_per_cycle`: `3.407`
+  - adaptive usage: `{1: 1337, 4: 567, 8: 5620}` (`17.8%`, `7.5%`, `74.7%`)
+
+Run B (adaptive 2/3/4):
+- Command core:
+  - `--candidate-mode fixed_prefix_rank --fixed-prefix-len 2 --branch-top-k 4 --max-candidates 4`
+  - `--adaptive-candidates --adaptive-budgets 2,3,4 --adaptive-accept-thresholds 0.90,0.75 --adaptive-warmup-cycles 8 --adaptive-probe-interval 0`
+- Results:
+  - `Speculative total_wall_s`: `449.192554`
+  - `Speculative TPOT`: `0.007887`
+  - `Speculative tokens_per_sec`: `122.007810`
+  - `Average Acceptance length (tau)`: `7.49`
+  - `avg_target_decode_s`: `10.803554`
+  - `avg_draft_decode_s`: `2.146270`
+  - `avg_candidates_per_cycle`: `3.573`
+  - adaptive usage: `{2: 1244, 3: 500, 4: 5817}` (`16.5%`, `6.6%`, `76.9%`)
+
+Reference static run (Section 16 best):
+- `fixed_prefix_len=2, branch_top_k=4, max_candidates=4`
+- `total_wall_s=377.158110`, `TPOT=0.006818`, `tokens/s=145.973263`, `tau=7.86`
+- `avg_target_decode_s=9.532146`, `avg_draft_decode_s=1.757153`
+
+Delta vs static `p2_k4_c4`:
+
+| Config | Wall | TPOT | Tokens/s | Tau | Avg Target Decode | Avg Draft Decode |
+|---|---:|---:|---:|---:|---:|---:|
+| adaptive `1/4/8` | `0.865x` | `0.899x` | `0.858x` | `-0.29` | `+10.7%` | `+18.7%` |
+| adaptive `2/3/4` | `0.840x` | `0.864x` | `0.836x` | `-0.37` | `+13.3%` | `+22.1%` |
+
+Notes:
+- Ratios above are relative to static best (`1.0` = parity with static).
+- In both adaptive runs, reduced candidate budgets on some cycles lowered acceptance enough to hurt throughput.
+- For this method on AIME25, static `p2,k4,c4` remains stronger than these adaptive policies.

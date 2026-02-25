@@ -25,9 +25,22 @@ Status legend:
   - long prefixes (`6`, `7`) regress hard despite tau > vanilla:
     - tokens/s ~`112.8`, draft decode ~`2.39s/sample`
   - `fixed_prefix_len=5` run is incomplete (no final metrics).
-- Interpretation:
+  - rerun confirmation (`fixed_prefix_sweep_20260225_033258`):
+    - `p6`: TPOT `0.007598`, tokens/s `130.37`, tau `7.56`
+    - `p7`: TPOT `0.007456`, tokens/s `133.29`, tau `7.63`
+    - both still below `p2`, confirming shallow prefix remains better.
+  - Interpretation:
   - naive suffix reuse and naive multi-step draft refinement both hurt acceptance and throughput on current setup.
   - fixed-prefix branching can improve both tau and throughput when prefix depth is kept shallow (`~2` here).
+- Adaptive candidate-budget follow-up (`fixed_prefix_rank`, `p=2`):
+  - tested:
+    - `budgets=1,4,8`, thresholds `0.85/0.65`, warmup `4`, probe `16`
+    - `budgets=2,3,4`, thresholds `0.90/0.75`, warmup `8`, probe `0`
+  - both regressed vs static `p2,k4,c4`:
+    - lower tau (`7.57` / `7.49` vs `7.86`)
+    - lower tokens/s (`125.3` / `122.0` vs `146.0`)
+    - higher draft+target decode cost.
+  - verdict: current adaptive budget policy is not useful for fixed-prefix mode.
 
 ## 1) EWMA Throughput Scheduler
 - Status: `implemented`
@@ -326,3 +339,19 @@ Status legend:
 - Expected upside:
   - increase candidate diversity at near-constant verify cost,
   - improve tau without the draft-cost blow-up seen for long fixed-prefix duplication.
+
+## 19) Adaptive Candidate Budgeting (Current Policy)
+- Status: `rejected` (for current fixed-prefix setup)
+- What was tested:
+  - per-cycle budget selection from previous acceptance ratio (`tau / block_size`)
+  - warmup + optional probe cycles
+  - tested budgets: `1/4/8` and `2/3/4` on `fixed_prefix_rank, p=2, k=4`.
+- Result:
+  - both adaptive variants underperformed static `p2,k4,c4` on AIME25 full split.
+  - acceptance dropped and decode cost increased; throughput fell by ~`14-16%`.
+- Why likely:
+  - dropping candidate budget too often harms tau more than it saves draft work.
+  - with `branch_top_k=4`, very high budget choices do not add extra useful diversity anyway.
+- If revisited:
+  - use strict streak-based downshift and immediate upshift recovery,
+  - and couple budget upper bound to `branch_top_k` (avoid ineffective budget states).
