@@ -8,6 +8,8 @@ DRAFT="${DRAFT:-z-lab/Qwen3-4B-DFlash-b16}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-2048}"
 TEMPERATURE="${TEMPERATURE:-0.0}"
+CANDIDATE_MODE="${CANDIDATE_MODE:-fixed_prefix_rank}"
+SPARSE_MAX_POSITIONS="${SPARSE_MAX_POSITIONS:-4}"
 RUN_TAG="${RUN_TAG:-fixed_prefix_sweep_$(date +%Y%m%d_%H%M%S)}"
 LOG_DIR="${LOG_DIR:-logs/${RUN_TAG}}"
 SUMMARY_CSV="${SUMMARY_CSV:-${LOG_DIR}/summary.csv}"
@@ -44,7 +46,7 @@ if [[ -n "${SAVE_OUTPUTS_DIR}" ]]; then
 fi
 
 cat > "${SUMMARY_CSV}" <<'EOF'
-dataset,max_samples,block_size,candidate_mode,fixed_prefix_len,branch_top_k,max_candidates,e2e_speedup_vs_bs1,tpot_speedup_vs_bs1,throughput_gain_vs_bs1,e2e_speedup_vs_vanilla_bs,tpot_speedup_vs_vanilla_bs,throughput_gain_vs_vanilla_bs,tau,speculative_total_wall_s,speculative_tokens_per_sec,speculative_tpot,speculative_ttft,spec_avg_target_decode_s,spec_avg_draft_decode_s,spec_target_share,spec_draft_share,spec_total_profiled_cycles,avg_candidates_per_cycle,avg_verify_calls_per_sample,baseline_total_wall_s,baseline_tokens_per_sec,baseline_tpot,vanilla_total_wall_s,vanilla_tokens_per_sec,vanilla_tpot,baseline_log_path,vanilla_log_path,log_path,output_jsonl_path,cycle_jsonl_path
+dataset,max_samples,block_size,candidate_mode,fixed_prefix_len,sparse_max_positions,branch_top_k,max_candidates,e2e_speedup_vs_bs1,tpot_speedup_vs_bs1,throughput_gain_vs_bs1,e2e_speedup_vs_vanilla_bs,tpot_speedup_vs_vanilla_bs,throughput_gain_vs_vanilla_bs,tau,speculative_total_wall_s,speculative_tokens_per_sec,speculative_tpot,speculative_ttft,spec_avg_target_decode_s,spec_avg_draft_decode_s,spec_target_share,spec_draft_share,spec_total_profiled_cycles,avg_candidates_per_cycle,avg_verify_calls_per_sample,baseline_total_wall_s,baseline_tokens_per_sec,baseline_tpot,vanilla_total_wall_s,vanilla_tokens_per_sec,vanilla_tpot,baseline_log_path,vanilla_log_path,log_path,output_jsonl_path,cycle_jsonl_path
 EOF
 
 is_number() {
@@ -86,6 +88,7 @@ VANILLA_LOG_PATH="${LOG_DIR}/${DATASET}_vanilla_bs${BLOCK_SIZE}.log"
 echo "Running fixed-prefix candidate sweep"
 echo "dataset=${DATASET} max_samples=${MAX_SAMPLES} block_size=${BLOCK_SIZE} max_new_tokens=${MAX_NEW_TOKENS}"
 echo "fixed_prefix_lens=${PREFIX_LIST[*]} top_k_list=${TOPK_LIST[*]} max_candidates_list=${MAXC_LIST[*]}"
+echo "candidate_mode=${CANDIDATE_MODE} sparse_max_positions=${SPARSE_MAX_POSITIONS}"
 echo "collect_profile=${COLLECT_PROFILE} run_baseline=${RUN_BASELINE} run_vanilla_ref=${RUN_VANILLA_REF} logs=${LOG_DIR}"
 
 if [[ "${RUN_BASELINE}" == "1" ]]; then
@@ -202,7 +205,7 @@ fi
 for prefix_len in "${PREFIX_LIST[@]}"; do
   for top_k in "${TOPK_LIST[@]}"; do
     for max_c in "${MAXC_LIST[@]}"; do
-      if (( max_c > top_k )); then
+      if [[ "${CANDIDATE_MODE}" == "fixed_prefix_rank" && ${max_c} -gt ${top_k} ]]; then
         echo "Skipping config prefix=${prefix_len} top_k=${top_k} max_candidates=${max_c} (max_candidates > top_k)"
         continue
       fi
@@ -226,8 +229,9 @@ for prefix_len in "${PREFIX_LIST[@]}"; do
         --block-size "${BLOCK_SIZE}"
         --max-new-tokens "${MAX_NEW_TOKENS}"
         --temperature "${TEMPERATURE}"
-        --candidate-mode fixed_prefix_rank
+        --candidate-mode "${CANDIDATE_MODE}"
         --fixed-prefix-len "${prefix_len}"
+        --sparse-max-positions "${SPARSE_MAX_POSITIONS}"
         --branch-top-k "${top_k}"
         --max-candidates "${max_c}"
         --skip-baseline
@@ -254,7 +258,7 @@ for prefix_len in "${PREFIX_LIST[@]}"; do
       echo "--------------------------------------------------------" | tee -a "${log_path}"
 
       if [[ "${DRY_RUN}" == "1" ]]; then
-        echo "${DATASET},${MAX_SAMPLES},${BLOCK_SIZE},fixed_prefix_rank,${prefix_len},${top_k},${max_c},DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,${BASELINE_TOTAL_WALL_S},${BASELINE_TOKENS_PER_SEC},${BASELINE_TPOT},${VANILLA_TOTAL_WALL_S},${VANILLA_TOKENS_PER_SEC},${VANILLA_TPOT},${BASELINE_LOG_PATH},${VANILLA_LOG_PATH},${log_path},${out_path:-NA},${cycle_path:-NA}" >> "${SUMMARY_CSV}"
+        echo "${DATASET},${MAX_SAMPLES},${BLOCK_SIZE},${CANDIDATE_MODE},${prefix_len},${SPARSE_MAX_POSITIONS},${top_k},${max_c},DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,DRY_RUN,${BASELINE_TOTAL_WALL_S},${BASELINE_TOKENS_PER_SEC},${BASELINE_TPOT},${VANILLA_TOTAL_WALL_S},${VANILLA_TOKENS_PER_SEC},${VANILLA_TPOT},${BASELINE_LOG_PATH},${VANILLA_LOG_PATH},${log_path},${out_path:-NA},${cycle_path:-NA}" >> "${SUMMARY_CSV}"
         continue
       fi
 
@@ -263,7 +267,7 @@ for prefix_len in "${PREFIX_LIST[@]}"; do
       status=${PIPESTATUS[0]}
       set -e
       if [[ "${status}" -ne 0 ]]; then
-        echo "${DATASET},${MAX_SAMPLES},${BLOCK_SIZE},fixed_prefix_rank,${prefix_len},${top_k},${max_c},ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,${BASELINE_TOTAL_WALL_S},${BASELINE_TOKENS_PER_SEC},${BASELINE_TPOT},${VANILLA_TOTAL_WALL_S},${VANILLA_TOKENS_PER_SEC},${VANILLA_TPOT},${BASELINE_LOG_PATH},${VANILLA_LOG_PATH},${log_path},${out_path:-NA},${cycle_path:-NA}" >> "${SUMMARY_CSV}"
+        echo "${DATASET},${MAX_SAMPLES},${BLOCK_SIZE},${CANDIDATE_MODE},${prefix_len},${SPARSE_MAX_POSITIONS},${top_k},${max_c},ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,${BASELINE_TOTAL_WALL_S},${BASELINE_TOKENS_PER_SEC},${BASELINE_TPOT},${VANILLA_TOTAL_WALL_S},${VANILLA_TOKENS_PER_SEC},${VANILLA_TPOT},${BASELINE_LOG_PATH},${VANILLA_LOG_PATH},${log_path},${out_path:-NA},${cycle_path:-NA}" >> "${SUMMARY_CSV}"
         continue
       fi
 
@@ -300,7 +304,7 @@ for prefix_len in "${PREFIX_LIST[@]}"; do
       tpot_speedup_vanilla="$(ratio_or_na "${VANILLA_TPOT}" "${spec_tpot}")"
       throughput_gain_vanilla="$(ratio_or_na "${spec_tps}" "${VANILLA_TOKENS_PER_SEC}")"
 
-      echo "${DATASET},${MAX_SAMPLES},${BLOCK_SIZE},fixed_prefix_rank,${prefix_len},${top_k},${max_c},${e2e_speedup_bs1},${tpot_speedup_bs1},${throughput_gain_bs1},${e2e_speedup_vanilla},${tpot_speedup_vanilla},${throughput_gain_vanilla},${tau},${spec_wall},${spec_tps},${spec_tpot},${spec_ttft},${spec_target_decode},${spec_draft_decode},${spec_target_share},${spec_draft_share},${spec_cycles},${avg_cands},${avg_verify_calls},${BASELINE_TOTAL_WALL_S},${BASELINE_TOKENS_PER_SEC},${BASELINE_TPOT},${VANILLA_TOTAL_WALL_S},${VANILLA_TOKENS_PER_SEC},${VANILLA_TPOT},${BASELINE_LOG_PATH},${VANILLA_LOG_PATH},${log_path},${out_path:-NA},${cycle_path:-NA}" >> "${SUMMARY_CSV}"
+      echo "${DATASET},${MAX_SAMPLES},${BLOCK_SIZE},${CANDIDATE_MODE},${prefix_len},${SPARSE_MAX_POSITIONS},${top_k},${max_c},${e2e_speedup_bs1},${tpot_speedup_bs1},${throughput_gain_bs1},${e2e_speedup_vanilla},${tpot_speedup_vanilla},${throughput_gain_vanilla},${tau},${spec_wall},${spec_tps},${spec_tpot},${spec_ttft},${spec_target_decode},${spec_draft_decode},${spec_target_share},${spec_draft_share},${spec_cycles},${avg_cands},${avg_verify_calls},${BASELINE_TOTAL_WALL_S},${BASELINE_TOKENS_PER_SEC},${BASELINE_TPOT},${VANILLA_TOTAL_WALL_S},${VANILLA_TOKENS_PER_SEC},${VANILLA_TPOT},${BASELINE_LOG_PATH},${VANILLA_LOG_PATH},${log_path},${out_path:-NA},${cycle_path:-NA}" >> "${SUMMARY_CSV}"
     done
   done
 done

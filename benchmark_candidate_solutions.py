@@ -248,6 +248,136 @@ def build_fixed_prefix_rank_candidates(
     return candidates, metadata, suffix_positions
 
 
+def build_uncertainty_sparse_rank_candidates(
+    base_block_output_ids: torch.Tensor,
+    draft_logits: torch.Tensor,
+    fixed_prefix_len: int,
+    rank_top_k: int,
+    max_candidates: int,
+    sparse_max_positions: int,
+    margin_threshold: float,
+) -> tuple[list[torch.Tensor], list[dict], list[int]]:
+    """Build sparse uncertainty-focused candidates with rank-suffix alternatives.
+
+    Candidate 0 is greedy base. Each non-base candidate changes only one uncertain
+    suffix position to a non-greedy rank token. This preserves high-confidence
+    greedy tokens while adding targeted diversity where the draft is uncertain.
+    """
+    if max_candidates < 1:
+        raise ValueError("max_candidates must be >= 1")
+    if rank_top_k < 1:
+        raise ValueError("rank_top_k must be >= 1")
+    if sparse_max_positions < 1:
+        raise ValueError("sparse_max_positions must be >= 1")
+
+    effective_block_size = int(base_block_output_ids.shape[1])
+    # block position 0 has no draft logits (context token for this cycle).
+    suffix_start = max(1, min(fixed_prefix_len, effective_block_size))
+    suffix_len = max(0, effective_block_size - suffix_start)
+    if suffix_len == 0:
+        return (
+            [base_block_output_ids.clone()],
+            [{"candidate_idx": 0, "draft_score": 0.0, "replaced_positions": [], "rank_variant": 1}],
+            [],
+        )
+
+    rank_k = min(rank_top_k, int(draft_logits.shape[-1]))
+    if rank_k <= 1 or max_candidates <= 1:
+        suffix_positions = list(range(suffix_start, effective_block_size))
+        return (
+            [base_block_output_ids.clone()],
+            [{"candidate_idx": 0, "draft_score": 0.0, "replaced_positions": [], "rank_variant": 1}],
+            suffix_positions,
+        )
+
+    # [suffix_len, rank_k]
+    suffix_logits = draft_logits[:, suffix_start - 1 :, :]
+    topk_values, topk_indices = torch.topk(suffix_logits, k=rank_k, dim=-1)
+    topk_values = topk_values[0]
+    topk_indices = topk_indices[0]
+
+    # Higher uncertainty score => more uncertain.
+    logit_margin = topk_values[:, 0] - topk_values[:, 1]
+    uncertainty = -logit_margin
+    ordered_suffix_idx = torch.argsort(uncertainty, descending=True)
+
+    # Optional probability-margin gate for compatibility with existing flag.
+    if margin_threshold >= 0:
+        probs = torch.softmax(suffix_logits.float(), dim=-1)[0]
+        prob_top2 = torch.topk(probs, k=2, dim=-1).values
+        prob_margin = prob_top2[:, 0] - prob_top2[:, 1]
+        keep_mask = prob_margin <= margin_threshold
+        ordered_suffix_idx = ordered_suffix_idx[keep_mask[ordered_suffix_idx]]
+
+    if ordered_suffix_idx.numel() == 0:
+        return (
+            [base_block_output_ids.clone()],
+            [{"candidate_idx": 0, "draft_score": 0.0, "replaced_positions": [], "rank_variant": 1}],
+            [],
+        )
+
+    selected_suffix_idx = ordered_suffix_idx[: min(int(sparse_max_positions), int(ordered_suffix_idx.numel()))]
+    selected_block_positions = selected_suffix_idx + suffix_start
+
+    alt_per_pos = rank_k - 1
+    pool_size = int(selected_suffix_idx.numel()) * alt_per_pos
+    candidate_total = min(max_candidates, 1 + pool_size)
+    if candidate_total <= 1:
+        return (
+            [base_block_output_ids.clone()],
+            [{"candidate_idx": 0, "draft_score": 0.0, "replaced_positions": [], "rank_variant": 1}],
+            [int(p) for p in selected_block_positions.tolist()],
+        )
+
+    # Select strongest alternatives from uncertainty-prioritized pool.
+    selected_topk_values = topk_values[selected_suffix_idx]  # [S, rank_k]
+    selected_topk_indices = topk_indices[selected_suffix_idx]  # [S, rank_k]
+    selected_uncertainty = uncertainty[selected_suffix_idx]  # [S]
+
+    alt_logits = selected_topk_values[:, 1:]  # [S, alt_per_pos]
+    alt_tokens = selected_topk_indices[:, 1:]  # [S, alt_per_pos]
+    composite = selected_uncertainty[:, None] * 1e6 + alt_logits
+
+    non_base = candidate_total - 1
+    top_comp, top_flat_idx = torch.topk(composite.reshape(-1), k=non_base, dim=0)
+    pos_choice = torch.div(top_flat_idx, alt_per_pos, rounding_mode="floor")
+    alt_choice = top_flat_idx % alt_per_pos  # 0 => rank-2
+
+    chosen_positions = selected_block_positions[pos_choice]
+    chosen_tokens = alt_tokens[pos_choice, alt_choice]
+    chosen_rank_variants = alt_choice + 2
+
+    # Tie-break draft score: start from greedy score over selected uncertain
+    # positions and replace one position with chosen alternative logit.
+    base_score = selected_topk_values[:, 0].sum()
+    chosen_base_logits = selected_topk_values[pos_choice, 0]
+    chosen_alt_logits = alt_logits[pos_choice, alt_choice]
+    candidate_scores = base_score - chosen_base_logits + chosen_alt_logits
+
+    # Build all candidates in one tensor op.
+    stacked = base_block_output_ids.expand(candidate_total, -1).clone()
+    row_idx = torch.arange(1, candidate_total, device=stacked.device, dtype=torch.long)
+    stacked[row_idx, chosen_positions] = chosen_tokens
+
+    candidates = [stacked[i : i + 1] for i in range(candidate_total)]
+    metadata: list[dict] = [
+        {"candidate_idx": 0, "draft_score": float(base_score.item()), "replaced_positions": [], "rank_variant": 1}
+    ]
+    for i in range(non_base):
+        pos = int(chosen_positions[i].item())
+        metadata.append(
+            {
+                "candidate_idx": int(i + 1),
+                "draft_score": float(candidate_scores[i].item()),
+                "replaced_positions": [pos],
+                "rank_variant": int(chosen_rank_variants[i].item()),
+                "composite_score": float(top_comp[i].item()),
+            }
+        )
+
+    return candidates, metadata, [int(p) for p in selected_block_positions.tolist()]
+
+
 @torch.inference_mode()
 def dflash_generate_candidate_solutions(
     model: DFlashDraftModel,
@@ -263,6 +393,7 @@ def dflash_generate_candidate_solutions(
     margin_threshold: float,
     candidate_mode: str,
     fixed_prefix_len: int,
+    sparse_max_positions: int,
     temperature: float = 0.0,
     collect_profile: bool = False,
 ) -> SimpleNamespace:
@@ -351,6 +482,16 @@ def dflash_generate_candidate_solutions(
                     fixed_prefix_len=fixed_prefix_len,
                     rank_top_k=branch_top_k,
                     max_candidates=max_candidates,
+                )
+            elif candidate_mode == "uncertainty_sparse_rank":
+                candidate_blocks, candidate_meta, selected_positions = build_uncertainty_sparse_rank_candidates(
+                    base_block_output_ids=block_output_ids,
+                    draft_logits=draft_logits,
+                    fixed_prefix_len=fixed_prefix_len,
+                    rank_top_k=branch_top_k,
+                    max_candidates=max_candidates,
+                    sparse_max_positions=sparse_max_positions,
+                    margin_threshold=margin_threshold,
                 )
             else:
                 selected_positions = select_branch_positions(
@@ -478,6 +619,7 @@ def dflash_generate_candidate_solutions(
     candidate_summary = {
         "candidate_mode": str(candidate_mode),
         "fixed_prefix_len": int(fixed_prefix_len),
+        "sparse_max_positions": int(sparse_max_positions),
         "avg_candidates_per_cycle": float(avg_candidates_per_cycle),
         "candidate_verify_calls": int(candidate_verify_calls),
         "candidate_count_sum": int(candidate_count_sum),
@@ -551,9 +693,13 @@ def main() -> None:
     parser.add_argument(
         "--candidate-mode",
         type=str,
-        choices=["branch_beam", "fixed_prefix_rank"],
+        choices=["branch_beam", "fixed_prefix_rank", "uncertainty_sparse_rank"],
         default="branch_beam",
-        help="Candidate generation mode. fixed_prefix_rank = greedy + rank-2/3/4 suffix variants.",
+        help=(
+            "Candidate generation mode. "
+            "fixed_prefix_rank = greedy + global rank-suffix variants; "
+            "uncertainty_sparse_rank = modify only uncertain suffix positions."
+        ),
     )
     parser.add_argument(
         "--fixed-prefix-len",
@@ -566,6 +712,12 @@ def main() -> None:
         type=float,
         default=-1.0,
         help="If >=0, only branch where (p1 - p2) <= threshold in selected early positions.",
+    )
+    parser.add_argument(
+        "--sparse-max-positions",
+        type=int,
+        default=4,
+        help="For uncertainty_sparse_rank: max uncertain suffix positions to include in alternative pool.",
     )
     parser.add_argument("--skip-baseline", action="store_true")
     parser.add_argument("--local-files-only", action="store_true")
@@ -587,6 +739,8 @@ def main() -> None:
         raise ValueError("--max-candidates must be >= 1")
     if args.fixed_prefix_len < 0:
         raise ValueError("--fixed-prefix-len must be >= 0")
+    if args.sparse_max_positions < 1:
+        raise ValueError("--sparse-max-positions must be >= 1")
     if args.temperature >= 1e-5:
         raise ValueError("This research script currently supports only --temperature 0.0")
     collect_profile = args.collect_profile or (args.save_cycle_trace_path is not None)
@@ -608,7 +762,7 @@ def main() -> None:
             f"pid={os.getpid()} starting; "
             f"candidate_mode={args.candidate_mode}, fixed_prefix_len={args.fixed_prefix_len}, "
             f"branch_depth={args.branch_depth}, top_k={args.branch_top_k}, max_candidates={args.max_candidates}, "
-            f"margin_threshold={args.branch_margin_threshold}"
+            f"margin_threshold={args.branch_margin_threshold}, sparse_max_positions={args.sparse_max_positions}"
         ),
         pre_dist=True,
     )
@@ -719,6 +873,7 @@ def main() -> None:
                     margin_threshold=args.branch_margin_threshold,
                     candidate_mode=args.candidate_mode,
                     fixed_prefix_len=args.fixed_prefix_len,
+                    sparse_max_positions=args.sparse_max_positions,
                     temperature=args.temperature,
                     collect_profile=collect_profile,
                 )
@@ -769,6 +924,7 @@ def main() -> None:
                     "branch_margin_threshold": args.branch_margin_threshold,
                     "candidate_mode": args.candidate_mode,
                     "fixed_prefix_len": args.fixed_prefix_len,
+                    "sparse_max_positions": args.sparse_max_positions,
                     "baseline": None
                     if baseline_response is None
                     else {
@@ -868,6 +1024,7 @@ def main() -> None:
     print(f"Candidate avg_verify_calls_per_sample: {avg_verify_calls:.1f}")
     print(f"Candidate mode: {args.candidate_mode}")
     print(f"Candidate fixed_prefix_len: {args.fixed_prefix_len}")
+    print(f"Candidate sparse_max_positions: {args.sparse_max_positions}")
     print(f"Candidate branch_depth: {args.branch_depth}")
     print(f"Candidate branch_top_k: {args.branch_top_k}")
     print(f"Candidate max_candidates: {args.max_candidates}")

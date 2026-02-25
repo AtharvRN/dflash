@@ -8,7 +8,7 @@ Status legend:
 - `validated`: tested with clear evidence
 - `rejected`: tested and not useful
 
-## Latest Results Snapshot (2026-02-18)
+## Latest Results Snapshot (2026-02-25)
 - Suffix-seed experiment (`bs=16`, AIME25, `max_samples=10`, `max_new_tokens=2048`, A100):
   - `seed_mode=none`: TPOT `0.006258`, tau `7.92`, speedup `6.44x`
   - `seed_mode=sparse` (`seed_max_tokens=2`): TPOT `0.011713`, tau `4.27`, derived speedup `3.44x`
@@ -18,9 +18,16 @@ Status legend:
 - Candidate benchmark (`aa10_*`, AIME25, `max_samples=10`, `max_new_tokens=512`, `bs=16`):
   - Candidate-On vs Vanilla: mean tau `7.121` vs `7.082` (`+0.039`)
   - but draft decode cost rose (`1.3445s` vs `0.8699s` per sample), and steady-state decode throughput remained below vanilla.
+- Fixed-prefix rank-suffix sweep (`k=4`, `c=4`, AIME25, `max_samples=30`, `max_new_tokens=2048`):
+  - best config: `fixed_prefix_len=2`
+    - total wall `377.158s`, TPOT `0.006818`, tokens/s `145.973`, tau `7.86`
+    - vs vanilla `bs=16`: wall `1.014x`, TPOT `1.067x`, throughput `1.052x`, tau `+0.40`
+  - long prefixes (`6`, `7`) regress hard despite tau > vanilla:
+    - tokens/s ~`112.8`, draft decode ~`2.39s/sample`
+  - `fixed_prefix_len=5` run is incomplete (no final metrics).
 - Interpretation:
   - naive suffix reuse and naive multi-step draft refinement both hurt acceptance and throughput on current setup.
-  - current candidate branching improves tau slightly but does not yet improve steady-state throughput.
+  - fixed-prefix branching can improve both tau and throughput when prefix depth is kept shallow (`~2` here).
 
 ## 1) EWMA Throughput Scheduler
 - Status: `implemented`
@@ -261,3 +268,61 @@ Status legend:
     - `Speculative TPOT`
     - `Speculative tokens_per_sec`
     - `Average Acceptance length`
+
+## 16) Evaluation Caveat: E2E vs TPOT with Variable Output Length
+- Status: `confirmed by multiple fixed-prefix runs`
+- Observation:
+  - `fixed_prefix_len=4` improved decode efficiency (`TPOT`, tokens/s, tau) but still had slightly worse E2E wall than vanilla in that specific run.
+  - `fixed_prefix_len=2` improved both decode efficiency and E2E wall (`~1.014x` wall ratio vs vanilla), so this caveat is run-dependent, not absolute.
+- Reason:
+  - E2E combines:
+    - per-token decode efficiency
+    - total number of produced tokens
+    - startup/prefill overhead.
+  - If output length increases enough, E2E wall can worsen even with better TPOT.
+- Implication for reporting:
+  - always report both:
+    - decode efficiency (`TPOT`, tokens/s, tau)
+    - end-to-end wall speedup on fixed workload.
+  - for fair method-vs-method E2E claims, prefer matched-length settings or normalize by generated tokens.
+
+## 17) Fixed-Prefix Tuning Outcome (`k=4`, `c=4`, full AIME25)
+- Status: `validated`
+- Completed prefixes: `1, 2, 3, 4, 6, 7` (`5` incomplete).
+- Best setting: `fixed_prefix_len=2`
+  - tau `7.86` (best),
+  - TPOT `0.006818` (best),
+  - tokens/s `145.97` (best),
+  - E2E wall speedup vs baseline `6.38x`,
+  - slight E2E win vs vanilla `bs=16`.
+- Failure mode:
+  - long fixed prefix (`6`, `7`) over-constrains candidate diversity and raises draft-side cost sharply (`~2.39s/sample`), causing major throughput regression.
+- Practical rule:
+  - keep fixed-prefix rank-suffix candidate generation shallow; explore around `prefix_len=2`.
+
+## 18) TiDAR-Inspired Direction (arXiv:2511.08923)
+- Status: `proposed`
+- Reference:
+  - `docs/2511.08923v1.pdf`
+  - `docs/2511.08923v1.txt`
+- What is directly useful for us:
+  - TiDAR emphasizes exploiting "free token slots": additional drafted/verified tokens can be packed with low incremental latency while kernels remain memory-bound.
+  - They also highlight low-overhead implementation details (preinitialized/sliced masks, exact KV handling) and show confidence-only decoding underperforms rejection-based draft+verify.
+- What is **not** directly drop-in:
+  - TiDAR is a single-model dual-mode architecture (AR + diffusion in one forward) and requires specific training/mask design.
+  - Our current DFlash setup uses separate target + draft models and inference-only changes.
+- Practical adaptation for our current scripts:
+  - Replace full-suffix duplication with **uncertainty-sparse branching** under a fixed verification node budget `B`:
+    - baseline fixed-prefix rank currently costs roughly `nodes = p + C * (bs - p)`.
+    - new sparse-branch form:
+      - keep one greedy backbone of length `bs`,
+      - branch only on uncertain positions `U` after prefix,
+      - approximate packed-node cost: `nodes ≈ bs + (C - 1) * |U|`.
+    - example (`bs=16`, `B=64`):
+      - current full-suffix with `p=2` gives max `C≈4`,
+      - sparse-branch with `|U|=4` allows up to `C≈13` within similar budget.
+  - Precompute/cache candidate packing layouts and attention-index maps per `(bs, |U|, C)` to reduce Python overhead in hot loop.
+  - Keep one-step diffusion draft (TiDAR ablations are consistent with one-step being the efficient regime).
+- Expected upside:
+  - increase candidate diversity at near-constant verify cost,
+  - improve tau without the draft-cost blow-up seen for long fixed-prefix duplication.
