@@ -42,6 +42,36 @@ def summarize_mode(samples: list[SimpleNamespace]) -> dict[str, float]:
     }
 
 
+def summarize_profile(samples: list[SimpleNamespace]) -> dict[str, float] | None:
+    profiles = [getattr(s, "profile_summary", None) for s in samples]
+    profiles = [p for p in profiles if p is not None]
+    if not profiles:
+        return None
+
+    total_target_prefill_s = float(np.sum([p["target_prefill_s"] for p in profiles]))
+    total_target_decode_s = float(np.sum([p["target_decode_s"] for p in profiles]))
+    total_draft_decode_s = float(np.sum([p["draft_decode_s"] for p in profiles]))
+    total_cycle_decode_s = float(np.sum([p["cycle_decode_s_sum"] for p in profiles]))
+    total_decode_wall_s = float(np.sum([p["decode_wall_s"] for p in profiles]))
+    total_cycles = int(np.sum([p["profiled_cycles"] for p in profiles]))
+    denom = max(1e-12, total_draft_decode_s + total_target_decode_s)
+
+    return {
+        "total_target_prefill_s": total_target_prefill_s,
+        "total_target_decode_s": total_target_decode_s,
+        "total_draft_decode_s": total_draft_decode_s,
+        "total_cycle_decode_s": total_cycle_decode_s,
+        "total_decode_wall_s": total_decode_wall_s,
+        "total_profiled_cycles": float(total_cycles),
+        "draft_share_decode": float(total_draft_decode_s / denom),
+        "target_share_decode": float(total_target_decode_s / denom),
+        "avg_target_prefill_s": float(total_target_prefill_s / len(profiles)),
+        "avg_target_decode_s": float(total_target_decode_s / len(profiles)),
+        "avg_draft_decode_s": float(total_draft_decode_s / len(profiles)),
+        "avg_decode_wall_s": float(total_decode_wall_s / len(profiles)),
+    }
+
+
 def clone_dynamic_cache(cache: DynamicCache) -> DynamicCache:
     # Clone tensors to avoid mutating the live prefix cache when expanding batch
     # for candidate verification.
@@ -147,6 +177,109 @@ def build_candidate_blocks(
     return candidates, metadata
 
 
+def build_fixed_prefix_rank_candidates(
+    base_block_output_ids: torch.Tensor,
+    draft_logits: torch.Tensor,
+    fixed_prefix_len: int,
+    rank_top_k: int,
+    max_candidates: int,
+) -> tuple[list[torch.Tensor], list[dict], list[int]]:
+    """Build candidates with shared prefix and global rank-suffix variants.
+
+    Candidate 0: greedy base.
+    Candidate r>0: keep prefix fixed, set every suffix position to rank-(r+1)
+    token under draft logits at that position.
+    """
+    if max_candidates < 1:
+        raise ValueError("max_candidates must be >= 1")
+    if rank_top_k < 1:
+        raise ValueError("rank_top_k must be >= 1")
+
+    effective_block_size = int(base_block_output_ids.shape[1])
+    # block position 0 has no draft logits (context token for this cycle).
+    suffix_start = max(1, min(fixed_prefix_len, effective_block_size))
+    suffix_positions = list(range(suffix_start, effective_block_size))
+
+    if not suffix_positions:
+        return (
+            [base_block_output_ids.clone()],
+            [{"candidate_idx": 0, "draft_score": 0.0, "replaced_positions": [], "rank_variant": 1}],
+            [],
+        )
+
+    # Number of total candidates to emit (including greedy base).
+    # Example: top-4 => greedy + (rank-2, rank-3, rank-4) = 4 total.
+    candidate_total = min(max_candidates, rank_top_k)
+    if candidate_total <= 1:
+        return (
+            [base_block_output_ids.clone()],
+            [{"candidate_idx": 0, "draft_score": 0.0, "replaced_positions": [], "rank_variant": 1}],
+            suffix_positions,
+        )
+
+    log_probs = torch.log_softmax(draft_logits.float(), dim=-1)
+    rank_table: dict[int, tuple[list[int], list[float]]] = {}
+    for pos in suffix_positions:
+        values, indices = torch.topk(log_probs[0, pos - 1], k=candidate_total, dim=-1)
+        rank_table[pos] = (
+            [int(x) for x in indices.tolist()],
+            [float(x) for x in values.tolist()],
+        )
+
+    candidates: list[torch.Tensor] = []
+    metadata: list[dict] = []
+    seen: set[tuple[int, ...]] = set()
+
+    # Always include greedy base candidate first.
+    base_score = 0.0
+    for pos in suffix_positions:
+        token_id = int(base_block_output_ids[0, pos].item())
+        base_score += float(log_probs[0, pos - 1, token_id].item())
+    base_key = tuple(int(x) for x in base_block_output_ids[0, 1:].tolist())
+    seen.add(base_key)
+    candidates.append(base_block_output_ids.clone())
+    metadata.append(
+        {
+            "candidate_idx": 0,
+            "draft_score": float(base_score),
+            "replaced_positions": [],
+            "rank_variant": 1,
+        }
+    )
+
+    # Add rank-2, rank-3, ... variants on the suffix.
+    for rank_idx in range(1, candidate_total):
+        candidate = base_block_output_ids.clone()
+        replaced_positions: list[int] = []
+        score = 0.0
+        for pos in suffix_positions:
+            token_ids, token_scores = rank_table[pos]
+            token_id = int(token_ids[rank_idx])
+            old_id = int(candidate[0, pos].item())
+            if old_id != token_id:
+                replaced_positions.append(pos)
+            candidate[0, pos] = token_id
+            score += float(token_scores[rank_idx])
+
+        key = tuple(int(x) for x in candidate[0, 1:].tolist())
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(candidate)
+        metadata.append(
+            {
+                "candidate_idx": len(candidates) - 1,
+                "draft_score": float(score),
+                "replaced_positions": replaced_positions,
+                "rank_variant": int(rank_idx + 1),
+            }
+        )
+        if len(candidates) >= max_candidates:
+            break
+
+    return candidates, metadata, suffix_positions
+
+
 @torch.inference_mode()
 def dflash_generate_candidate_solutions(
     model: DFlashDraftModel,
@@ -160,7 +293,10 @@ def dflash_generate_candidate_solutions(
     branch_top_k: int,
     max_candidates: int,
     margin_threshold: float,
+    candidate_mode: str,
+    fixed_prefix_len: int,
     temperature: float = 0.0,
+    collect_profile: bool = False,
 ) -> SimpleNamespace:
     if temperature >= 1e-5:
         raise ValueError("benchmark_candidate_solutions.py currently supports only temperature=0.0")
@@ -205,6 +341,15 @@ def dflash_generate_candidate_solutions(
     first_prompt_cycle_done = False
 
     while start < max_length:
+        cycle_start = None
+        cycle_end = None
+        draft_events = None
+        target_events = None
+        if collect_profile:
+            cycle_start = torch.cuda.Event(enable_timing=True)
+            cycle_end = torch.cuda.Event(enable_timing=True)
+            cycle_start.record()
+
         remaining = max_length - start
         effective_block_size = min(block_size, remaining)
         block_output_ids = output_ids[:, start : start + effective_block_size].clone()
@@ -215,6 +360,9 @@ def dflash_generate_candidate_solutions(
         candidate_meta = [{"candidate_idx": 0, "draft_score": 0.0, "replaced_positions": []}]
 
         if effective_block_size > 1:
+            if collect_profile:
+                draft_events = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+                draft_events[0].record()
             noise_embedding = target.model.embed_tokens(block_output_ids)
             draft_logits = target.lm_head(
                 model(
@@ -228,20 +376,30 @@ def dflash_generate_candidate_solutions(
             )
             past_key_values_draft.crop(start)
             block_output_ids[:, 1:] = sample(draft_logits, temperature)
-
-            selected_positions = select_branch_positions(
-                draft_logits=draft_logits,
-                effective_block_size=effective_block_size,
-                branch_depth=branch_depth,
-                margin_threshold=margin_threshold,
-            )
-            candidate_blocks, candidate_meta = build_candidate_blocks(
-                base_block_output_ids=block_output_ids,
-                draft_logits=draft_logits,
-                selected_positions=selected_positions,
-                branch_top_k=branch_top_k,
-                max_candidates=max_candidates,
-            )
+            if candidate_mode == "fixed_prefix_rank":
+                candidate_blocks, candidate_meta, selected_positions = build_fixed_prefix_rank_candidates(
+                    base_block_output_ids=block_output_ids,
+                    draft_logits=draft_logits,
+                    fixed_prefix_len=fixed_prefix_len,
+                    rank_top_k=branch_top_k,
+                    max_candidates=max_candidates,
+                )
+            else:
+                selected_positions = select_branch_positions(
+                    draft_logits=draft_logits,
+                    effective_block_size=effective_block_size,
+                    branch_depth=branch_depth,
+                    margin_threshold=margin_threshold,
+                )
+                candidate_blocks, candidate_meta = build_candidate_blocks(
+                    base_block_output_ids=block_output_ids,
+                    draft_logits=draft_logits,
+                    selected_positions=selected_positions,
+                    branch_top_k=branch_top_k,
+                    max_candidates=max_candidates,
+                )
+            if collect_profile:
+                draft_events[1].record()
 
         candidate_count_sum += len(candidate_blocks)
 
@@ -253,6 +411,9 @@ def dflash_generate_candidate_solutions(
         if num_candidates > 1:
             verify_cache.batch_repeat_interleave(num_candidates)
 
+        if collect_profile:
+            target_events = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+            target_events[0].record()
         verify_output = target(
             stacked_candidates,
             position_ids=stacked_position_ids,
@@ -260,6 +421,8 @@ def dflash_generate_candidate_solutions(
             use_cache=True,
             output_hidden_states=True if effective_block_size > 1 else False,
         )
+        if collect_profile:
+            target_events[1].record()
         candidate_verify_calls += 1
 
         posterior_all = sample(verify_output.logits, temperature)
@@ -298,20 +461,27 @@ def dflash_generate_candidate_solutions(
         output_ids[:, start + tau] = posterior[:, acceptance_length]
         acceptance_lengths.append(tau)
 
-        cycle_trace.append(
-            {
-                "cycle_idx": int(len(acceptance_lengths) - 1),
-                "generated_tokens_before": int(start - num_input_tokens),
-                "effective_block_size": int(effective_block_size),
-                "tau": int(tau),
-                "acceptance_ratio": float(tau / max(1, effective_block_size)),
-                "num_candidates": int(len(candidate_blocks)),
-                "selected_positions": [int(x) for x in selected_positions],
-                "chosen_candidate_idx": int(chosen_candidate_idx),
-                "candidate_taus": [int(x["tau"]) for x in candidate_evals],
-                "candidate_draft_scores": [float(x["draft_score"]) for x in candidate_evals],
+        cycle_row = {
+            "cycle_idx": int(len(acceptance_lengths) - 1),
+            "generated_tokens_before": int(start - num_input_tokens),
+            "effective_block_size": int(effective_block_size),
+            "tau": int(tau),
+            "acceptance_ratio": float(tau / max(1, effective_block_size)),
+            "num_candidates": int(len(candidate_blocks)),
+            "selected_positions": [int(x) for x in selected_positions],
+            "chosen_candidate_idx": int(chosen_candidate_idx),
+            "candidate_taus": [int(x["tau"]) for x in candidate_evals],
+            "candidate_draft_scores": [float(x["draft_score"]) for x in candidate_evals],
+            "candidate_rank_variants": [int(x.get("rank_variant", 1)) for x in candidate_meta],
+        }
+        if collect_profile:
+            cycle_end.record()
+            cycle_row["_events"] = {
+                "draft": draft_events,
+                "target": target_events,
+                "cycle": (cycle_start, cycle_end),
             }
-        )
+        cycle_trace.append(cycle_row)
 
         start += tau
         past_key_values_target.crop(start)
@@ -342,10 +512,52 @@ def dflash_generate_candidate_solutions(
     avg_candidates_per_cycle = float(candidate_count_sum / max(1, len(acceptance_lengths)))
 
     candidate_summary = {
+        "candidate_mode": str(candidate_mode),
+        "fixed_prefix_len": int(fixed_prefix_len),
         "avg_candidates_per_cycle": float(avg_candidates_per_cycle),
         "candidate_verify_calls": int(candidate_verify_calls),
         "candidate_count_sum": int(candidate_count_sum),
     }
+
+    profile_summary = None
+    if collect_profile:
+        torch.cuda.synchronize()
+        target_prefill_s = float(time_to_first_token)
+        total_target_decode_s = 0.0
+        total_draft_decode_s = 0.0
+        total_cycle_s = 0.0
+        for row in cycle_trace:
+            draft_pair = row["_events"]["draft"]
+            target_pair = row["_events"]["target"]
+            cycle_pair = row["_events"]["cycle"]
+            draft_s = 0.0
+            if draft_pair is not None:
+                draft_s = draft_pair[0].elapsed_time(draft_pair[1]) / 1000.0
+            target_s = 0.0
+            if target_pair is not None:
+                target_s = target_pair[0].elapsed_time(target_pair[1]) / 1000.0
+            cycle_s = cycle_pair[0].elapsed_time(cycle_pair[1]) / 1000.0
+            row["draft_s"] = float(draft_s)
+            row["target_s"] = float(target_s)
+            row["cycle_s"] = float(cycle_s)
+            row.pop("_events", None)
+            total_draft_decode_s += draft_s
+            total_target_decode_s += target_s
+            total_cycle_s += cycle_s
+        profile_summary = {
+            "target_prefill_s": float(target_prefill_s),
+            "target_decode_s": float(total_target_decode_s),
+            "draft_decode_s": float(total_draft_decode_s),
+            "cycle_decode_s_sum": float(total_cycle_s),
+            "decode_wall_s": float(total_decode_time),
+            "profiled_cycles": int(len(cycle_trace)),
+            "draft_share_decode": float(
+                total_draft_decode_s / max(1e-12, total_draft_decode_s + total_target_decode_s)
+            ),
+            "target_share_decode": float(
+                total_target_decode_s / max(1e-12, total_draft_decode_s + total_target_decode_s)
+            ),
+        }
 
     return SimpleNamespace(
         output_ids=output_ids,
@@ -356,6 +568,7 @@ def dflash_generate_candidate_solutions(
         acceptance_lengths=acceptance_lengths,
         cycle_trace=cycle_trace,
         candidate_summary=candidate_summary,
+        profile_summary=profile_summary,
     )
 
 
@@ -372,6 +585,19 @@ def main() -> None:
     parser.add_argument("--branch-top-k", type=int, default=2, help="Top-k tokens per selected position.")
     parser.add_argument("--max-candidates", type=int, default=4, help="Maximum candidate blocks per cycle.")
     parser.add_argument(
+        "--candidate-mode",
+        type=str,
+        choices=["branch_beam", "fixed_prefix_rank"],
+        default="branch_beam",
+        help="Candidate generation mode. fixed_prefix_rank = greedy + rank-2/3/4 suffix variants.",
+    )
+    parser.add_argument(
+        "--fixed-prefix-len",
+        type=int,
+        default=5,
+        help="For fixed_prefix_rank mode: keep first N block positions fixed, vary suffix by rank.",
+    )
+    parser.add_argument(
         "--branch-margin-threshold",
         type=float,
         default=-1.0,
@@ -382,6 +608,11 @@ def main() -> None:
     parser.add_argument("--log-all-ranks", action="store_true")
     parser.add_argument("--save-outputs-path", type=str, default=None)
     parser.add_argument("--save-cycle-trace-path", type=str, default=None)
+    parser.add_argument(
+        "--collect-profile",
+        action="store_true",
+        help="Collect per-cycle profiling stats (target/draft/cycle timings).",
+    )
     args = parser.parse_args()
 
     if args.branch_depth < 0:
@@ -390,8 +621,11 @@ def main() -> None:
         raise ValueError("--branch-top-k must be >= 1")
     if args.max_candidates < 1:
         raise ValueError("--max-candidates must be >= 1")
+    if args.fixed_prefix_len < 0:
+        raise ValueError("--fixed-prefix-len must be >= 0")
     if args.temperature >= 1e-5:
         raise ValueError("This research script currently supports only --temperature 0.0")
+    collect_profile = args.collect_profile or (args.save_cycle_trace_path is not None)
 
     setup_t0 = time.perf_counter()
 
@@ -408,6 +642,7 @@ def main() -> None:
     setup_log(
         (
             f"pid={os.getpid()} starting; "
+            f"candidate_mode={args.candidate_mode}, fixed_prefix_len={args.fixed_prefix_len}, "
             f"branch_depth={args.branch_depth}, top_k={args.branch_top_k}, max_candidates={args.max_candidates}, "
             f"margin_threshold={args.branch_margin_threshold}"
         ),
@@ -518,7 +753,10 @@ def main() -> None:
                     branch_top_k=args.branch_top_k,
                     max_candidates=args.max_candidates,
                     margin_threshold=args.branch_margin_threshold,
+                    candidate_mode=args.candidate_mode,
+                    fixed_prefix_len=args.fixed_prefix_len,
                     temperature=args.temperature,
+                    collect_profile=collect_profile,
                 )
                 response[bs].wall_time_s = cuda_time() - t_call
 
@@ -565,6 +803,8 @@ def main() -> None:
                     "branch_top_k": args.branch_top_k,
                     "max_candidates": args.max_candidates,
                     "branch_margin_threshold": args.branch_margin_threshold,
+                    "candidate_mode": args.candidate_mode,
+                    "fixed_prefix_len": args.fixed_prefix_len,
                     "baseline": None
                     if baseline_response is None
                     else {
@@ -576,6 +816,7 @@ def main() -> None:
                         "tpot_s": baseline_response.time_per_output_token,
                         "acceptance_lengths": baseline_response.acceptance_lengths,
                         "candidate_summary": baseline_response.candidate_summary,
+                        "profile_summary": baseline_response.profile_summary,
                     },
                     "speculative": {
                         "output_text": output_text,
@@ -586,6 +827,7 @@ def main() -> None:
                         "tpot_s": spec_response.time_per_output_token,
                         "acceptance_lengths": spec_response.acceptance_lengths,
                         "candidate_summary": spec_response.candidate_summary,
+                        "profile_summary": spec_response.profile_summary,
                     },
                 }
             )
@@ -631,6 +873,25 @@ def main() -> None:
     else:
         print("Decoding speedup: N/A (baseline skipped)")
 
+    if collect_profile:
+        spec_profile = summarize_profile(spec_samples)
+        if spec_profile is not None:
+            print(f"Speculative profile avg_target_prefill_s: {spec_profile['avg_target_prefill_s']:.6f}")
+            print(f"Speculative profile avg_target_decode_s: {spec_profile['avg_target_decode_s']:.6f}")
+            print(f"Speculative profile avg_draft_decode_s: {spec_profile['avg_draft_decode_s']:.6f}")
+            print(f"Speculative profile target_share_decode: {spec_profile['target_share_decode']:.4f}")
+            print(f"Speculative profile draft_share_decode: {spec_profile['draft_share_decode']:.4f}")
+            print(f"Speculative profile total_profiled_cycles: {int(spec_profile['total_profiled_cycles'])}")
+        if baseline_enabled:
+            baseline_profile = summarize_profile(baseline_samples)
+            if baseline_profile is not None:
+                print(f"Baseline profile avg_target_prefill_s: {baseline_profile['avg_target_prefill_s']:.6f}")
+                print(f"Baseline profile avg_target_decode_s: {baseline_profile['avg_target_decode_s']:.6f}")
+                print(f"Baseline profile avg_draft_decode_s: {baseline_profile['avg_draft_decode_s']:.6f}")
+                print(f"Baseline profile target_share_decode: {baseline_profile['target_share_decode']:.4f}")
+                print(f"Baseline profile draft_share_decode: {baseline_profile['draft_share_decode']:.4f}")
+                print(f"Baseline profile total_profiled_cycles: {int(baseline_profile['total_profiled_cycles'])}")
+
     tau = np.mean([np.mean(r[block_size].acceptance_lengths) for r in responses])
     print(f"Average Acceptance length: {tau:.2f}")
     acceptance_lengths = list(chain(*[r[block_size].acceptance_lengths for r in responses]))
@@ -641,6 +902,8 @@ def main() -> None:
     avg_verify_calls = float(np.mean([r[block_size].candidate_summary["candidate_verify_calls"] for r in responses]))
     print(f"Candidate avg_candidates_per_cycle: {avg_candidates_per_cycle:.3f}")
     print(f"Candidate avg_verify_calls_per_sample: {avg_verify_calls:.1f}")
+    print(f"Candidate mode: {args.candidate_mode}")
+    print(f"Candidate fixed_prefix_len: {args.fixed_prefix_len}")
     print(f"Candidate branch_depth: {args.branch_depth}")
     print(f"Candidate branch_top_k: {args.branch_top_k}")
     print(f"Candidate max_candidates: {args.max_candidates}")

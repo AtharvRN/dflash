@@ -15,8 +15,12 @@ Status legend:
   - `seed_mode=dense` (`seed_max_tokens=-1`): TPOT `0.019733`, tau `2.52`, derived speedup `2.04x`
 - Multi-step draft refinement (`--draft-steps=2`) in `benchmark.py`:
   - TPOT `0.044606`, tau `1.20`, tokens/s `22.38` (near-baseline behavior; severe acceptance collapse)
+- Candidate benchmark (`aa10_*`, AIME25, `max_samples=10`, `max_new_tokens=512`, `bs=16`):
+  - Candidate-On vs Vanilla: mean tau `7.121` vs `7.082` (`+0.039`)
+  - but draft decode cost rose (`1.3445s` vs `0.8699s` per sample), and steady-state decode throughput remained below vanilla.
 - Interpretation:
   - naive suffix reuse and naive multi-step draft refinement both hurt acceptance and throughput on current setup.
+  - current candidate branching improves tau slightly but does not yet improve steady-state throughput.
 
 ## 1) EWMA Throughput Scheduler
 - Status: `implemented`
@@ -166,3 +170,71 @@ Status legend:
   - verify each candidate with target, choose best by `tau` (tie-break by draft score), then commit.
 - Important caveat:
   - this is a research testbed and adds extra target verifications per cycle; it is not expected to be throughput-optimal yet.
+
+## 11) Literature-Grounded Candidate Generation (Single-Step DFlash Constraint)
+- Status: `proposed`
+- Constraint:
+  - only pursue methods explicitly backed by published literature; avoid ad-hoc heuristics without citation.
+- Most relevant papers in this repo:
+  - `docs/2510.04147v1.pdf` (SSD: Self Speculative Decoding for DLMs)
+  - `docs/2406.16858v2.pdf` (EAGLE-2)
+  - `docs/2602.10953v1.pdf` (SOAR)
+- SSD-backed principles to transfer:
+  - confidence-ranked position selection under block-order constraints,
+  - greedy top-1 default for tractable verify tree size,
+  - explicit warning that full `k`-ary expansion is `Theta(k^N)` and quickly impractical.
+- EAGLE-2-backed principle to transfer:
+  - use draft confidence as acceptance proxy, and prioritize branches by estimated global acceptability.
+- SOAR-backed principle to transfer:
+  - confidence-conditioned widening/narrowing of search (adapted to one-step candidate budgeting).
+- Immediate plan (paper-grounded only):
+  - implement SSD-style confidence/block-order candidate selection as baseline branch policy,
+  - add EAGLE-2-style confidence gating for when to branch,
+  - evaluate against fixed `bs=16` with strict steady-state apples-to-apples metrics.
+
+## 12) What Actually Moves Speed (from `bs=12..19` profiled sweep)
+- Status: `confirmed by measurements`
+- Core finding:
+  - per-cycle decode cost is nearly flat across block sizes in this range.
+  - verify: ~`0.043` to `0.045 s/cycle`
+  - draft: ~`0.0072` to `0.0080 s/cycle`
+  - verify remains dominant (`~5.5x` to `~6.0x` draft).
+- Implication:
+  - adaptive block sizing in this range does not buy much by reducing cycle-time directly.
+  - primary speed lever is improving accepted tokens per cycle (`tau`) at similar cycle cost.
+- Useful equation:
+  - `TPOT ≈ (verify_s_per_cycle + draft_s_per_cycle) / tau`
+  - so speedup improves mainly via higher `tau` (or true kernel/system cycle-time reductions).
+
+## 13) Practical Adaptive Levers (Inference-Only, No Training)
+- Status: `proposed next experiments`
+- Priority levers (ranked):
+  - adaptive draft refinement steps:
+    - default `draft_steps=1`; use `2` only on low-confidence cycles.
+  - selective position refinement:
+    - refine only low-confidence positions, not full block.
+  - adaptive branching budget:
+    - branch only when uncertainty is high; dynamically choose candidates per cycle.
+  - position-aware policy:
+    - greedy early prefix, branch/refine later uncertain positions.
+  - EOS-aware truncation:
+    - shorten effective drafted suffix on low-confidence EOS-tail cycles.
+- Implementation requirement:
+  - avoid Python-heavy per-cycle control paths; keep candidate/branch logic tensorized to prevent overhead from erasing `tau` gains.
+
+## 14) Fixed-Prefix Rank-Suffix Candidates (Theoretical Stress Test)
+- Status: `implemented`
+- Script support:
+  - `benchmark_candidate_solutions.py --candidate-mode fixed_prefix_rank`
+- Construction:
+  - keep first `N` block positions fixed (default `N=5`),
+  - build global suffix rank variants:
+    - candidate 1: greedy base
+    - candidate 2: suffix uses rank-2 token at each suffix position
+    - candidate 3: suffix uses rank-3 tokens
+    - candidate 4: suffix uses rank-4 tokens
+- For `bs=16`, `N=5`, `max_candidates=4`:
+  - shared-prefix tree size target is `5 + 4 * 11 = 49` nodes (theoretical packing budget).
+- Notes:
+  - this is intentionally a strong stress-test construction, not a probability-optimal search policy.
+  - useful to measure whether larger candidate diversity can raise realized acceptance despite coarse suffix variants.
