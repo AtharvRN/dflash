@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 import shlex
 import time
 import statistics
@@ -99,10 +100,55 @@ def _send_generate_batch(
 @dataclass(frozen=True)
 class BenchMetrics:
     latency_s: float
+    request_count: int
     output_tokens: int
     output_toks_per_s: float
     spec_accept_length: Optional[float]
     spec_verify_ct_sum: int
+    spec_accept_rate: Optional[float]
+    spec_accept_token_sum: int
+    spec_draft_token_sum: int
+    e2e_latency_avg_s: Optional[float]
+    e2e_latency_p50_s: Optional[float]
+    e2e_latency_p95_s: Optional[float]
+    inference_time_avg_s: Optional[float]
+    decode_throughput_avg_tok_s: Optional[float]
+    extra_timing_avgs_s: dict[str, Optional[float]]
+
+
+def _mean_or_none(values: list[float]) -> Optional[float]:
+    if not values:
+        return None
+    return float(statistics.mean(values))
+
+
+def _percentile_or_none(values: list[float], pct: float) -> Optional[float]:
+    if not values:
+        return None
+    if len(values) == 1:
+        return float(values[0])
+    p = min(max(float(pct), 0.0), 1.0)
+    xs = sorted(float(x) for x in values)
+    pos = p * (len(xs) - 1)
+    lo = int(pos)
+    hi = min(lo + 1, len(xs) - 1)
+    frac = pos - lo
+    return float(xs[lo] * (1.0 - frac) + xs[hi] * frac)
+
+
+def _extract_float(meta: dict, keys: list[str]) -> Optional[float]:
+    for key in keys:
+        if key not in meta:
+            continue
+        try:
+            return float(meta[key])
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _fmt_opt(v: Optional[float], fmt: str) -> str:
+    return "N/A" if v is None else format(v, fmt)
 
 
 def _run_bench_requests(
@@ -147,9 +193,71 @@ def _run_bench_requests(
         prompts = prompts[bs:]
 
     start = time.perf_counter()
+    request_count = 0
     total_tokens = 0
     spec_verify_ct_sum = 0
+    spec_accept_token_sum = 0
+    spec_draft_token_sum = 0
     spec_accept_lengths: list[float] = []
+    spec_accept_rates: list[float] = []
+    e2e_latencies: list[float] = []
+    inference_times: list[float] = []
+    decode_throughputs: list[float] = []
+    # Capture optional fields if server starts exposing them in meta_info.
+    extra_timing_fields = {
+        "draft_time_s": [
+            "spec_draft_time_s",
+            "spec_draft_time",
+            "draft_time_s",
+            "draft_time",
+        ],
+        "verify_time_s": [
+            "spec_verify_time_s",
+            "spec_verify_time",
+            "verify_time_s",
+            "verify_time",
+            "target_verify_time_s",
+            "target_verify_time",
+        ],
+    }
+    extra_timing_samples: dict[str, list[float]] = defaultdict(list)
+
+    def _consume_meta(meta: dict) -> None:
+        nonlocal request_count
+        nonlocal total_tokens
+        nonlocal spec_verify_ct_sum
+        nonlocal spec_accept_token_sum
+        nonlocal spec_draft_token_sum
+        request_count += 1
+        total_tokens += int(meta.get("completion_tokens", 0))
+        spec_verify_ct_sum += int(meta.get("spec_verify_ct", 0))
+        spec_accept_token_sum += int(meta.get("spec_accept_token_num", 0))
+        spec_draft_token_sum += int(meta.get("spec_draft_token_num", 0))
+
+        spec_accept_length = _extract_float(meta, ["spec_accept_length"])
+        if spec_accept_length is not None:
+            spec_accept_lengths.append(spec_accept_length)
+
+        spec_accept_rate = _extract_float(meta, ["spec_accept_rate"])
+        if spec_accept_rate is not None:
+            spec_accept_rates.append(spec_accept_rate)
+
+        e2e_latency = _extract_float(meta, ["e2e_latency"])
+        if e2e_latency is not None:
+            e2e_latencies.append(e2e_latency)
+
+        inference_time = _extract_float(meta, ["inference_time"])
+        if inference_time is not None:
+            inference_times.append(inference_time)
+
+        decode_throughput = _extract_float(meta, ["decode_throughput"])
+        if decode_throughput is not None:
+            decode_throughputs.append(decode_throughput)
+
+        for field_name, keys in extra_timing_fields.items():
+            v = _extract_float(meta, keys)
+            if v is not None:
+                extra_timing_samples[field_name].append(v)
 
     if batch_requests:
         bs = max(int(concurrency), 1)
@@ -168,15 +276,9 @@ def _run_bench_requests(
                     f"got {len(outs)} outputs for {len(chunk_prompts)} prompts."
                 )
 
-            for j, out in enumerate(outs):
+            for out in outs:
                 meta = out.get("meta_info", {}) or {}
-                total_tokens += int(meta.get("completion_tokens", 0))
-                spec_verify_ct_sum += int(meta.get("spec_verify_ct", 0))
-                if "spec_accept_length" in meta:
-                    try:
-                        spec_accept_lengths.append(float(meta["spec_accept_length"]))
-                    except (TypeError, ValueError):
-                        pass
+                _consume_meta(meta)
     else:
         with ThreadPoolExecutor(max_workers=int(concurrency)) as pool:
             futures = {
@@ -193,13 +295,7 @@ def _run_bench_requests(
             for fut in as_completed(futures):
                 out = fut.result()
                 meta = out.get("meta_info", {}) or {}
-                total_tokens += int(meta.get("completion_tokens", 0))
-                spec_verify_ct_sum += int(meta.get("spec_verify_ct", 0))
-                if "spec_accept_length" in meta:
-                    try:
-                        spec_accept_lengths.append(float(meta["spec_accept_length"]))
-                    except (TypeError, ValueError):
-                        pass
+                _consume_meta(meta)
 
     latency = time.perf_counter() - start
     toks_per_s = total_tokens / max(latency, 1e-6)
@@ -210,16 +306,33 @@ def _run_bench_requests(
             "(DFLASH may not have been enabled)."
         )
 
-    spec_accept_length = (
-        float(statistics.mean(spec_accept_lengths)) if spec_accept_lengths else None
-    )
+    spec_accept_length = _mean_or_none(spec_accept_lengths)
+    spec_accept_rate = _mean_or_none(spec_accept_rates)
+    e2e_latency_avg_s = _mean_or_none(e2e_latencies)
+    e2e_latency_p50_s = _percentile_or_none(e2e_latencies, 0.50)
+    e2e_latency_p95_s = _percentile_or_none(e2e_latencies, 0.95)
+    inference_time_avg_s = _mean_or_none(inference_times)
+    decode_throughput_avg_tok_s = _mean_or_none(decode_throughputs)
+    extra_timing_avgs_s = {
+        k: _mean_or_none(vs) for k, vs in extra_timing_samples.items()
+    }
 
     return BenchMetrics(
         latency_s=float(latency),
+        request_count=int(request_count),
         output_tokens=int(total_tokens),
         output_toks_per_s=float(toks_per_s),
         spec_accept_length=spec_accept_length,
         spec_verify_ct_sum=int(spec_verify_ct_sum),
+        spec_accept_rate=spec_accept_rate,
+        spec_accept_token_sum=int(spec_accept_token_sum),
+        spec_draft_token_sum=int(spec_draft_token_sum),
+        e2e_latency_avg_s=e2e_latency_avg_s,
+        e2e_latency_p50_s=e2e_latency_p50_s,
+        e2e_latency_p95_s=e2e_latency_p95_s,
+        inference_time_avg_s=inference_time_avg_s,
+        decode_throughput_avg_tok_s=decode_throughput_avg_tok_s,
+        extra_timing_avgs_s=extra_timing_avgs_s,
     )
 
 
@@ -303,6 +416,11 @@ def main() -> None:
         type=str,
         default="",
         help="Raw extra args appended to launch_server (parsed with shlex.split).",
+    )
+    parser.add_argument(
+        "--enable-server-metrics",
+        action="store_true",
+        help="Pass --enable-metrics to SGLang server so response meta_info includes extra timing fields like inference_time/decode_throughput.",
     )
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--timeout-s", type=int, default=3600)
@@ -398,6 +516,8 @@ def main() -> None:
     baseline_toks: dict[tuple[str, int], Optional[float]] = {}
     dflash_toks: dict[tuple[str, int], Optional[float]] = {}
     dflash_accept_len: dict[tuple[str, int], Optional[float]] = {}
+    baseline_metrics: dict[tuple[str, int], BenchMetrics] = {}
+    dflash_metrics: dict[tuple[str, int], BenchMetrics] = {}
     
     tp = args.tp_size  # Fixed TP size
 
@@ -422,6 +542,8 @@ def main() -> None:
         )
         if args.disable_radix_cache:
             common_server_args.append("--disable-radix-cache")
+        if args.enable_server_metrics:
+            common_server_args.append("--enable-metrics")
         if args.disable_overlap_schedule:
             common_server_args.append("--disable-overlap-schedule")
         if args.server_extra_args.strip():
@@ -464,10 +586,12 @@ def main() -> None:
                         expect_dflash=False,
                     )
                     baseline_toks[(backend, conc)] = metrics.output_toks_per_s
+                    baseline_metrics[(backend, conc)] = metrics
                     print(
                         f"[baseline] conc={conc:>2} n={n:<4} "
                         f"toks/s={metrics.output_toks_per_s:,.2f} "
                         f"latency={metrics.latency_s:.1f}s "
+                        f"e2e_avg={_fmt_opt(metrics.e2e_latency_avg_s, '.3f')}s "
                     )
             finally:
                 kill_process_tree(baseline_proc.pid)
@@ -543,11 +667,25 @@ def main() -> None:
                 )
                 dflash_toks[(backend, conc)] = metrics.output_toks_per_s
                 dflash_accept_len[(backend, conc)] = metrics.spec_accept_length
+                dflash_metrics[(backend, conc)] = metrics
+                verify_calls_per_s = (
+                    metrics.spec_verify_ct_sum / max(metrics.latency_s, 1e-6)
+                    if metrics.spec_verify_ct_sum > 0
+                    else None
+                )
+                draft_tokens_per_s = (
+                    metrics.spec_draft_token_sum / max(metrics.latency_s, 1e-6)
+                    if metrics.spec_draft_token_sum > 0
+                    else None
+                )
                 print(
                     f"[{spec_algo}]   conc={conc:>2} n={n:<4} "
                     f"toks/s={metrics.output_toks_per_s:,.2f} "
                     f"latency={metrics.latency_s:.1f}s "
-                    f"accept_len={metrics.spec_accept_length:.3f} "
+                    f"tau={_fmt_opt(metrics.spec_accept_length, '.3f')} "
+                    f"accept_rate={_fmt_opt(metrics.spec_accept_rate, '.3f')} "
+                    f"verify/s={_fmt_opt(verify_calls_per_s, ',.2f')} "
+                    f"draft_tok/s={_fmt_opt(draft_tokens_per_s, ',.2f')} "
                     f"spec_verify_ct_sum={metrics.spec_verify_ct_sum}"
                 )
         finally:
@@ -575,6 +713,7 @@ def main() -> None:
     md_lines.append(f"- speculative_num_steps: `{args.speculative_num_steps}`")
     md_lines.append(f"- speculative_eagle_topk: `{args.speculative_eagle_topk}`")
     md_lines.append(f"- disable_overlap_schedule: `{bool(args.disable_overlap_schedule)}`")
+    md_lines.append(f"- enable_server_metrics: `{bool(args.enable_server_metrics)}`")
     md_lines.append(f"- server_extra_args: `{args.server_extra_args}`")
     md_lines.append(f"- max_new_tokens: `{args.max_new_tokens}`")
     md_lines.append(f"- attention_backends: `{', '.join(attention_backends)}`")
@@ -633,7 +772,7 @@ def main() -> None:
         )
         md_lines.append("")
 
-        md_lines.append("### DFLASH acceptance length")
+        md_lines.append("### DFLASH tau (accept length)")
         md_lines.append(
             _format_table(
                 concurrencies=concurrencies,
@@ -642,6 +781,235 @@ def main() -> None:
                     for c in concurrencies
                 },
                 float_fmt=".3f",
+            )
+        )
+        md_lines.append("")
+
+        md_lines.append("### DFLASH acceptance rate")
+        md_lines.append(
+            _format_table(
+                concurrencies=concurrencies,
+                values={
+                    c: (
+                        dflash_metrics[(backend, c)].spec_accept_rate
+                        if (backend, c) in dflash_metrics
+                        else None
+                    )
+                    for c in concurrencies
+                },
+                float_fmt=".3f",
+            )
+        )
+        md_lines.append("")
+
+        md_lines.append("### DFLASH verify calls total")
+        md_lines.append(
+            _format_table(
+                concurrencies=concurrencies,
+                values={
+                    c: (
+                        float(dflash_metrics[(backend, c)].spec_verify_ct_sum)
+                        if (backend, c) in dflash_metrics
+                        else None
+                    )
+                    for c in concurrencies
+                },
+                float_fmt=",.0f",
+            )
+        )
+        md_lines.append("")
+
+        md_lines.append("### DFLASH verify calls per second")
+        md_lines.append(
+            _format_table(
+                concurrencies=concurrencies,
+                values={
+                    c: (
+                        dflash_metrics[(backend, c)].spec_verify_ct_sum
+                        / max(dflash_metrics[(backend, c)].latency_s, 1e-6)
+                        if (backend, c) in dflash_metrics
+                        and dflash_metrics[(backend, c)].spec_verify_ct_sum > 0
+                        else None
+                    )
+                    for c in concurrencies
+                },
+                float_fmt=",.2f",
+            )
+        )
+        md_lines.append("")
+
+        md_lines.append("### DFLASH drafted tokens per second")
+        md_lines.append(
+            _format_table(
+                concurrencies=concurrencies,
+                values={
+                    c: (
+                        dflash_metrics[(backend, c)].spec_draft_token_sum
+                        / max(dflash_metrics[(backend, c)].latency_s, 1e-6)
+                        if (backend, c) in dflash_metrics
+                        and dflash_metrics[(backend, c)].spec_draft_token_sum > 0
+                        else None
+                    )
+                    for c in concurrencies
+                },
+                float_fmt=",.2f",
+            )
+        )
+        md_lines.append("")
+
+        md_lines.append("### DFLASH accepted draft tokens per second")
+        md_lines.append(
+            _format_table(
+                concurrencies=concurrencies,
+                values={
+                    c: (
+                        dflash_metrics[(backend, c)].spec_accept_token_sum
+                        / max(dflash_metrics[(backend, c)].latency_s, 1e-6)
+                        if (backend, c) in dflash_metrics
+                        and dflash_metrics[(backend, c)].spec_accept_token_sum > 0
+                        else None
+                    )
+                    for c in concurrencies
+                },
+                float_fmt=",.2f",
+            )
+        )
+        md_lines.append("")
+
+        md_lines.append("### DFLASH wall time per verify call (s)")
+        md_lines.append(
+            _format_table(
+                concurrencies=concurrencies,
+                values={
+                    c: (
+                        dflash_metrics[(backend, c)].latency_s
+                        / max(float(dflash_metrics[(backend, c)].spec_verify_ct_sum), 1.0)
+                        if (backend, c) in dflash_metrics
+                        and dflash_metrics[(backend, c)].spec_verify_ct_sum > 0
+                        else None
+                    )
+                    for c in concurrencies
+                },
+                float_fmt=".6f",
+            )
+        )
+        md_lines.append("")
+
+        md_lines.append("### Request E2E latency avg (s)")
+        md_lines.append(
+            _format_table(
+                concurrencies=concurrencies,
+                values={
+                    c: (
+                        dflash_metrics[(backend, c)].e2e_latency_avg_s
+                        if (backend, c) in dflash_metrics
+                        else None
+                    )
+                    for c in concurrencies
+                },
+                float_fmt=".3f",
+            )
+        )
+        md_lines.append("")
+
+        md_lines.append("### Request E2E latency p95 (s)")
+        md_lines.append(
+            _format_table(
+                concurrencies=concurrencies,
+                values={
+                    c: (
+                        dflash_metrics[(backend, c)].e2e_latency_p95_s
+                        if (backend, c) in dflash_metrics
+                        else None
+                    )
+                    for c in concurrencies
+                },
+                float_fmt=".3f",
+            )
+        )
+        md_lines.append("")
+
+        md_lines.append("### Baseline request E2E latency avg (s)")
+        md_lines.append(
+            _format_table(
+                concurrencies=concurrencies,
+                values={
+                    c: (
+                        baseline_metrics[(backend, c)].e2e_latency_avg_s
+                        if (backend, c) in baseline_metrics
+                        else None
+                    )
+                    for c in concurrencies
+                },
+                float_fmt=".3f",
+            )
+        )
+        md_lines.append("")
+
+        md_lines.append("### DFLASH inference_time avg (s, if server metrics enabled)")
+        md_lines.append(
+            _format_table(
+                concurrencies=concurrencies,
+                values={
+                    c: (
+                        dflash_metrics[(backend, c)].inference_time_avg_s
+                        if (backend, c) in dflash_metrics
+                        else None
+                    )
+                    for c in concurrencies
+                },
+                float_fmt=".3f",
+            )
+        )
+        md_lines.append("")
+
+        md_lines.append("### DFLASH decode_throughput avg (tok/s, if server metrics enabled)")
+        md_lines.append(
+            _format_table(
+                concurrencies=concurrencies,
+                values={
+                    c: (
+                        dflash_metrics[(backend, c)].decode_throughput_avg_tok_s
+                        if (backend, c) in dflash_metrics
+                        else None
+                    )
+                    for c in concurrencies
+                },
+                float_fmt=",.2f",
+            )
+        )
+        md_lines.append("")
+
+        md_lines.append("### DFLASH reported draft time avg (s, if exposed by server)")
+        md_lines.append(
+            _format_table(
+                concurrencies=concurrencies,
+                values={
+                    c: (
+                        dflash_metrics[(backend, c)].extra_timing_avgs_s.get("draft_time_s")
+                        if (backend, c) in dflash_metrics
+                        else None
+                    )
+                    for c in concurrencies
+                },
+                float_fmt=".6f",
+            )
+        )
+        md_lines.append("")
+
+        md_lines.append("### DFLASH reported verify time avg (s, if exposed by server)")
+        md_lines.append(
+            _format_table(
+                concurrencies=concurrencies,
+                values={
+                    c: (
+                        dflash_metrics[(backend, c)].extra_timing_avgs_s.get("verify_time_s")
+                        if (backend, c) in dflash_metrics
+                        else None
+                    )
+                    for c in concurrencies
+                },
+                float_fmt=".6f",
             )
         )
         md_lines.append("")
