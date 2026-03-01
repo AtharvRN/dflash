@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+import json
 import shlex
 import time
 import statistics
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, TextIO
 
 import requests
 import torch
@@ -161,6 +162,10 @@ def _run_bench_requests(
     stop: list[str],
     timeout_s: int,
     expect_dflash: bool,
+    trace_fp: Optional[TextIO] = None,
+    trace_common: Optional[dict] = None,
+    trace_include_prompt: bool = False,
+    trace_include_raw_meta: bool = False,
 ) -> BenchMetrics:
     # Drop the first batch from metrics to exclude one-time JIT/cuda-graph overhead
     bs = max(int(concurrency), 1)
@@ -222,12 +227,20 @@ def _run_bench_requests(
     }
     extra_timing_samples: dict[str, list[float]] = defaultdict(list)
 
-    def _consume_meta(meta: dict) -> None:
+    def _consume_meta(
+        meta: dict,
+        *,
+        prompt_text: Optional[str] = None,
+        client_request_wall_s: Optional[float] = None,
+        client_batch_wall_s: Optional[float] = None,
+        client_batch_size: Optional[int] = None,
+    ) -> None:
         nonlocal request_count
         nonlocal total_tokens
         nonlocal spec_verify_ct_sum
         nonlocal spec_accept_token_sum
         nonlocal spec_draft_token_sum
+        request_local_idx = request_count
         request_count += 1
         total_tokens += int(meta.get("completion_tokens", 0))
         spec_verify_ct_sum += int(meta.get("spec_verify_ct", 0))
@@ -259,10 +272,42 @@ def _run_bench_requests(
             if v is not None:
                 extra_timing_samples[field_name].append(v)
 
+        if trace_fp is not None:
+            draft_time_s = _extract_float(meta, extra_timing_fields["draft_time_s"])
+            verify_time_s = _extract_float(meta, extra_timing_fields["verify_time_s"])
+            row = dict(trace_common or {})
+            row.update(
+                {
+                    "request_local_idx": int(request_local_idx),
+                    "timestamp_unix_s": float(time.time()),
+                    "completion_tokens": int(meta.get("completion_tokens", 0)),
+                    "e2e_latency_s": _extract_float(meta, ["e2e_latency"]),
+                    "spec_accept_length": spec_accept_length,
+                    "spec_accept_rate": spec_accept_rate,
+                    "spec_verify_ct": int(meta.get("spec_verify_ct", 0)),
+                    "spec_accept_token_num": int(meta.get("spec_accept_token_num", 0)),
+                    "spec_draft_token_num": int(meta.get("spec_draft_token_num", 0)),
+                    "inference_time_s": _extract_float(meta, ["inference_time"]),
+                    "decode_throughput_tok_s": _extract_float(meta, ["decode_throughput"]),
+                    "draft_time_s": draft_time_s,
+                    "verify_time_s": verify_time_s,
+                    "client_request_wall_s": client_request_wall_s,
+                    "client_batch_wall_s": client_batch_wall_s,
+                    "client_batch_size": client_batch_size,
+                }
+            )
+            if trace_include_prompt:
+                row["prompt"] = prompt_text
+            if trace_include_raw_meta:
+                row["meta_info_raw"] = meta
+            trace_fp.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+            trace_fp.flush()
+
     if batch_requests:
         bs = max(int(concurrency), 1)
         for start_idx in range(0, len(prompts), bs):
             chunk_prompts = prompts[start_idx : start_idx + bs]
+            batch_t0 = time.perf_counter()
             outs = _send_generate_batch(
                 base_url,
                 chunk_prompts,
@@ -270,32 +315,47 @@ def _run_bench_requests(
                 stop=stop,
                 timeout_s=timeout_s,
             )
+            batch_wall_s = time.perf_counter() - batch_t0
             if len(outs) != len(chunk_prompts):
                 raise RuntimeError(
                     "Batched /generate output length mismatch: "
                     f"got {len(outs)} outputs for {len(chunk_prompts)} prompts."
                 )
 
-            for out in outs:
+            for idx, out in enumerate(outs):
                 meta = out.get("meta_info", {}) or {}
-                _consume_meta(meta)
+                _consume_meta(
+                    meta,
+                    prompt_text=chunk_prompts[idx],
+                    client_batch_wall_s=float(batch_wall_s),
+                    client_batch_size=int(len(chunk_prompts)),
+                )
     else:
+        def _timed_send(prompt_idx: int, prompt: str):
+            t0 = time.perf_counter()
+            out = _send_generate(
+                base_url,
+                prompt,
+                max_new_tokens=max_new_tokens,
+                stop=stop,
+                timeout_s=timeout_s,
+            )
+            wall_s = time.perf_counter() - t0
+            return prompt_idx, prompt, out, wall_s
+
         with ThreadPoolExecutor(max_workers=int(concurrency)) as pool:
             futures = {
-                pool.submit(
-                    _send_generate,
-                    base_url,
-                    prompt,
-                    max_new_tokens=max_new_tokens,
-                    stop=stop,
-                    timeout_s=timeout_s,
-                ): i
+                pool.submit(_timed_send, i, prompt): i
                 for i, prompt in enumerate(prompts)
             }
             for fut in as_completed(futures):
-                out = fut.result()
+                _prompt_idx, prompt_text, out, req_wall_s = fut.result()
                 meta = out.get("meta_info", {}) or {}
-                _consume_meta(meta)
+                _consume_meta(
+                    meta,
+                    prompt_text=prompt_text,
+                    client_request_wall_s=float(req_wall_s),
+                )
 
     latency = time.perf_counter() - start
     toks_per_s = total_tokens / max(latency, 1e-6)
@@ -362,6 +422,22 @@ def main() -> None:
         type=str,
         default=None,
         help="Write a markdown report to this file (disabled by default).",
+    )
+    parser.add_argument(
+        "--save-call-trace-path",
+        type=str,
+        default=None,
+        help="Optional JSONL path. Writes one row per request response with per-call meta (tau/verify/draft timings when available).",
+    )
+    parser.add_argument(
+        "--save-call-trace-prompt",
+        action="store_true",
+        help="Include full prompt text in each call-trace row.",
+    )
+    parser.add_argument(
+        "--save-call-trace-raw-meta",
+        action="store_true",
+        help="Include raw response meta_info dict in each call-trace row.",
     )
     parser.add_argument("--dataset-name", type=str, default="gsm8k")
     parser.add_argument("--target-model", type=str, default="Qwen/Qwen3-8B")
@@ -521,48 +597,146 @@ def main() -> None:
     
     tp = args.tp_size  # Fixed TP size
 
-    for backend in attention_backends:
-        port_base = find_available_port(20000)
+    call_trace_fp: Optional[TextIO] = None
+    if args.save_call_trace_path:
+        call_trace_fp = open(args.save_call_trace_path, "w", encoding="utf-8")
 
-        common_server_args: list[str] = [
-            "--trust-remote-code",
-            "--attention-backend",
-            backend,
-            "--tp-size",
-            str(tp),
-            "--dtype",
-            str(args.dtype),
-            "--mem-fraction-static",
-            str(args.mem_fraction_static),
-            "--max-running-requests",
-            str(args.max_running_requests),
-        ]
-        common_server_args.extend(
-            ["--cuda-graph-bs", *[str(i) for i in range(1, 33)], "--cuda-graph-max-bs", "32"]
-        )
-        if args.disable_radix_cache:
-            common_server_args.append("--disable-radix-cache")
-        if args.enable_server_metrics:
-            common_server_args.append("--enable-metrics")
-        if args.disable_overlap_schedule:
-            common_server_args.append("--disable-overlap-schedule")
-        if args.server_extra_args.strip():
-            common_server_args.extend(shlex.split(args.server_extra_args))
+    try:
+        for backend in attention_backends:
+            port_base = find_available_port(20000)
 
-        if not args.skip_baseline:
-            print(f"\n=== backend={backend} tp={tp} (baseline) ===")
-            baseline_port = port_base
-            baseline_url = f"http://127.0.0.1:{baseline_port}"
-            baseline_proc = popen_launch_server(
+            common_server_args: list[str] = [
+                "--trust-remote-code",
+                "--attention-backend",
+                backend,
+                "--tp-size",
+                str(tp),
+                "--dtype",
+                str(args.dtype),
+                "--mem-fraction-static",
+                str(args.mem_fraction_static),
+                "--max-running-requests",
+                str(args.max_running_requests),
+            ]
+            common_server_args.extend(
+                ["--cuda-graph-bs", *[str(i) for i in range(1, 33)], "--cuda-graph-max-bs", "32"]
+            )
+            if args.disable_radix_cache:
+                common_server_args.append("--disable-radix-cache")
+            if args.enable_server_metrics:
+                common_server_args.append("--enable-metrics")
+            if args.disable_overlap_schedule:
+                common_server_args.append("--disable-overlap-schedule")
+            if args.server_extra_args.strip():
+                common_server_args.extend(shlex.split(args.server_extra_args))
+
+            if not args.skip_baseline:
+                print(f"\n=== backend={backend} tp={tp} (baseline) ===")
+                baseline_port = port_base
+                baseline_url = f"http://127.0.0.1:{baseline_port}"
+                baseline_proc = popen_launch_server(
+                    args.target_model,
+                    baseline_url,
+                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                    other_args=common_server_args,
+                )
+                try:
+                    # Warm up.
+                    _send_generate(
+                        baseline_url,
+                        "Hello",
+                        max_new_tokens=8,
+                        stop=[],
+                        timeout_s=min(int(args.timeout_s), 300),
+                    )
+
+                    for conc in concurrencies:
+                        n = num_questions_by_conc[conc]
+                        _flush_cache(baseline_url)
+                        print(
+                            f"[warmup] run 1 warmup batch (size={conc}) after /flush_cache; excluded from metrics."
+                        )
+                        metrics = _run_bench_requests(
+                            baseline_url,
+                            prompts=prompts[: n + conc],
+                            max_new_tokens=int(args.max_new_tokens),
+                            concurrency=int(conc),
+                            batch_requests=bool(args.batch_requests),
+                            stop=[],
+                            timeout_s=int(args.timeout_s),
+                            expect_dflash=False,
+                            trace_fp=call_trace_fp,
+                            trace_common={
+                                "mode": "baseline",
+                                "speculative_algorithm": "NONE",
+                                "backend": backend,
+                                "tp_size": int(tp),
+                                "concurrency": int(conc),
+                                "question_count": int(n),
+                                "batch_requests": bool(args.batch_requests),
+                            },
+                            trace_include_prompt=bool(args.save_call_trace_prompt),
+                            trace_include_raw_meta=bool(args.save_call_trace_raw_meta),
+                        )
+                        baseline_toks[(backend, conc)] = metrics.output_toks_per_s
+                        baseline_metrics[(backend, conc)] = metrics
+                        print(
+                            f"[baseline] conc={conc:>2} n={n:<4} "
+                            f"toks/s={metrics.output_toks_per_s:,.2f} "
+                            f"latency={metrics.latency_s:.1f}s "
+                            f"e2e_avg={_fmt_opt(metrics.e2e_latency_avg_s, '.3f')}s "
+                        )
+                finally:
+                    kill_process_tree(baseline_proc.pid)
+                    try:
+                        baseline_proc.wait(timeout=30)
+                    except Exception:
+                        pass
+
+            spec_algo = args.speculative_algorithm.upper()
+            print(f"\n=== backend={backend} tp={tp} ({spec_algo}) ===")
+            spec_server_args = [
+                *common_server_args,
+                "--speculative-algorithm",
+                spec_algo,
+            ]
+            if args.draft_model:
+                spec_server_args.extend(
+                    ["--speculative-draft-model-path", args.draft_model]
+                )
+            if args.speculative_dflash_block_size is not None:
+                spec_server_args.extend(
+                    [
+                        "--speculative-dflash-block-size",
+                        str(int(args.speculative_dflash_block_size)),
+                    ]
+                )
+            if args.speculative_num_draft_tokens is not None:
+                spec_server_args.extend(
+                    [
+                        "--speculative-num-draft-tokens",
+                        str(int(args.speculative_num_draft_tokens)),
+                    ]
+                )
+            if args.speculative_num_steps is not None:
+                spec_server_args.extend(
+                    ["--speculative-num-steps", str(int(args.speculative_num_steps))]
+                )
+            if args.speculative_eagle_topk is not None:
+                spec_server_args.extend(
+                    ["--speculative-eagle-topk", str(int(args.speculative_eagle_topk))]
+                )
+            dflash_port = find_available_port(port_base + 1)
+            dflash_url = f"http://127.0.0.1:{dflash_port}"
+            dflash_proc = popen_launch_server(
                 args.target_model,
-                baseline_url,
+                dflash_url,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=common_server_args,
+                other_args=spec_server_args,
             )
             try:
-                # Warm up.
                 _send_generate(
-                    baseline_url,
+                    dflash_url,
                     "Hello",
                     max_new_tokens=8,
                     stop=[],
@@ -571,129 +745,64 @@ def main() -> None:
 
                 for conc in concurrencies:
                     n = num_questions_by_conc[conc]
-                    _flush_cache(baseline_url)
+                    _flush_cache(dflash_url)
                     print(
                         f"[warmup] run 1 warmup batch (size={conc}) after /flush_cache; excluded from metrics."
                     )
                     metrics = _run_bench_requests(
-                        baseline_url,
+                        dflash_url,
                         prompts=prompts[: n + conc],
                         max_new_tokens=int(args.max_new_tokens),
                         concurrency=int(conc),
                         batch_requests=bool(args.batch_requests),
                         stop=[],
                         timeout_s=int(args.timeout_s),
-                        expect_dflash=False,
+                        expect_dflash=True,
+                        trace_fp=call_trace_fp,
+                        trace_common={
+                            "mode": "speculative",
+                            "speculative_algorithm": spec_algo,
+                            "backend": backend,
+                            "tp_size": int(tp),
+                            "concurrency": int(conc),
+                            "question_count": int(n),
+                            "batch_requests": bool(args.batch_requests),
+                        },
+                        trace_include_prompt=bool(args.save_call_trace_prompt),
+                        trace_include_raw_meta=bool(args.save_call_trace_raw_meta),
                     )
-                    baseline_toks[(backend, conc)] = metrics.output_toks_per_s
-                    baseline_metrics[(backend, conc)] = metrics
+                    dflash_toks[(backend, conc)] = metrics.output_toks_per_s
+                    dflash_accept_len[(backend, conc)] = metrics.spec_accept_length
+                    dflash_metrics[(backend, conc)] = metrics
+                    verify_calls_per_s = (
+                        metrics.spec_verify_ct_sum / max(metrics.latency_s, 1e-6)
+                        if metrics.spec_verify_ct_sum > 0
+                        else None
+                    )
+                    draft_tokens_per_s = (
+                        metrics.spec_draft_token_sum / max(metrics.latency_s, 1e-6)
+                        if metrics.spec_draft_token_sum > 0
+                        else None
+                    )
                     print(
-                        f"[baseline] conc={conc:>2} n={n:<4} "
+                        f"[{spec_algo}]   conc={conc:>2} n={n:<4} "
                         f"toks/s={metrics.output_toks_per_s:,.2f} "
                         f"latency={metrics.latency_s:.1f}s "
-                        f"e2e_avg={_fmt_opt(metrics.e2e_latency_avg_s, '.3f')}s "
+                        f"tau={_fmt_opt(metrics.spec_accept_length, '.3f')} "
+                        f"accept_rate={_fmt_opt(metrics.spec_accept_rate, '.3f')} "
+                        f"verify/s={_fmt_opt(verify_calls_per_s, ',.2f')} "
+                        f"draft_tok/s={_fmt_opt(draft_tokens_per_s, ',.2f')} "
+                        f"spec_verify_ct_sum={metrics.spec_verify_ct_sum}"
                     )
             finally:
-                kill_process_tree(baseline_proc.pid)
+                kill_process_tree(dflash_proc.pid)
                 try:
-                    baseline_proc.wait(timeout=30)
+                    dflash_proc.wait(timeout=30)
                 except Exception:
                     pass
-
-        spec_algo = args.speculative_algorithm.upper()
-        print(f"\n=== backend={backend} tp={tp} ({spec_algo}) ===")
-        spec_server_args = [
-            *common_server_args,
-            "--speculative-algorithm",
-            spec_algo,
-        ]
-        if args.draft_model:
-            spec_server_args.extend(
-                ["--speculative-draft-model-path", args.draft_model]
-            )
-        if args.speculative_dflash_block_size is not None:
-            spec_server_args.extend(
-                [
-                    "--speculative-dflash-block-size",
-                    str(int(args.speculative_dflash_block_size)),
-                ]
-            )
-        if args.speculative_num_draft_tokens is not None:
-            spec_server_args.extend(
-                [
-                    "--speculative-num-draft-tokens",
-                    str(int(args.speculative_num_draft_tokens)),
-                ]
-            )
-        if args.speculative_num_steps is not None:
-            spec_server_args.extend(
-                ["--speculative-num-steps", str(int(args.speculative_num_steps))]
-            )
-        if args.speculative_eagle_topk is not None:
-            spec_server_args.extend(
-                ["--speculative-eagle-topk", str(int(args.speculative_eagle_topk))]
-            )
-        dflash_port = find_available_port(port_base + 1)
-        dflash_url = f"http://127.0.0.1:{dflash_port}"
-        dflash_proc = popen_launch_server(
-            args.target_model,
-            dflash_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=spec_server_args,
-        )
-        try:
-            _send_generate(
-                dflash_url,
-                "Hello",
-                max_new_tokens=8,
-                stop=[],
-                timeout_s=min(int(args.timeout_s), 300),
-            )
-            for conc in concurrencies:
-                n = num_questions_by_conc[conc]
-                _flush_cache(dflash_url)
-                print(
-                    f"[warmup] run 1 warmup batch (size={conc}) after /flush_cache; excluded from metrics."
-                )
-                metrics = _run_bench_requests(
-                    dflash_url,
-                    prompts=prompts[: n + conc],
-                    max_new_tokens=int(args.max_new_tokens),
-                    concurrency=int(conc),
-                    batch_requests=bool(args.batch_requests),
-                    stop=[],
-                    timeout_s=int(args.timeout_s),
-                    expect_dflash=True,
-                )
-                dflash_toks[(backend, conc)] = metrics.output_toks_per_s
-                dflash_accept_len[(backend, conc)] = metrics.spec_accept_length
-                dflash_metrics[(backend, conc)] = metrics
-                verify_calls_per_s = (
-                    metrics.spec_verify_ct_sum / max(metrics.latency_s, 1e-6)
-                    if metrics.spec_verify_ct_sum > 0
-                    else None
-                )
-                draft_tokens_per_s = (
-                    metrics.spec_draft_token_sum / max(metrics.latency_s, 1e-6)
-                    if metrics.spec_draft_token_sum > 0
-                    else None
-                )
-                print(
-                    f"[{spec_algo}]   conc={conc:>2} n={n:<4} "
-                    f"toks/s={metrics.output_toks_per_s:,.2f} "
-                    f"latency={metrics.latency_s:.1f}s "
-                    f"tau={_fmt_opt(metrics.spec_accept_length, '.3f')} "
-                    f"accept_rate={_fmt_opt(metrics.spec_accept_rate, '.3f')} "
-                    f"verify/s={_fmt_opt(verify_calls_per_s, ',.2f')} "
-                    f"draft_tok/s={_fmt_opt(draft_tokens_per_s, ',.2f')} "
-                    f"spec_verify_ct_sum={metrics.spec_verify_ct_sum}"
-                )
-        finally:
-            kill_process_tree(dflash_proc.pid)
-            try:
-                dflash_proc.wait(timeout=30)
-            except Exception:
-                pass
+    finally:
+        if call_trace_fp is not None:
+            call_trace_fp.close()
 
     # Render markdown.
     md_lines: list[str] = []
@@ -715,6 +824,9 @@ def main() -> None:
     md_lines.append(f"- disable_overlap_schedule: `{bool(args.disable_overlap_schedule)}`")
     md_lines.append(f"- enable_server_metrics: `{bool(args.enable_server_metrics)}`")
     md_lines.append(f"- server_extra_args: `{args.server_extra_args}`")
+    md_lines.append(f"- save_call_trace_path: `{args.save_call_trace_path}`")
+    md_lines.append(f"- save_call_trace_prompt: `{bool(args.save_call_trace_prompt)}`")
+    md_lines.append(f"- save_call_trace_raw_meta: `{bool(args.save_call_trace_raw_meta)}`")
     md_lines.append(f"- max_new_tokens: `{args.max_new_tokens}`")
     md_lines.append(f"- attention_backends: `{', '.join(attention_backends)}`")
     md_lines.append(f"- tp_size: `{tp}`")
@@ -1021,6 +1133,9 @@ def main() -> None:
         print(f"\nWrote markdown report to: {args.output_md}")
     else:
         print("\nMarkdown report disabled (pass --output-md to write one).")
+
+    if args.save_call_trace_path:
+        print(f"Wrote per-call JSONL trace to: {args.save_call_trace_path}")
 
 
 if __name__ == "__main__":
