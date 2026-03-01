@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import shlex
 import time
 import statistics
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -262,6 +263,47 @@ def main() -> None:
         action="store_true",
         help="Send prompts as server-side batched /generate requests (batch size = concurrency) instead of client-side concurrent requests.",
     )
+    parser.add_argument(
+        "--speculative-algorithm",
+        type=str,
+        default="DFLASH",
+        help="Speculative algorithm for the speculative run (e.g., DFLASH/EAGLE/EAGLE3/STANDALONE/NGRAM/NEXTN).",
+    )
+    parser.add_argument(
+        "--speculative-dflash-block-size",
+        type=int,
+        default=None,
+        help="DFLASH only. Sets --speculative-dflash-block-size on server.",
+    )
+    parser.add_argument(
+        "--speculative-num-draft-tokens",
+        type=int,
+        default=None,
+        help="Optional override for --speculative-num-draft-tokens on server.",
+    )
+    parser.add_argument(
+        "--speculative-num-steps",
+        type=int,
+        default=None,
+        help="Optional override for --speculative-num-steps on server.",
+    )
+    parser.add_argument(
+        "--speculative-eagle-topk",
+        type=int,
+        default=None,
+        help="Optional override for --speculative-eagle-topk on server.",
+    )
+    parser.add_argument(
+        "--disable-overlap-schedule",
+        action="store_true",
+        help="Force --disable-overlap-schedule on server.",
+    )
+    parser.add_argument(
+        "--server-extra-args",
+        type=str,
+        default="",
+        help="Raw extra args appended to launch_server (parsed with shlex.split).",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--timeout-s", type=int, default=3600)
     parser.add_argument("--mem-fraction-static", type=float, default=0.75)
@@ -380,6 +422,10 @@ def main() -> None:
         )
         if args.disable_radix_cache:
             common_server_args.append("--disable-radix-cache")
+        if args.disable_overlap_schedule:
+            common_server_args.append("--disable-overlap-schedule")
+        if args.server_extra_args.strip():
+            common_server_args.extend(shlex.split(args.server_extra_args))
 
         if not args.skip_baseline:
             print(f"\n=== backend={backend} tp={tp} (baseline) ===")
@@ -430,20 +476,46 @@ def main() -> None:
                 except Exception:
                     pass
 
-        print(f"\n=== backend={backend} tp={tp} (DFLASH) ===")
+        spec_algo = args.speculative_algorithm.upper()
+        print(f"\n=== backend={backend} tp={tp} ({spec_algo}) ===")
+        spec_server_args = [
+            *common_server_args,
+            "--speculative-algorithm",
+            spec_algo,
+        ]
+        if args.draft_model:
+            spec_server_args.extend(
+                ["--speculative-draft-model-path", args.draft_model]
+            )
+        if args.speculative_dflash_block_size is not None:
+            spec_server_args.extend(
+                [
+                    "--speculative-dflash-block-size",
+                    str(int(args.speculative_dflash_block_size)),
+                ]
+            )
+        if args.speculative_num_draft_tokens is not None:
+            spec_server_args.extend(
+                [
+                    "--speculative-num-draft-tokens",
+                    str(int(args.speculative_num_draft_tokens)),
+                ]
+            )
+        if args.speculative_num_steps is not None:
+            spec_server_args.extend(
+                ["--speculative-num-steps", str(int(args.speculative_num_steps))]
+            )
+        if args.speculative_eagle_topk is not None:
+            spec_server_args.extend(
+                ["--speculative-eagle-topk", str(int(args.speculative_eagle_topk))]
+            )
         dflash_port = find_available_port(port_base + 1)
         dflash_url = f"http://127.0.0.1:{dflash_port}"
         dflash_proc = popen_launch_server(
             args.target_model,
             dflash_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                *common_server_args,
-                "--speculative-algorithm",
-                "DFLASH",
-                "--speculative-draft-model-path",
-                args.draft_model,
-            ],
+            other_args=spec_server_args,
         )
         try:
             _send_generate(
@@ -472,7 +544,7 @@ def main() -> None:
                 dflash_toks[(backend, conc)] = metrics.output_toks_per_s
                 dflash_accept_len[(backend, conc)] = metrics.spec_accept_length
                 print(
-                    f"[DFLASH]   conc={conc:>2} n={n:<4} "
+                    f"[{spec_algo}]   conc={conc:>2} n={n:<4} "
                     f"toks/s={metrics.output_toks_per_s:,.2f} "
                     f"latency={metrics.latency_s:.1f}s "
                     f"accept_len={metrics.spec_accept_length:.3f} "
@@ -493,6 +565,17 @@ def main() -> None:
     md_lines.append(f"- dataset: `{args.dataset_name}`")
     md_lines.append(f"- target_model: `{args.target_model}`")
     md_lines.append(f"- draft_model: `{args.draft_model}`")
+    md_lines.append(f"- speculative_algorithm: `{args.speculative_algorithm.upper()}`")
+    md_lines.append(
+        f"- speculative_dflash_block_size: `{args.speculative_dflash_block_size}`"
+    )
+    md_lines.append(
+        f"- speculative_num_draft_tokens: `{args.speculative_num_draft_tokens}`"
+    )
+    md_lines.append(f"- speculative_num_steps: `{args.speculative_num_steps}`")
+    md_lines.append(f"- speculative_eagle_topk: `{args.speculative_eagle_topk}`")
+    md_lines.append(f"- disable_overlap_schedule: `{bool(args.disable_overlap_schedule)}`")
+    md_lines.append(f"- server_extra_args: `{args.server_extra_args}`")
     md_lines.append(f"- max_new_tokens: `{args.max_new_tokens}`")
     md_lines.append(f"- attention_backends: `{', '.join(attention_backends)}`")
     md_lines.append(f"- tp_size: `{tp}`")
