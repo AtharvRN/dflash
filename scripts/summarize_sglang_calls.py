@@ -116,6 +116,12 @@ def _load_rows(path: Path):
                 "accept_tokens": accept_tokens if accept_tokens is not None else 0,
                 "accept_rate": accept_rate,
                 "accept_len": accept_len,
+                "request_idx": _as_int(
+                    _first_present(
+                        merged,
+                        ["request_local_idx", "request_idx", "call_idx"],
+                    )
+                ),
                 "draft_time_s": _as_float(
                     _first_present(merged, ["draft_time_s", "spec_draft_time_s"])
                 ),
@@ -302,6 +308,16 @@ def summarize(rows):
         bs_request_hist.most_common(1)[0] if bs_request_hist else None
     )
 
+    requests_with_runtime_hist = [r for r in rows if r["runtime_bs_hist"]]
+    mixed_bs_requests = sum(
+        1 for r in requests_with_runtime_hist if len(r["runtime_bs_hist"]) > 1
+    )
+    unique_bs_per_request = (
+        mean([len(r["runtime_bs_hist"]) for r in requests_with_runtime_hist])
+        if requests_with_runtime_hist
+        else None
+    )
+
     draft_cycle_wmean_s = _wmean(
         [r["draft_time_per_cycle_s"] for r in rows], [r["verify_ct"] for r in rows]
     )
@@ -350,6 +366,18 @@ def summarize(rows):
         )
     else:
         lines.append("- most_common_block_size (request-count): `N/A`")
+    if requests_with_runtime_hist:
+        lines.append(
+            f"- requests_with_exact_runtime_hist: `{len(requests_with_runtime_hist)}`"
+        )
+        lines.append(
+            f"- requests_with_mixed_block_sizes: `{mixed_bs_requests}`"
+        )
+        lines.append(
+            f"- mean_unique_block_sizes_per_request: `{_fmt(unique_bs_per_request, 3)}`"
+        )
+    else:
+        lines.append("- requests_with_exact_runtime_hist: `0`")
 
     lines.append("")
     lines.append("### Block-Size Cycle Histogram")
@@ -375,6 +403,48 @@ def summarize(rows):
     lines.append(
         f"- mean_verify_time_per_request_s: `{_fmt(verify_req_mean_s, 6)}`"
     )
+    lines.append("")
+    lines.append("## Per-Request Block Usage")
+    if requests_with_runtime_hist:
+        lines.append(
+            "_Rows show how many verify cycles used each block size for that request._"
+        )
+        lines.append("| request_local_idx | verify_cycles | runtime_bs_hist | mode_bs | avg_bs |")
+        lines.append("|---:|---:|---|---:|---:|")
+
+        def _sort_key(rr):
+            return (
+                rr["request_idx"] if rr["request_idx"] is not None else 10**12,
+                rr["verify_ct"],
+            )
+
+        preview_rows = sorted(requests_with_runtime_hist, key=_sort_key)[:32]
+        for r in preview_rows:
+            hist = r["runtime_bs_hist"]
+            hist_str = ", ".join(f"{bs}:{ct}" for bs, ct in sorted(hist.items()))
+            mode_bs = max(
+                sorted(hist.items()),
+                key=lambda kv: kv[1],
+            )[0]
+            total_ct = sum(hist.values())
+            avg_bs = (
+                sum(int(bs) * int(ct) for bs, ct in hist.items()) / float(total_ct)
+                if total_ct > 0
+                else None
+            )
+            req_idx = r["request_idx"] if r["request_idx"] is not None else -1
+            lines.append(
+                f"| {req_idx} | {r['verify_ct']} | `{hist_str}` | {mode_bs} | {_fmt(avg_bs, 3)} |"
+            )
+        if len(requests_with_runtime_hist) > len(preview_rows):
+            lines.append("")
+            lines.append(
+                f"_Showing first {len(preview_rows)} requests out of {len(requests_with_runtime_hist)} with exact runtime block-size histograms._"
+            )
+    else:
+        lines.append(
+            "_No exact runtime block-size histogram in this trace; only inferred block size is available._"
+        )
     lines.append("")
     lines.append("## Per-Block Breakdown")
     lines.append("| block_size | requests(mode) | verify_cycles | draft_tokens | accepted_tokens | accept_rate |")
