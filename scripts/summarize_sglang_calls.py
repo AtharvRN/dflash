@@ -32,6 +32,21 @@ def _first_present(d, keys):
     return None
 
 
+def _normalize_hist(raw_hist):
+    if not isinstance(raw_hist, dict):
+        return {}
+    out = {}
+    for k, v in raw_hist.items():
+        bs = _as_int(k)
+        ct = _as_int(v)
+        if bs is None or ct is None:
+            continue
+        if bs <= 0 or ct <= 0:
+            continue
+        out[int(bs)] = int(ct)
+    return out
+
+
 def _load_rows(path: Path):
     rows = []
     with path.open() as f:
@@ -84,6 +99,16 @@ def _load_rows(path: Path):
                     ],
                 )
             )
+            runtime_bs_hist = _normalize_hist(
+                _first_present(
+                    merged,
+                    [
+                        "spec_runtime_bs_hist",
+                        "dflash_runtime_bs_hist",
+                        "runtime_bs_hist",
+                    ],
+                )
+            )
 
             row = {
                 "verify_ct": verify_ct if verify_ct is not None else 0,
@@ -112,10 +137,16 @@ def _load_rows(path: Path):
                 "completion_tokens": _as_int(_first_present(merged, ["completion_tokens"]))
                 or 0,
                 "runtime_bs_exact": runtime_bs,
+                "runtime_bs_hist": runtime_bs_hist,
             }
 
             if row["runtime_bs_exact"] is None:
-                if row["verify_ct"] > 0 and row["draft_tokens"] >= 0:
+                if runtime_bs_hist:
+                    inferred = max(
+                        sorted(runtime_bs_hist.items()),
+                        key=lambda kv: kv[1],
+                    )[0]
+                elif row["verify_ct"] > 0 and row["draft_tokens"] >= 0:
                     inferred = int(round(row["draft_tokens"] / row["verify_ct"] + 1.0))
                     inferred = max(1, inferred)
                 else:
@@ -229,7 +260,10 @@ def summarize(rows):
     accept_rate_samples = [r["accept_rate"] for r in rows if r["accept_rate"] is not None]
     accept_len_samples = [r["accept_len"] for r in rows if r["accept_len"] is not None]
 
-    exact_bs_present = any(r["runtime_bs_exact"] is not None for r in rows)
+    exact_hist_present = any(bool(r.get("runtime_bs_hist")) for r in rows)
+    exact_bs_present = exact_hist_present or any(
+        r["runtime_bs_exact"] is not None for r in rows
+    )
     bs_cycle_hist = Counter()
     bs_request_hist = Counter()
     per_bs = defaultdict(
@@ -237,16 +271,31 @@ def summarize(rows):
     )
 
     for r in rows:
+        if r["runtime_bs_hist"]:
+            # Exact cycle counts by block-size for this request.
+            for bs, ct in r["runtime_bs_hist"].items():
+                bs_cycle_hist[bs] += int(ct)
+                per_bs[bs]["verify_ct"] += int(ct)
+                # Drafted tokens are exact given block size and cycle count.
+                per_bs[bs]["draft_tokens"] += int(ct) * max(0, int(bs) - 1)
+            req_mode_bs = max(
+                sorted(r["runtime_bs_hist"].items()),
+                key=lambda kv: kv[1],
+            )[0]
+            bs_request_hist[int(req_mode_bs)] += 1
+            per_bs[int(req_mode_bs)]["requests"] += 1
+            continue
+
         bs = r["runtime_bs_inferred"]
         if bs is None:
             continue
-        bs_request_hist[bs] += 1
+        bs_request_hist[int(bs)] += 1
         if r["verify_ct"] > 0:
-            bs_cycle_hist[bs] += r["verify_ct"]
-            per_bs[bs]["verify_ct"] += r["verify_ct"]
-            per_bs[bs]["draft_tokens"] += r["draft_tokens"]
-            per_bs[bs]["accept_tokens"] += r["accept_tokens"]
-            per_bs[bs]["requests"] += 1
+            bs_cycle_hist[int(bs)] += r["verify_ct"]
+            per_bs[int(bs)]["verify_ct"] += r["verify_ct"]
+            per_bs[int(bs)]["draft_tokens"] += r["draft_tokens"]
+            per_bs[int(bs)]["accept_tokens"] += r["accept_tokens"]
+            per_bs[int(bs)]["requests"] += 1
 
     most_common_cycle_bs = bs_cycle_hist.most_common(1)[0] if bs_cycle_hist else None
     most_common_request_bs = (
@@ -285,7 +334,7 @@ def summarize(rows):
     lines.append("")
     lines.append("## Block Size")
     lines.append(
-        f"- block_size_source: `{'exact_runtime_block_size' if exact_bs_present else 'inferred_from_draft_tokens_per_verify'}`"
+        f"- block_size_source: `{'exact_runtime_bs_hist' if exact_hist_present else ('exact_runtime_block_size' if exact_bs_present else 'inferred_from_draft_tokens_per_verify')}`"
     )
     if most_common_cycle_bs:
         lines.append(
@@ -301,6 +350,15 @@ def summarize(rows):
         )
     else:
         lines.append("- most_common_block_size (request-count): `N/A`")
+
+    lines.append("")
+    lines.append("### Block-Size Cycle Histogram")
+    lines.append("| block_size | verify_cycles | cycle_pct |")
+    lines.append("|---:|---:|---:|")
+    total_cycle_hist = sum(bs_cycle_hist.values())
+    for bs, ct in sorted(bs_cycle_hist.items()):
+        pct = (float(ct) / float(total_cycle_hist)) if total_cycle_hist > 0 else 0.0
+        lines.append(f"| {bs} | {ct} | {_fmt(pct * 100.0, 2)}% |")
     lines.append("")
     lines.append("## Timing")
     lines.append(
@@ -319,14 +377,19 @@ def summarize(rows):
     )
     lines.append("")
     lines.append("## Per-Block Breakdown")
-    lines.append("| block_size | requests | verify_cycles | draft_tokens | accepted_tokens | accept_rate |")
+    lines.append("| block_size | requests(mode) | verify_cycles | draft_tokens | accepted_tokens | accept_rate |")
     lines.append("|---:|---:|---:|---:|---:|---:|")
     for bs in sorted(per_bs):
         d = per_bs[bs]
+        # accepted_tokens per block-size is exact only when rows don't mix block sizes.
         ar = (d["accept_tokens"] / d["draft_tokens"]) if d["draft_tokens"] > 0 else None
+        accept_tokens_disp = (
+            str(d["accept_tokens"]) if not exact_hist_present else "N/A"
+        )
+        accept_rate_disp = _fmt(ar, 4) if not exact_hist_present else "N/A"
         lines.append(
             f"| {bs} | {d['requests']} | {d['verify_ct']} | {d['draft_tokens']} | "
-            f"{d['accept_tokens']} | {_fmt(ar, 4)} |"
+            f"{accept_tokens_disp} | {accept_rate_disp} |"
         )
 
     return "\n".join(lines) + "\n"

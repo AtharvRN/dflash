@@ -340,6 +340,13 @@ def _run_bench_requests(
                     "verify_time_s": verify_time_s,
                     "draft_time_per_cycle_s": draft_time_per_cycle_s,
                     "verify_time_per_cycle_s": verify_time_per_cycle_s,
+                    "spec_runtime_bs_hist": meta.get("spec_runtime_bs_hist"),
+                    "spec_runtime_bs_mode": _extract_float(
+                        meta, ["spec_runtime_bs_mode"]
+                    ),
+                    "spec_runtime_bs_avg": _extract_float(
+                        meta, ["spec_runtime_bs_avg"]
+                    ),
                     "client_request_wall_s": client_request_wall_s,
                     "client_batch_wall_s": client_batch_wall_s,
                     "client_batch_size": client_batch_size,
