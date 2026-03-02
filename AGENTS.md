@@ -1,0 +1,86 @@
+# DFlash Agent Handoff (2026-03-02)
+
+## Current Working Branches
+- Superproject branch: `dflash-flex-experiments`
+- Submodule path: `third_party/sglang`
+- Submodule URL: `https://github.com/AtharvRN/sglang`
+- Submodule branch used for DFLASH changes: `pr16818-flex-experiments`
+
+## Pull + Setup (fresh session)
+```bash
+cd /workspace/DSC291/dflash
+git pull origin dflash-flex-experiments
+git submodule sync --recursive
+git submodule update --init --recursive
+
+# Ensure CLI uses local SGLang with latest DFLASH flags.
+pip install -e ./third_party/sglang/python --no-deps
+```
+
+Sanity check:
+```bash
+sglang serve --help | grep speculative-dflash-adaptive-k-start
+```
+
+## DFLASH Adaptive Controls (important)
+- `--speculative-dflash-block-size`:
+  - Sets DFLASH configured max block size.
+  - Also drives `speculative_num_draft_tokens` and draft/verify memory/capture sizing.
+- `--speculative-dflash-adaptive-k-min`, `--speculative-dflash-adaptive-k-max`:
+  - Runtime adaptive range.
+  - Must satisfy `1 <= k_min <= k_max <= speculative_dflash_block_size`.
+- `--speculative-dflash-adaptive-k-start`:
+  - Initial runtime block size per request.
+  - Must satisfy `k_min <= k_start <= k_max`.
+  - Lets us run `k_max=16` but start each request at `k_start=8`.
+
+## Key Scripts
+- Benchmark: `benchmark_sglang.py`
+- C=16 adaptive launcher: `run_sglang_dynamic_c16.sh`
+- Call-trace summarizer: `scripts/summarize_sglang_calls.py`
+
+## Recommended C=16 Run (start at 8, allow up to 16)
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+RUN_BASELINE=0 \
+RUN_TAG=sg_adaptive_c16_kstart8_$(date +%Y%m%d_%H%M%S) \
+CONCURRENCY=16 \
+QUESTIONS_PER_CONCURRENCY_BASE=8 \
+MAX_QUESTIONS_PER_CONFIG=256 \
+DFLASH_BLOCK_SIZE=16 \
+ADAPTIVE_ENABLED=1 \
+ADAPTIVE_RHO=0.30 \
+ADAPTIVE_DELTA=1.0 \
+ADAPTIVE_K_MIN=1 \
+ADAPTIVE_K_MAX=16 \
+ADAPTIVE_K_START=8 \
+ADAPTIVE_LOW_ACCEPT_THRESHOLD=0.35 \
+ADAPTIVE_LOW_ACCEPT_STREAK=2 \
+bash run_sglang_dynamic_c16.sh
+```
+
+## Where Outputs Go
+- Markdown report: `logs/<run_tag>/<run_tag>.md`
+- Per-call JSONL: `logs/<run_tag>/<run_tag>_calls.jsonl`
+- Derived summary: `logs/<run_tag>/<run_tag>_calls_summary.md`
+- Raw log: `logs/<run_tag>/<run_tag>.log`
+
+## Call-Trace Fields To Use
+- `spec_accept_rate`
+- `spec_accept_length`
+- `spec_verify_ct`
+- `spec_draft_token_num`
+- `draft_time_s`, `verify_time_s`
+- `draft_time_per_cycle_s`, `verify_time_per_cycle_s`
+- `spec_runtime_bs_hist` (exact runtime block-size cycle histogram per request)
+- `spec_runtime_bs_mode`
+- `spec_runtime_bs_avg`
+
+## Known Failure Modes
+- Unknown adaptive CLI args:
+  - Reinstall editable SGLang (`pip install -e ./third_party/sglang/python --no-deps`).
+- `ModuleNotFoundError: imageio` after editable install:
+  - `pip install imageio`
+- `libnuma.so.1` missing:
+  - install `libnuma1` in pod image/env.
+
