@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 import json
+import math
 import os
 import shlex
 import time
@@ -42,6 +43,7 @@ def _send_generate(
     max_new_tokens: int,
     stop: list[str],
     timeout_s: int,
+    sampling_custom_params: Optional[dict] = None,
 ) -> dict:
     sampling_params: dict = {
         "temperature": 0.0,
@@ -51,6 +53,8 @@ def _send_generate(
     }
     if stop:
         sampling_params["stop"] = stop
+    if sampling_custom_params:
+        sampling_params["custom_params"] = dict(sampling_custom_params)
     resp = requests.post(
         base_url + "/generate",
         json={
@@ -70,6 +74,7 @@ def _send_generate_batch(
     max_new_tokens: int,
     stop: list[str],
     timeout_s: int,
+    sampling_custom_params: Optional[dict] = None,
 ) -> list[dict]:
     if not prompts:
         return []
@@ -81,6 +86,8 @@ def _send_generate_batch(
     }
     if stop:
         sampling_params["stop"] = stop
+    if sampling_custom_params:
+        sampling_params["custom_params"] = dict(sampling_custom_params)
     resp = requests.post(
         base_url + "/generate",
         json={
@@ -122,6 +129,7 @@ class BenchMetrics:
 class DynamicChunkRecord:
     chunk_idx: int
     block_size: int
+    chunk_size: int
     request_count: int
     output_tokens: int
     latency_s: float
@@ -131,6 +139,12 @@ class DynamicChunkRecord:
     verify_calls: int
     drafted_tokens: int
     accepted_tokens: int
+
+
+@dataclass(frozen=True)
+class DynamicChoice:
+    block_size: int
+    batch_size: int
 
 
 def _mean_or_none(values: list[float]) -> Optional[float]:
@@ -178,6 +192,7 @@ def _run_bench_requests(
     stop: list[str],
     timeout_s: int,
     expect_dflash: bool,
+    sampling_custom_params: Optional[dict] = None,
     trace_fp: Optional[TextIO] = None,
     trace_common: Optional[dict] = None,
     trace_include_prompt: bool = False,
@@ -194,6 +209,7 @@ def _run_bench_requests(
                 max_new_tokens=max_new_tokens,
                 stop=stop,
                 timeout_s=timeout_s,
+                sampling_custom_params=sampling_custom_params,
             )
         else:
             with ThreadPoolExecutor(max_workers=int(concurrency)) as pool:
@@ -205,6 +221,7 @@ def _run_bench_requests(
                         max_new_tokens=max_new_tokens,
                         stop=stop,
                         timeout_s=timeout_s,
+                        sampling_custom_params=sampling_custom_params,
                     )
                     for prompt in warmup_prompts
                 ]
@@ -346,6 +363,7 @@ def _run_bench_requests(
                 max_new_tokens=max_new_tokens,
                 stop=stop,
                 timeout_s=timeout_s,
+                sampling_custom_params=sampling_custom_params,
             )
             batch_wall_s = time.perf_counter() - batch_t0
             if len(outs) != len(chunk_prompts):
@@ -371,6 +389,7 @@ def _run_bench_requests(
                 max_new_tokens=max_new_tokens,
                 stop=stop,
                 timeout_s=timeout_s,
+                sampling_custom_params=sampling_custom_params,
             )
             wall_s = time.perf_counter() - t0
             return prompt_idx, prompt, out, wall_s
@@ -472,90 +491,161 @@ def _parse_dynamic_gpu_map(s: str) -> dict[int, str]:
     return out
 
 
-class DynamicBlockEWMAController:
+class DynamicAdaptiveController:
     def __init__(
         self,
         *,
-        candidates: list[int],
+        block_sizes: list[int],
+        batch_sizes: list[int],
+        policy: str,
         ewma_alpha: float,
+        exploration_c: float,
         switch_margin: float,
         required_streak: int,
         warmup_chunks: int,
         probe_interval: int,
     ) -> None:
-        self.candidates = sorted({int(x) for x in candidates})
-        if not self.candidates:
+        self.block_sizes = sorted({int(x) for x in block_sizes if int(x) >= 1})
+        self.batch_sizes = sorted({int(x) for x in batch_sizes if int(x) >= 1})
+        if not self.block_sizes:
             raise ValueError("No dynamic block-size candidates provided.")
+        if not self.batch_sizes:
+            raise ValueError("No dynamic batch-size candidates provided.")
+        if policy not in {"ewma", "ucb"}:
+            raise ValueError("dynamic-policy must be one of: ewma, ucb.")
         if not (0.0 < float(ewma_alpha) <= 1.0):
             raise ValueError("dynamic-ewma-alpha must be in (0, 1].")
+
+        self.policy = str(policy)
         self.ewma_alpha = float(ewma_alpha)
+        self.exploration_c = float(max(0.0, exploration_c))
         self.switch_margin = float(max(0.0, switch_margin))
         self.required_streak = int(max(1, required_streak))
         self.warmup_chunks = int(max(0, warmup_chunks))
         self.probe_interval = int(max(0, probe_interval))
 
-        self.current = self.candidates[-1]
-        self.score_hat: dict[int, Optional[float]] = {b: None for b in self.candidates}
-        self.obs_count: dict[int, int] = {b: 0 for b in self.candidates}
+        self.arms: list[DynamicChoice] = [
+            DynamicChoice(block_size=bs, batch_size=bz)
+            for bs in self.block_sizes
+            for bz in self.batch_sizes
+        ]
+        if not self.arms:
+            raise ValueError("No dynamic controller arms could be constructed.")
+
+        self.score_hat: dict[tuple[int, int], Optional[float]] = {
+            (a.block_size, a.batch_size): None for a in self.arms
+        }
+        self.obs_count: dict[tuple[int, int], int] = {
+            (a.block_size, a.batch_size): 0 for a in self.arms
+        }
+        self.total_obs = 0
+        self.current = DynamicChoice(
+            block_size=max(self.block_sizes), batch_size=max(self.batch_sizes)
+        )
         self.pending_target = self.current
         self.pending_streak = 0
         self.probe_cursor = 0
+        self.warmup_cursor = 0
+
+    @staticmethod
+    def _key(choice: DynamicChoice) -> tuple[int, int]:
+        return (int(choice.block_size), int(choice.batch_size))
 
     def _ewma(self, old: Optional[float], new: float) -> float:
         if old is None:
             return float(new)
         return float((1.0 - self.ewma_alpha) * old + self.ewma_alpha * float(new))
 
-    def _next_probe(self) -> int:
-        for _ in range(len(self.candidates)):
-            b = self.candidates[self.probe_cursor % len(self.candidates)]
+    def _feasible(self, remaining_prompts: int) -> list[DynamicChoice]:
+        rem = int(max(1, remaining_prompts))
+        feasible = [a for a in self.arms if int(a.batch_size) <= rem]
+        return feasible if feasible else [min(self.arms, key=lambda a: a.batch_size)]
+
+    def _next_probe(self, feasible: list[DynamicChoice]) -> DynamicChoice:
+        if not feasible:
+            return self.current
+        for _ in range(max(1, len(self.arms))):
+            cand = self.arms[self.probe_cursor % len(self.arms)]
             self.probe_cursor += 1
-            if b != self.current:
-                return b
-        return self.current
+            if cand in feasible and cand != self.current:
+                return cand
+        return self.current if self.current in feasible else feasible[0]
 
-    def select(self, chunk_idx: int) -> int:
+    def _ucb_value(self, arm: DynamicChoice) -> float:
+        k = self._key(arm)
+        base = self.score_hat.get(k)
+        if base is None:
+            base = 0.0
+        n = int(self.obs_count.get(k, 0))
+        bonus = self.exploration_c * math.sqrt(
+            math.log(float(self.total_obs) + 2.0) / (float(n) + 1.0)
+        )
+        return float(base + bonus)
+
+    def select(self, *, chunk_idx: int, remaining_prompts: int) -> DynamicChoice:
+        feasible = self._feasible(int(remaining_prompts))
         if chunk_idx < self.warmup_chunks:
-            return self.candidates[chunk_idx % len(self.candidates)]
+            choice = feasible[self.warmup_cursor % len(feasible)]
+            self.warmup_cursor += 1
+            return choice
         if self.probe_interval > 0:
-            since_warmup = chunk_idx - self.warmup_chunks
-            if since_warmup >= 0 and (since_warmup % self.probe_interval == 0):
-                return self._next_probe()
-        return self.current
+            since_warmup = int(chunk_idx) - self.warmup_chunks
+            if since_warmup >= 0 and since_warmup % self.probe_interval == 0:
+                return self._next_probe(feasible)
 
-    def update(self, *, block_size: int, score: float) -> None:
-        b = int(block_size)
-        if b not in self.score_hat:
+        if self.policy == "ucb":
+            return max(feasible, key=self._ucb_value)
+
+        if self.current in feasible:
+            return self.current
+        scored = [(arm, self.score_hat.get(self._key(arm))) for arm in feasible]
+        scored = [(a, s) for a, s in scored if s is not None]
+        if scored:
+            return max(scored, key=lambda x: x[1])[0]
+        return max(feasible, key=lambda a: (a.batch_size, a.block_size))
+
+    def update(self, *, choice: DynamicChoice, score: float) -> None:
+        k = self._key(choice)
+        if k not in self.score_hat:
             return
-        self.score_hat[b] = self._ewma(self.score_hat[b], float(score))
-        self.obs_count[b] += 1
+        self.score_hat[k] = self._ewma(self.score_hat[k], float(score))
+        self.obs_count[k] = int(self.obs_count[k]) + 1
+        self.total_obs += 1
 
-        scored = [(k, v) for k, v in self.score_hat.items() if v is not None]
+        if self.policy != "ewma":
+            self.current = choice
+            return
+
+        scored = [
+            (DynamicChoice(block_size=b, batch_size=z), s)
+            for (b, z), s in self.score_hat.items()
+            if s is not None
+        ]
         if not scored:
             return
-        best_b, best_score = max(scored, key=lambda x: x[1])
-        cur_score = self.score_hat.get(self.current)
+        best_choice, best_score = max(scored, key=lambda x: x[1])
+        cur_score = self.score_hat.get(self._key(self.current))
         if cur_score is None:
-            self.current = best_b
+            self.current = best_choice
             self.pending_target = self.current
             self.pending_streak = 0
             return
 
         rel_improvement = (best_score - cur_score) / max(abs(cur_score), 1e-12)
-        eligible = best_b != self.current and rel_improvement > self.switch_margin
+        eligible = best_choice != self.current and rel_improvement > self.switch_margin
         if not eligible:
             self.pending_target = self.current
             self.pending_streak = 0
             return
 
-        if self.pending_target == best_b:
+        if self.pending_target == best_choice:
             self.pending_streak += 1
         else:
-            self.pending_target = best_b
+            self.pending_target = best_choice
             self.pending_streak = 1
 
         if self.pending_streak >= self.required_streak:
-            self.current = best_b
+            self.current = best_choice
             self.pending_target = self.current
             self.pending_streak = 0
 
@@ -627,46 +717,97 @@ def _run_dynamic_spec(
     batch_requests: bool,
     stop: list[str],
     timeout_s: int,
-    controller: DynamicBlockEWMAController,
+    controller: DynamicAdaptiveController,
     score_metric: str,
+    send_runtime_block_size_param: bool,
     trace_fp: Optional[TextIO],
     trace_common: Optional[dict],
     trace_include_prompt: bool,
     trace_include_raw_meta: bool,
-) -> tuple[BenchMetrics, list[DynamicChunkRecord], dict[int, int]]:
+) -> tuple[
+    BenchMetrics,
+    list[DynamicChunkRecord],
+    dict[int, int],
+    dict[int, int],
+    dict[tuple[int, int], int],
+]:
     if not urls_by_bs:
         raise ValueError("Dynamic spec requires at least one block-size server URL.")
 
-    chunk_size = max(1, int(concurrency))
+    max_chunk_size = max(1, int(concurrency))
     chunk_records: list[DynamicChunkRecord] = []
     metrics_accum: list[BenchMetrics] = []
     usage_counts: dict[int, int] = {int(k): 0 for k in sorted(urls_by_bs.keys())}
+    batch_usage_counts: dict[int, int] = {}
+    arm_usage_counts: dict[tuple[int, int], int] = {}
+    max_block_size = max(int(k) for k in urls_by_bs.keys())
 
-    for chunk_idx, start_idx in enumerate(range(0, len(prompts), chunk_size)):
-        chunk_prompts = prompts[start_idx : start_idx + chunk_size]
+    def _score_chunk(m: BenchMetrics) -> float:
+        if score_metric == "accepted_toks_per_s":
+            return float(m.spec_accept_token_sum) / max(float(m.latency_s), 1e-6)
+        if score_metric == "tau_over_verify":
+            return (
+                float(m.spec_accept_length) / max(float(m.spec_verify_ct_sum), 1.0)
+                if m.spec_accept_length is not None
+                else 0.0
+            )
+        if score_metric == "multi_objective":
+            throughput = float(m.output_toks_per_s)
+            accept_rate = float(m.spec_accept_rate) if m.spec_accept_rate is not None else 0.0
+            tau_norm = (
+                float(m.spec_accept_length) / max(float(max_block_size), 1.0)
+                if m.spec_accept_length is not None
+                else 0.0
+            )
+            verify_per_out_tok = float(m.spec_verify_ct_sum) / max(float(m.output_tokens), 1.0)
+            draft_per_out_tok = float(m.spec_draft_token_sum) / max(float(m.output_tokens), 1.0)
+            return (
+                throughput
+                * (1.0 + 0.35 * accept_rate + 0.25 * tau_norm)
+                / (1.0 + 0.75 * verify_per_out_tok + 0.15 * draft_per_out_tok)
+            )
+        return float(m.output_toks_per_s)
+
+    start_idx = 0
+    chunk_idx = 0
+    while start_idx < len(prompts):
+        remaining = len(prompts) - start_idx
+        choice = controller.select(chunk_idx=chunk_idx, remaining_prompts=remaining)
+        chosen_bs = int(choice.block_size)
+        chosen_chunk_size = min(max(1, int(choice.batch_size)), max_chunk_size, remaining)
+        chunk_prompts = prompts[start_idx : start_idx + chosen_chunk_size]
         if not chunk_prompts:
-            continue
-        chosen_bs = int(controller.select(chunk_idx))
+            break
+        start_idx += chosen_chunk_size
         if chosen_bs not in urls_by_bs:
             # Safety fallback if controller selects a candidate not provisioned.
             chosen_bs = max(urls_by_bs.keys())
         usage_counts[chosen_bs] = usage_counts.get(chosen_bs, 0) + 1
+        batch_usage_counts[chosen_chunk_size] = batch_usage_counts.get(chosen_chunk_size, 0) + 1
+        arm_key = (int(chosen_bs), int(chosen_chunk_size))
+        arm_usage_counts[arm_key] = arm_usage_counts.get(arm_key, 0) + 1
 
         m = _run_bench_requests(
             urls_by_bs[chosen_bs],
             prompts=chunk_prompts,
             max_new_tokens=max_new_tokens,
-            concurrency=chunk_size,
+            concurrency=chosen_chunk_size,
             batch_requests=batch_requests,
             stop=stop,
             timeout_s=timeout_s,
             expect_dflash=True,
+            sampling_custom_params=(
+                {"dflash_block_size": int(chosen_bs)}
+                if send_runtime_block_size_param
+                else None
+            ),
             trace_fp=trace_fp,
             trace_common={
                 **(trace_common or {}),
                 "dynamic_mode": True,
                 "dynamic_block_size": int(chosen_bs),
                 "dynamic_chunk_idx": int(chunk_idx),
+                "dynamic_batch_size": int(chosen_chunk_size),
                 "dynamic_chunk_size": int(len(chunk_prompts)),
             },
             trace_include_prompt=trace_include_prompt,
@@ -677,6 +818,7 @@ def _run_dynamic_spec(
             DynamicChunkRecord(
                 chunk_idx=int(chunk_idx),
                 block_size=int(chosen_bs),
+                chunk_size=int(chosen_chunk_size),
                 request_count=int(m.request_count),
                 output_tokens=int(m.output_tokens),
                 latency_s=float(m.latency_s),
@@ -688,20 +830,20 @@ def _run_dynamic_spec(
                 accepted_tokens=int(m.spec_accept_token_sum),
             )
         )
+        score = _score_chunk(m)
+        controller.update(
+            choice=DynamicChoice(block_size=int(chosen_bs), batch_size=int(chosen_chunk_size)),
+            score=float(score),
+        )
+        chunk_idx += 1
 
-        if score_metric == "accepted_toks_per_s":
-            score = float(m.spec_accept_token_sum) / max(float(m.latency_s), 1e-6)
-        elif score_metric == "tau_over_verify":
-            score = (
-                float(m.spec_accept_length) / max(float(m.spec_verify_ct_sum), 1.0)
-                if m.spec_accept_length is not None
-                else 0.0
-            )
-        else:
-            score = float(m.output_toks_per_s)
-        controller.update(block_size=chosen_bs, score=float(score))
-
-    return _aggregate_bench_metrics(metrics_accum), chunk_records, usage_counts
+    return (
+        _aggregate_bench_metrics(metrics_accum),
+        chunk_records,
+        usage_counts,
+        batch_usage_counts,
+        arm_usage_counts,
+    )
 
 
 def main() -> None:
@@ -754,10 +896,29 @@ def main() -> None:
         help="DFLASH only. Sets --speculative-dflash-block-size on server.",
     )
     parser.add_argument(
+        "--request-dflash-block-size",
+        type=int,
+        default=None,
+        help="Optional per-request runtime DFLASH block size sent via sampling_params.custom_params['dflash_block_size'] (DFLASH only).",
+    )
+    parser.add_argument(
         "--dynamic-block-sizes",
         type=str,
         default="",
         help="Optional comma-separated DFLASH block sizes (e.g. 8,16). If set, launches one speculative server per block size and routes chunks dynamically.",
+    )
+    parser.add_argument(
+        "--dynamic-batch-sizes",
+        type=str,
+        default="",
+        help="Optional comma-separated client batch sizes used by dynamic mode (e.g. 4,8,16). If empty, uses fixed batch size equal to concurrency.",
+    )
+    parser.add_argument(
+        "--dynamic-policy",
+        type=str,
+        default="ewma",
+        choices=["ewma", "ucb"],
+        help="Dynamic controller policy. ewma = hysteresis switching; ucb = exploration-aware bandit.",
     )
     parser.add_argument(
         "--dynamic-gpu-map",
@@ -766,10 +927,21 @@ def main() -> None:
         help="Optional bs:gpu_id map for dynamic servers (e.g. 8:0,16:1). If omitted, inherits current CUDA_VISIBLE_DEVICES.",
     )
     parser.add_argument(
+        "--dynamic-single-server",
+        action="store_true",
+        help="Run dynamic mode on one server launched at max(dynamic block sizes), passing per-chunk dflash_block_size through request custom params.",
+    )
+    parser.add_argument(
         "--dynamic-ewma-alpha",
         type=float,
         default=0.20,
-        help="EWMA alpha for dynamic block-size controller.",
+        help="EWMA alpha for dynamic controller score smoothing.",
+    )
+    parser.add_argument(
+        "--dynamic-exploration-c",
+        type=float,
+        default=0.15,
+        help="Exploration coefficient for --dynamic-policy ucb.",
     )
     parser.add_argument(
         "--dynamic-switch-margin",
@@ -799,7 +971,12 @@ def main() -> None:
         "--dynamic-score-metric",
         type=str,
         default="output_toks_per_s",
-        choices=["output_toks_per_s", "accepted_toks_per_s", "tau_over_verify"],
+        choices=[
+            "output_toks_per_s",
+            "accepted_toks_per_s",
+            "tau_over_verify",
+            "multi_objective",
+        ],
         help="Objective metric used by dynamic block-size controller.",
     )
     parser.add_argument(
@@ -883,9 +1060,33 @@ def main() -> None:
         os.environ["SGLANG_DFLASH_REPORT_TIMING"] = "1"
         print("[setup] enabled SGLANG_DFLASH_REPORT_TIMING=1 for launched SGLang servers")
 
-    dynamic_block_sizes = sorted({int(x) for x in _parse_int_csv(args.dynamic_block_sizes)}) if args.dynamic_block_sizes.strip() else []
+    dynamic_block_sizes = (
+        sorted({int(x) for x in _parse_int_csv(args.dynamic_block_sizes)})
+        if args.dynamic_block_sizes.strip()
+        else []
+    )
+    dynamic_batch_sizes = (
+        sorted({int(x) for x in _parse_int_csv(args.dynamic_batch_sizes)})
+        if args.dynamic_batch_sizes.strip()
+        else []
+    )
     dynamic_mode = len(dynamic_block_sizes) > 0
     dynamic_gpu_map = _parse_dynamic_gpu_map(args.dynamic_gpu_map)
+    request_dflash_block_size: Optional[int] = None
+
+    if args.request_dflash_block_size is not None:
+        req_bs = int(args.request_dflash_block_size)
+        if req_bs <= 0:
+            raise RuntimeError(
+                f"--request-dflash-block-size must be > 0, got {req_bs}."
+            )
+        if args.speculative_algorithm.upper() != "DFLASH":
+            print(
+                "[warn] --request-dflash-block-size is ignored because speculative algorithm is not DFLASH.",
+                flush=True,
+            )
+        else:
+            request_dflash_block_size = req_bs
 
     if dynamic_mode:
         if args.speculative_algorithm.upper() != "DFLASH":
@@ -897,11 +1098,43 @@ def main() -> None:
                 "[warn] --speculative-dflash-block-size is ignored in dynamic mode; using --dynamic-block-sizes.",
                 flush=True,
             )
-        missing_gpu_map = [bs for bs in dynamic_block_sizes if bs not in dynamic_gpu_map]
-        if dynamic_gpu_map and missing_gpu_map:
-            raise RuntimeError(
-                f"--dynamic-gpu-map missing entries for block sizes: {missing_gpu_map}"
+        if args.dynamic_single_server and request_dflash_block_size is not None:
+            print(
+                "[warn] --request-dflash-block-size is ignored in --dynamic-single-server mode "
+                "(controller-selected block size is sent per chunk).",
+                flush=True,
             )
+            request_dflash_block_size = None
+        elif request_dflash_block_size is not None:
+            print(
+                "[warn] --request-dflash-block-size is ignored in multi-server dynamic mode.",
+                flush=True,
+            )
+            request_dflash_block_size = None
+        if dynamic_gpu_map:
+            if args.dynamic_single_server:
+                max_bs = max(dynamic_block_sizes)
+                ignored = sorted(bs for bs in dynamic_gpu_map.keys() if bs != max_bs)
+                if ignored:
+                    print(
+                        f"[warn] --dynamic-single-server ignores --dynamic-gpu-map entries for non-max block sizes: {ignored}",
+                        flush=True,
+                    )
+            else:
+                missing_gpu_map = [
+                    bs for bs in dynamic_block_sizes if bs not in dynamic_gpu_map
+                ]
+                if missing_gpu_map:
+                    raise RuntimeError(
+                        f"--dynamic-gpu-map missing entries for block sizes: {missing_gpu_map}"
+                    )
+        invalid_batch_sizes = [b for b in dynamic_batch_sizes if b < 1]
+        if invalid_batch_sizes:
+            raise RuntimeError(f"Invalid dynamic batch sizes: {invalid_batch_sizes}")
+    elif dynamic_batch_sizes:
+        raise RuntimeError("--dynamic-batch-sizes requires --dynamic-block-sizes.")
+    elif args.dynamic_single_server:
+        raise RuntimeError("--dynamic-single-server requires --dynamic-block-sizes.")
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this sweep.")
@@ -962,6 +1195,8 @@ def main() -> None:
     baseline_metrics: dict[tuple[str, int], BenchMetrics] = {}
     dflash_metrics: dict[tuple[str, int], BenchMetrics] = {}
     dynamic_usage_counts: dict[tuple[str, int], dict[int, int]] = {}
+    dynamic_batch_usage_counts: dict[tuple[str, int], dict[int, int]] = {}
+    dynamic_arm_usage_counts: dict[tuple[str, int], dict[tuple[int, int], int]] = {}
     dynamic_chunk_logs: dict[tuple[str, int], list[DynamicChunkRecord]] = {}
     
     tp = args.tp_size  # Fixed TP size
@@ -1063,6 +1298,11 @@ def main() -> None:
                         pass
 
             spec_algo = args.speculative_algorithm.upper()
+            request_custom_params = (
+                {"dflash_block_size": int(request_dflash_block_size)}
+                if (spec_algo == "DFLASH" and request_dflash_block_size is not None)
+                else None
+            )
             print(f"\n=== backend={backend} tp={tp} ({spec_algo}) ===")
             def _build_spec_server_args(block_size_override: Optional[int]) -> list[str]:
                 spec_server_args = [
@@ -1109,27 +1349,58 @@ def main() -> None:
                 urls_by_bs: dict[int, str] = {}
                 procs_by_bs: dict[int, object] = {}
                 try:
-                    for idx, bs in enumerate(dynamic_block_sizes):
-                        dflash_port = find_available_port(port_base + 1 + idx * 10)
+                    if args.dynamic_single_server:
+                        max_dynamic_bs = max(dynamic_block_sizes)
+                        dflash_port = find_available_port(port_base + 1)
                         dflash_url = f"http://127.0.0.1:{dflash_port}"
                         launch_env = None
-                        if bs in dynamic_gpu_map:
-                            launch_env = {"CUDA_VISIBLE_DEVICES": str(dynamic_gpu_map[bs])}
+                        if max_dynamic_bs in dynamic_gpu_map:
+                            launch_env = {
+                                "CUDA_VISIBLE_DEVICES": str(
+                                    dynamic_gpu_map[max_dynamic_bs]
+                                )
+                            }
                         proc = popen_launch_server(
                             args.target_model,
                             dflash_url,
                             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                            other_args=_build_spec_server_args(bs),
+                            other_args=_build_spec_server_args(max_dynamic_bs),
                             env=launch_env,
                         )
-                        urls_by_bs[int(bs)] = dflash_url
-                        procs_by_bs[int(bs)] = proc
+                        for bs in dynamic_block_sizes:
+                            urls_by_bs[int(bs)] = dflash_url
+                            procs_by_bs[int(bs)] = proc
                         print(
-                            f"[dynamic] launched bs={bs} server at {dflash_url} "
-                            f"(gpu={dynamic_gpu_map.get(bs, 'inherit')})"
+                            f"[dynamic] launched single server at {dflash_url} "
+                            f"(max_bs={max_dynamic_bs}, gpu={dynamic_gpu_map.get(max_dynamic_bs, 'inherit')})"
                         )
+                    else:
+                        for idx, bs in enumerate(dynamic_block_sizes):
+                            dflash_port = find_available_port(port_base + 1 + idx * 10)
+                            dflash_url = f"http://127.0.0.1:{dflash_port}"
+                            launch_env = None
+                            if bs in dynamic_gpu_map:
+                                launch_env = {
+                                    "CUDA_VISIBLE_DEVICES": str(dynamic_gpu_map[bs])
+                                }
+                            proc = popen_launch_server(
+                                args.target_model,
+                                dflash_url,
+                                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                                other_args=_build_spec_server_args(bs),
+                                env=launch_env,
+                            )
+                            urls_by_bs[int(bs)] = dflash_url
+                            procs_by_bs[int(bs)] = proc
+                            print(
+                                f"[dynamic] launched bs={bs} server at {dflash_url} "
+                                f"(gpu={dynamic_gpu_map.get(bs, 'inherit')})"
+                            )
 
+                    warmed_urls: set[str] = set()
                     for bs, dflash_url in sorted(urls_by_bs.items()):
+                        if dflash_url in warmed_urls:
+                            continue
                         _send_generate(
                             dflash_url,
                             "Hello",
@@ -1137,24 +1408,57 @@ def main() -> None:
                             stop=[],
                             timeout_s=min(int(args.timeout_s), 300),
                         )
-                        print(f"[dynamic] warmed server bs={bs}")
+                        warmed_urls.add(dflash_url)
+                        if args.dynamic_single_server:
+                            print(f"[dynamic] warmed single server (max_bs={max(dynamic_block_sizes)})")
+                        else:
+                            print(f"[dynamic] warmed server bs={bs}")
 
                     for conc in concurrencies:
                         n = num_questions_by_conc[conc]
+                        flushed_urls: set[str] = set()
                         for bs, dflash_url in sorted(urls_by_bs.items()):
+                            if dflash_url in flushed_urls:
+                                continue
                             _flush_cache(dflash_url)
-                            print(f"[dynamic] flushed bs={bs} cache before conc={conc}")
+                            flushed_urls.add(dflash_url)
+                            if args.dynamic_single_server:
+                                print(f"[dynamic] flushed single server cache before conc={conc}")
+                            else:
+                                print(f"[dynamic] flushed bs={bs} cache before conc={conc}")
 
-                        controller = DynamicBlockEWMAController(
-                            candidates=dynamic_block_sizes,
+                        batch_sizes_for_conc = (
+                            sorted(
+                                {
+                                    int(x)
+                                    for x in (
+                                        dynamic_batch_sizes if dynamic_batch_sizes else [int(conc)]
+                                    )
+                                    if 1 <= int(x) <= int(conc)
+                                }
+                            )
+                            or [int(conc)]
+                        )
+
+                        controller = DynamicAdaptiveController(
+                            block_sizes=dynamic_block_sizes,
+                            batch_sizes=batch_sizes_for_conc,
+                            policy=str(args.dynamic_policy),
                             ewma_alpha=float(args.dynamic_ewma_alpha),
+                            exploration_c=float(args.dynamic_exploration_c),
                             switch_margin=float(args.dynamic_switch_margin),
                             required_streak=int(args.dynamic_required_streak),
                             warmup_chunks=int(args.dynamic_warmup_chunks),
                             probe_interval=int(args.dynamic_probe_interval),
                         )
 
-                        metrics, chunk_records, usage = _run_dynamic_spec(
+                        (
+                            metrics,
+                            chunk_records,
+                            usage,
+                            batch_usage,
+                            arm_usage,
+                        ) = _run_dynamic_spec(
                             urls_by_bs=urls_by_bs,
                             prompts=prompts[:n],
                             max_new_tokens=int(args.max_new_tokens),
@@ -1164,6 +1468,9 @@ def main() -> None:
                             timeout_s=int(args.timeout_s),
                             controller=controller,
                             score_metric=str(args.dynamic_score_metric),
+                            send_runtime_block_size_param=bool(
+                                args.dynamic_single_server
+                            ),
                             trace_fp=call_trace_fp,
                             trace_common={
                                 "mode": "speculative_dynamic",
@@ -1182,6 +1489,8 @@ def main() -> None:
                         dflash_accept_len[(backend, conc)] = metrics.spec_accept_length
                         dflash_metrics[(backend, conc)] = metrics
                         dynamic_usage_counts[(backend, conc)] = usage
+                        dynamic_batch_usage_counts[(backend, conc)] = batch_usage
+                        dynamic_arm_usage_counts[(backend, conc)] = arm_usage
                         dynamic_chunk_logs[(backend, conc)] = chunk_records
 
                         verify_calls_per_s = (
@@ -1197,6 +1506,9 @@ def main() -> None:
                         usage_str = ", ".join(
                             [f"bs{b}:{usage.get(b, 0)}" for b in sorted(dynamic_block_sizes)]
                         )
+                        batch_usage_str = ", ".join(
+                            [f"b{b}:{batch_usage.get(b, 0)}" for b in sorted(batch_sizes_for_conc)]
+                        )
                         print(
                             f"[{spec_algo}-dynamic] conc={conc:>2} n={n:<4} "
                             f"toks/s={metrics.output_toks_per_s:,.2f} "
@@ -1205,10 +1517,15 @@ def main() -> None:
                             f"accept_rate={_fmt_opt(metrics.spec_accept_rate, '.3f')} "
                             f"verify/s={_fmt_opt(verify_calls_per_s, ',.2f')} "
                             f"draft_tok/s={_fmt_opt(draft_tokens_per_s, ',.2f')} "
-                            f"usage=[{usage_str}]"
+                            f"bs_usage=[{usage_str}] "
+                            f"batch_usage=[{batch_usage_str}]"
                         )
                 finally:
+                    stopped_pids: set[int] = set()
                     for bs, proc in procs_by_bs.items():
+                        if proc.pid in stopped_pids:
+                            continue
+                        stopped_pids.add(proc.pid)
                         try:
                             kill_process_tree(proc.pid)
                         except Exception:
@@ -1233,6 +1550,7 @@ def main() -> None:
                         max_new_tokens=8,
                         stop=[],
                         timeout_s=min(int(args.timeout_s), 300),
+                        sampling_custom_params=request_custom_params,
                     )
 
                     for conc in concurrencies:
@@ -1250,6 +1568,7 @@ def main() -> None:
                             stop=[],
                             timeout_s=int(args.timeout_s),
                             expect_dflash=True,
+                            sampling_custom_params=request_custom_params,
                             trace_fp=call_trace_fp,
                             trace_common={
                                 "mode": "speculative",
@@ -1308,12 +1627,21 @@ def main() -> None:
     md_lines.append(
         f"- speculative_dflash_block_size: `{args.speculative_dflash_block_size}`"
     )
+    md_lines.append(
+        f"- request_dflash_block_size: `{args.request_dflash_block_size}`"
+    )
     md_lines.append(f"- dynamic_mode: `{bool(dynamic_mode)}`")
     md_lines.append(
         f"- dynamic_block_sizes: `{', '.join(str(x) for x in dynamic_block_sizes) if dynamic_block_sizes else ''}`"
     )
+    md_lines.append(
+        f"- dynamic_batch_sizes: `{', '.join(str(x) for x in dynamic_batch_sizes) if dynamic_batch_sizes else ''}`"
+    )
+    md_lines.append(f"- dynamic_policy: `{args.dynamic_policy}`")
+    md_lines.append(f"- dynamic_single_server: `{bool(args.dynamic_single_server)}`")
     md_lines.append(f"- dynamic_gpu_map: `{args.dynamic_gpu_map}`")
     md_lines.append(f"- dynamic_ewma_alpha: `{args.dynamic_ewma_alpha}`")
+    md_lines.append(f"- dynamic_exploration_c: `{args.dynamic_exploration_c}`")
     md_lines.append(f"- dynamic_switch_margin: `{args.dynamic_switch_margin}`")
     md_lines.append(f"- dynamic_required_streak: `{args.dynamic_required_streak}`")
     md_lines.append(f"- dynamic_warmup_chunks: `{args.dynamic_warmup_chunks}`")
@@ -1414,6 +1742,32 @@ def main() -> None:
                     continue
                 usage_str = ", ".join(
                     [f"bs{b}:{usage.get(b, 0)}" for b in sorted(dynamic_block_sizes)]
+                )
+                md_lines.append(f"| {c} | {usage_str} |")
+            md_lines.append("")
+
+            md_lines.append("### DFLASH dynamic batch usage (chunk counts)")
+            md_lines.append("| conc | usage |")
+            md_lines.append("| --- | --- |")
+            for c in concurrencies:
+                usage = dynamic_batch_usage_counts.get((backend, c))
+                if not usage:
+                    md_lines.append(f"| {c} | N/A |")
+                    continue
+                usage_str = ", ".join([f"b{k}:{v}" for k, v in sorted(usage.items())])
+                md_lines.append(f"| {c} | {usage_str} |")
+            md_lines.append("")
+
+            md_lines.append("### DFLASH dynamic arm usage (block,batch chunk counts)")
+            md_lines.append("| conc | usage |")
+            md_lines.append("| --- | --- |")
+            for c in concurrencies:
+                usage = dynamic_arm_usage_counts.get((backend, c))
+                if not usage:
+                    md_lines.append(f"| {c} | N/A |")
+                    continue
+                usage_str = ", ".join(
+                    [f"(bs{bs},b{bz}):{ct}" for (bs, bz), ct in sorted(usage.items())]
                 )
                 md_lines.append(f"| {c} | {usage_str} |")
             md_lines.append("")
