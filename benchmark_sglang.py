@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 import json
+import os
 import shlex
 import time
 import statistics
@@ -224,6 +225,14 @@ def _run_bench_requests(
             "target_verify_time_s",
             "target_verify_time",
         ],
+        "draft_time_per_cycle_s": [
+            "spec_draft_time_per_cycle_s",
+            "draft_time_per_cycle_s",
+        ],
+        "verify_time_per_cycle_s": [
+            "spec_verify_time_per_cycle_s",
+            "verify_time_per_cycle_s",
+        ],
     }
     extra_timing_samples: dict[str, list[float]] = defaultdict(list)
 
@@ -275,6 +284,12 @@ def _run_bench_requests(
         if trace_fp is not None:
             draft_time_s = _extract_float(meta, extra_timing_fields["draft_time_s"])
             verify_time_s = _extract_float(meta, extra_timing_fields["verify_time_s"])
+            draft_time_per_cycle_s = _extract_float(
+                meta, extra_timing_fields["draft_time_per_cycle_s"]
+            )
+            verify_time_per_cycle_s = _extract_float(
+                meta, extra_timing_fields["verify_time_per_cycle_s"]
+            )
             row = dict(trace_common or {})
             row.update(
                 {
@@ -291,6 +306,8 @@ def _run_bench_requests(
                     "decode_throughput_tok_s": _extract_float(meta, ["decode_throughput"]),
                     "draft_time_s": draft_time_s,
                     "verify_time_s": verify_time_s,
+                    "draft_time_per_cycle_s": draft_time_per_cycle_s,
+                    "verify_time_per_cycle_s": verify_time_per_cycle_s,
                     "client_request_wall_s": client_request_wall_s,
                     "client_batch_wall_s": client_batch_wall_s,
                     "client_batch_size": client_batch_size,
@@ -498,6 +515,11 @@ def main() -> None:
         action="store_true",
         help="Pass --enable-metrics to SGLang server so response meta_info includes extra timing fields like inference_time/decode_throughput.",
     )
+    parser.add_argument(
+        "--enable-dflash-stage-timing",
+        action="store_true",
+        help="Set SGLANG_DFLASH_REPORT_TIMING=1 for launched servers so DFLASH reports attributed draft/verify timing fields in meta_info.",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--timeout-s", type=int, default=3600)
     parser.add_argument("--mem-fraction-static", type=float, default=0.75)
@@ -535,6 +557,10 @@ def main() -> None:
         help="Comma-separated list. Will auto-skip fa3 unless SM90 (Hopper), and fa4 unless SM100+ (Blackwell).",
     )
     args = parser.parse_args()
+
+    if args.enable_dflash_stage_timing:
+        os.environ["SGLANG_DFLASH_REPORT_TIMING"] = "1"
+        print("[setup] enabled SGLANG_DFLASH_REPORT_TIMING=1 for launched SGLang servers")
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this sweep.")
@@ -822,6 +848,9 @@ def main() -> None:
     md_lines.append(f"- speculative_num_steps: `{args.speculative_num_steps}`")
     md_lines.append(f"- speculative_eagle_topk: `{args.speculative_eagle_topk}`")
     md_lines.append(f"- disable_overlap_schedule: `{bool(args.disable_overlap_schedule)}`")
+    md_lines.append(
+        f"- enable_dflash_stage_timing: `{bool(args.enable_dflash_stage_timing)}`"
+    )
     md_lines.append(f"- enable_server_metrics: `{bool(args.enable_server_metrics)}`")
     md_lines.append(f"- server_extra_args: `{args.server_extra_args}`")
     md_lines.append(f"- save_call_trace_path: `{args.save_call_trace_path}`")
@@ -1116,6 +1145,48 @@ def main() -> None:
                 values={
                     c: (
                         dflash_metrics[(backend, c)].extra_timing_avgs_s.get("verify_time_s")
+                        if (backend, c) in dflash_metrics
+                        else None
+                    )
+                    for c in concurrencies
+                },
+                float_fmt=".6f",
+            )
+        )
+        md_lines.append("")
+
+        md_lines.append(
+            "### DFLASH reported draft time per cycle avg (s, if exposed by server)"
+        )
+        md_lines.append(
+            _format_table(
+                concurrencies=concurrencies,
+                values={
+                    c: (
+                        dflash_metrics[(backend, c)].extra_timing_avgs_s.get(
+                            "draft_time_per_cycle_s"
+                        )
+                        if (backend, c) in dflash_metrics
+                        else None
+                    )
+                    for c in concurrencies
+                },
+                float_fmt=".6f",
+            )
+        )
+        md_lines.append("")
+
+        md_lines.append(
+            "### DFLASH reported verify time per cycle avg (s, if exposed by server)"
+        )
+        md_lines.append(
+            _format_table(
+                concurrencies=concurrencies,
+                values={
+                    c: (
+                        dflash_metrics[(backend, c)].extra_timing_avgs_s.get(
+                            "verify_time_per_cycle_s"
+                        )
                         if (backend, c) in dflash_metrics
                         else None
                     )
