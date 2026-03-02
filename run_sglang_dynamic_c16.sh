@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Dynamic DFLASH block-size experiment focused on concurrency=16.
-# Designed for a 2xA100 pod where each block-size server can live on a separate GPU.
+# True server-side adaptive DFLASH block-size experiment focused on concurrency=16.
+# This uses one SGLang DFLASH server and lets the worker adapt runtime block size
+# per request from acceptance history.
 #
 # Example:
 #   RUN_TAG=sg_dynamic_c16_$(date +%Y%m%d_%H%M%S) bash run_sglang_dynamic_c16.sh
@@ -22,15 +23,14 @@ TIMEOUT_S="${TIMEOUT_S:-3600}"
 RUN_BASELINE="${RUN_BASELINE:-1}"
 BATCH_REQUESTS="${BATCH_REQUESTS:-1}"
 
-DYNAMIC_BLOCK_SIZES="${DYNAMIC_BLOCK_SIZES:-1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16}"
-# Single-server dynamic mode: only max block-size entry is used if provided.
-DYNAMIC_GPU_MAP="${DYNAMIC_GPU_MAP:-}"
-DYNAMIC_EWMA_ALPHA="${DYNAMIC_EWMA_ALPHA:-0.20}"
-DYNAMIC_SWITCH_MARGIN="${DYNAMIC_SWITCH_MARGIN:-0.02}"
-DYNAMIC_REQUIRED_STREAK="${DYNAMIC_REQUIRED_STREAK:-2}"
-DYNAMIC_WARMUP_CHUNKS="${DYNAMIC_WARMUP_CHUNKS:-4}"
-DYNAMIC_PROBE_INTERVAL="${DYNAMIC_PROBE_INTERVAL:-8}"
-DYNAMIC_SCORE_METRIC="${DYNAMIC_SCORE_METRIC:-output_toks_per_s}"
+DFLASH_BLOCK_SIZE="${DFLASH_BLOCK_SIZE:-16}"
+ADAPTIVE_ENABLED="${ADAPTIVE_ENABLED:-1}"
+ADAPTIVE_RHO="${ADAPTIVE_RHO:-0.30}"
+ADAPTIVE_DELTA="${ADAPTIVE_DELTA:-1.0}"
+ADAPTIVE_K_MIN="${ADAPTIVE_K_MIN:-1}"
+ADAPTIVE_K_MAX="${ADAPTIVE_K_MAX:-16}"
+ADAPTIVE_LOW_ACCEPT_THRESHOLD="${ADAPTIVE_LOW_ACCEPT_THRESHOLD:-0.35}"
+ADAPTIVE_LOW_ACCEPT_STREAK="${ADAPTIVE_LOW_ACCEPT_STREAK:-2}"
 
 RUN_TAG="${RUN_TAG:-sglang_dynamic_c16_$(date +%Y%m%d_%H%M%S)}"
 LOG_DIR="${LOG_DIR:-logs/${RUN_TAG}}"
@@ -54,20 +54,22 @@ cmd=(
   --max-running-requests "${MAX_RUNNING_REQUESTS}"
   --timeout-s "${TIMEOUT_S}"
   --speculative-algorithm DFLASH
-  --dynamic-single-server
-  --dynamic-block-sizes "${DYNAMIC_BLOCK_SIZES}"
-  --dynamic-gpu-map "${DYNAMIC_GPU_MAP}"
-  --dynamic-ewma-alpha "${DYNAMIC_EWMA_ALPHA}"
-  --dynamic-switch-margin "${DYNAMIC_SWITCH_MARGIN}"
-  --dynamic-required-streak "${DYNAMIC_REQUIRED_STREAK}"
-  --dynamic-warmup-chunks "${DYNAMIC_WARMUP_CHUNKS}"
-  --dynamic-probe-interval "${DYNAMIC_PROBE_INTERVAL}"
-  --dynamic-score-metric "${DYNAMIC_SCORE_METRIC}"
+  --speculative-dflash-block-size "${DFLASH_BLOCK_SIZE}"
+  --speculative-dflash-adaptive-rho "${ADAPTIVE_RHO}"
+  --speculative-dflash-adaptive-delta "${ADAPTIVE_DELTA}"
+  --speculative-dflash-adaptive-k-min "${ADAPTIVE_K_MIN}"
+  --speculative-dflash-adaptive-k-max "${ADAPTIVE_K_MAX}"
+  --speculative-dflash-adaptive-low-accept-threshold "${ADAPTIVE_LOW_ACCEPT_THRESHOLD}"
+  --speculative-dflash-adaptive-low-accept-streak "${ADAPTIVE_LOW_ACCEPT_STREAK}"
   --enable-server-metrics
   --enable-dflash-stage-timing
   --save-call-trace-path "${OUT_TRACE}"
   --output-md "${OUT_MD}"
 )
+
+if [[ "${ADAPTIVE_ENABLED}" == "1" ]]; then
+  cmd+=(--speculative-dflash-adaptive-block-size)
+fi
 
 if [[ "${BATCH_REQUESTS}" == "1" ]]; then
   cmd+=(--batch-requests)

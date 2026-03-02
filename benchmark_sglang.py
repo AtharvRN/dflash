@@ -910,16 +910,57 @@ def main() -> None:
         help="Optional per-request runtime DFLASH block size sent via sampling_params.custom_params['dflash_block_size'] (DFLASH only).",
     )
     parser.add_argument(
+        "--speculative-dflash-adaptive-block-size",
+        action="store_true",
+        help="Enable true server-side adaptive DFLASH block size (per-request state updated each verify cycle).",
+    )
+    parser.add_argument(
+        "--speculative-dflash-adaptive-rho",
+        type=float,
+        default=0.30,
+        help="Server-side DFLASH adaptive EWMA rho.",
+    )
+    parser.add_argument(
+        "--speculative-dflash-adaptive-delta",
+        type=float,
+        default=1.0,
+        help="Server-side DFLASH adaptive growth delta.",
+    )
+    parser.add_argument(
+        "--speculative-dflash-adaptive-k-min",
+        type=int,
+        default=None,
+        help="Server-side DFLASH adaptive minimum block size.",
+    )
+    parser.add_argument(
+        "--speculative-dflash-adaptive-k-max",
+        type=int,
+        default=None,
+        help="Server-side DFLASH adaptive maximum block size.",
+    )
+    parser.add_argument(
+        "--speculative-dflash-adaptive-low-accept-threshold",
+        type=float,
+        default=0.35,
+        help="Server-side DFLASH adaptive immediate fallback threshold on acceptance ratio.",
+    )
+    parser.add_argument(
+        "--speculative-dflash-adaptive-low-accept-streak",
+        type=int,
+        default=2,
+        help="Server-side DFLASH adaptive consecutive low-accept cycles before one-step fallback.",
+    )
+    parser.add_argument(
         "--dynamic-block-sizes",
         type=str,
         default="",
-        help="Optional comma-separated DFLASH block sizes (e.g. 8,12,16). Dynamic mode runs on a single speculative server and sends per-chunk runtime dflash_block_size via request custom_params.",
+        help="Deprecated. Legacy benchmark-side dynamic routing removed; use server-side DFLASH adaptive flags instead.",
     )
     parser.add_argument(
         "--dynamic-batch-sizes",
         type=str,
         default="",
-        help="Optional comma-separated client batch sizes used by dynamic mode (e.g. 4,8,16). If empty, uses fixed batch size equal to concurrency.",
+        help="Deprecated. Legacy benchmark-side dynamic routing removed; use server-side DFLASH adaptive flags instead.",
     )
     parser.add_argument(
         "--dynamic-policy",
@@ -932,12 +973,12 @@ def main() -> None:
         "--dynamic-gpu-map",
         type=str,
         default="",
-        help="Optional bs:gpu_id map for dynamic servers (e.g. 8:0,16:1). If omitted, inherits current CUDA_VISIBLE_DEVICES.",
+        help="Deprecated. Legacy benchmark-side dynamic routing removed; use server-side DFLASH adaptive flags instead.",
     )
     parser.add_argument(
         "--dynamic-single-server",
         action="store_true",
-        help="Run dynamic mode on one server launched at max(dynamic block sizes), passing per-chunk dflash_block_size through request custom params.",
+        help="Deprecated. Legacy benchmark-side dynamic routing removed; use server-side DFLASH adaptive flags instead.",
     )
     parser.add_argument(
         "--dynamic-ewma-alpha",
@@ -1068,19 +1109,25 @@ def main() -> None:
         os.environ["SGLANG_DFLASH_REPORT_TIMING"] = "1"
         print("[setup] enabled SGLANG_DFLASH_REPORT_TIMING=1 for launched SGLang servers")
 
-    dynamic_block_sizes = (
-        sorted({int(x) for x in _parse_int_csv(args.dynamic_block_sizes)})
-        if args.dynamic_block_sizes.strip()
-        else []
-    )
-    dynamic_batch_sizes = (
-        sorted({int(x) for x in _parse_int_csv(args.dynamic_batch_sizes)})
-        if args.dynamic_batch_sizes.strip()
-        else []
-    )
-    dynamic_mode = len(dynamic_block_sizes) > 0
-    dynamic_gpu_map = _parse_dynamic_gpu_map(args.dynamic_gpu_map)
+    dynamic_block_sizes: list[int] = []
+    dynamic_batch_sizes: list[int] = []
+    dynamic_mode = False
+    dynamic_gpu_map: dict[int, str] = {}
     request_dflash_block_size: Optional[int] = None
+
+    # Legacy client-side dynamic routing is intentionally retired in favor of
+    # true server-side adaptive DFLASH block size.
+    if (
+        args.dynamic_block_sizes.strip()
+        or args.dynamic_batch_sizes.strip()
+        or args.dynamic_gpu_map.strip()
+        or args.dynamic_single_server
+    ):
+        raise RuntimeError(
+            "Legacy benchmark-side dynamic block-size routing was removed. "
+            "Use server-side adaptive mode with "
+            "--speculative-dflash-adaptive-block-size and related flags."
+        )
 
     if args.request_dflash_block_size is not None:
         req_bs = int(args.request_dflash_block_size)
@@ -1096,45 +1143,10 @@ def main() -> None:
         else:
             request_dflash_block_size = req_bs
 
-    if dynamic_mode:
-        if args.speculative_algorithm.upper() != "DFLASH":
-            raise RuntimeError("--dynamic-block-sizes is currently supported only with --speculative-algorithm DFLASH.")
-        if len(dynamic_block_sizes) < 2:
-            raise RuntimeError("Dynamic mode requires at least two block sizes.")
-        if not args.dynamic_single_server:
-            print(
-                "[warn] Multi-server dynamic routing has been removed. "
-                "Forcing single-server dynamic mode.",
-                flush=True,
-            )
-            args.dynamic_single_server = True
-        if args.speculative_dflash_block_size is not None:
-            print(
-                "[warn] --speculative-dflash-block-size is ignored in dynamic mode; using --dynamic-block-sizes.",
-                flush=True,
-            )
-        if request_dflash_block_size is not None:
-            print(
-                "[warn] --request-dflash-block-size is ignored in --dynamic-single-server mode "
-                "(controller-selected block size is sent per chunk).",
-                flush=True,
-            )
-            request_dflash_block_size = None
-        if dynamic_gpu_map:
-            max_bs = max(dynamic_block_sizes)
-            ignored = sorted(bs for bs in dynamic_gpu_map.keys() if bs != max_bs)
-            if ignored:
-                print(
-                    f"[warn] --dynamic-single-server ignores --dynamic-gpu-map entries for non-max block sizes: {ignored}",
-                    flush=True,
-                )
-        invalid_batch_sizes = [b for b in dynamic_batch_sizes if b < 1]
-        if invalid_batch_sizes:
-            raise RuntimeError(f"Invalid dynamic batch sizes: {invalid_batch_sizes}")
-    elif dynamic_batch_sizes:
-        raise RuntimeError("--dynamic-batch-sizes requires --dynamic-block-sizes.")
-    elif args.dynamic_single_server:
-        raise RuntimeError("--dynamic-single-server requires --dynamic-block-sizes.")
+    if args.speculative_dflash_adaptive_block_size and args.speculative_algorithm.upper() != "DFLASH":
+        raise RuntimeError(
+            "--speculative-dflash-adaptive-block-size is only valid with --speculative-algorithm DFLASH."
+        )
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this sweep.")
@@ -1343,6 +1355,39 @@ def main() -> None:
                     spec_server_args.extend(
                         ["--speculative-eagle-topk", str(int(args.speculative_eagle_topk))]
                     )
+                if (
+                    spec_algo == "DFLASH"
+                    and bool(args.speculative_dflash_adaptive_block_size)
+                ):
+                    spec_server_args.extend(
+                        ["--speculative-dflash-adaptive-block-size"]
+                    )
+                    spec_server_args.extend(
+                        [
+                            "--speculative-dflash-adaptive-rho",
+                            str(float(args.speculative_dflash_adaptive_rho)),
+                            "--speculative-dflash-adaptive-delta",
+                            str(float(args.speculative_dflash_adaptive_delta)),
+                            "--speculative-dflash-adaptive-low-accept-threshold",
+                            str(float(args.speculative_dflash_adaptive_low_accept_threshold)),
+                            "--speculative-dflash-adaptive-low-accept-streak",
+                            str(int(args.speculative_dflash_adaptive_low_accept_streak)),
+                        ]
+                    )
+                    if args.speculative_dflash_adaptive_k_min is not None:
+                        spec_server_args.extend(
+                            [
+                                "--speculative-dflash-adaptive-k-min",
+                                str(int(args.speculative_dflash_adaptive_k_min)),
+                            ]
+                        )
+                    if args.speculative_dflash_adaptive_k_max is not None:
+                        spec_server_args.extend(
+                            [
+                                "--speculative-dflash-adaptive-k-max",
+                                str(int(args.speculative_dflash_adaptive_k_max)),
+                            ]
+                        )
                 return spec_server_args
 
             if dynamic_mode:
@@ -1591,6 +1636,27 @@ def main() -> None:
     )
     md_lines.append(
         f"- request_dflash_block_size: `{args.request_dflash_block_size}`"
+    )
+    md_lines.append(
+        f"- speculative_dflash_adaptive_block_size: `{bool(args.speculative_dflash_adaptive_block_size)}`"
+    )
+    md_lines.append(
+        f"- speculative_dflash_adaptive_rho: `{args.speculative_dflash_adaptive_rho}`"
+    )
+    md_lines.append(
+        f"- speculative_dflash_adaptive_delta: `{args.speculative_dflash_adaptive_delta}`"
+    )
+    md_lines.append(
+        f"- speculative_dflash_adaptive_k_min: `{args.speculative_dflash_adaptive_k_min}`"
+    )
+    md_lines.append(
+        f"- speculative_dflash_adaptive_k_max: `{args.speculative_dflash_adaptive_k_max}`"
+    )
+    md_lines.append(
+        f"- speculative_dflash_adaptive_low_accept_threshold: `{args.speculative_dflash_adaptive_low_accept_threshold}`"
+    )
+    md_lines.append(
+        f"- speculative_dflash_adaptive_low_accept_streak: `{args.speculative_dflash_adaptive_low_accept_streak}`"
     )
     md_lines.append(f"- dynamic_mode: `{bool(dynamic_mode)}`")
     md_lines.append(
