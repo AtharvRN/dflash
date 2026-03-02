@@ -118,6 +118,21 @@ class BenchMetrics:
     extra_timing_avgs_s: dict[str, Optional[float]]
 
 
+@dataclass
+class DynamicChunkRecord:
+    chunk_idx: int
+    block_size: int
+    request_count: int
+    output_tokens: int
+    latency_s: float
+    output_toks_per_s: float
+    tau: Optional[float]
+    accept_rate: Optional[float]
+    verify_calls: int
+    drafted_tokens: int
+    accepted_tokens: int
+
+
 def _mean_or_none(values: list[float]) -> Optional[float]:
     if not values:
         return None
@@ -432,6 +447,263 @@ def _format_table(
     return "\n".join(lines)
 
 
+def _parse_int_csv(s: str) -> list[int]:
+    vals = [int(x.strip()) for x in str(s).split(",") if x.strip()]
+    return vals
+
+
+def _parse_dynamic_gpu_map(s: str) -> dict[int, str]:
+    out: dict[int, str] = {}
+    raw = str(s).strip()
+    if not raw:
+        return out
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(f"Invalid --dynamic-gpu-map entry '{item}'. Expected bs:gpu_id.")
+        bs_str, gpu_str = item.split(":", 1)
+        bs = int(bs_str.strip())
+        gpu = gpu_str.strip()
+        if not gpu:
+            raise ValueError(f"Invalid --dynamic-gpu-map entry '{item}'. GPU id cannot be empty.")
+        out[bs] = gpu
+    return out
+
+
+class DynamicBlockEWMAController:
+    def __init__(
+        self,
+        *,
+        candidates: list[int],
+        ewma_alpha: float,
+        switch_margin: float,
+        required_streak: int,
+        warmup_chunks: int,
+        probe_interval: int,
+    ) -> None:
+        self.candidates = sorted({int(x) for x in candidates})
+        if not self.candidates:
+            raise ValueError("No dynamic block-size candidates provided.")
+        if not (0.0 < float(ewma_alpha) <= 1.0):
+            raise ValueError("dynamic-ewma-alpha must be in (0, 1].")
+        self.ewma_alpha = float(ewma_alpha)
+        self.switch_margin = float(max(0.0, switch_margin))
+        self.required_streak = int(max(1, required_streak))
+        self.warmup_chunks = int(max(0, warmup_chunks))
+        self.probe_interval = int(max(0, probe_interval))
+
+        self.current = self.candidates[-1]
+        self.score_hat: dict[int, Optional[float]] = {b: None for b in self.candidates}
+        self.obs_count: dict[int, int] = {b: 0 for b in self.candidates}
+        self.pending_target = self.current
+        self.pending_streak = 0
+        self.probe_cursor = 0
+
+    def _ewma(self, old: Optional[float], new: float) -> float:
+        if old is None:
+            return float(new)
+        return float((1.0 - self.ewma_alpha) * old + self.ewma_alpha * float(new))
+
+    def _next_probe(self) -> int:
+        for _ in range(len(self.candidates)):
+            b = self.candidates[self.probe_cursor % len(self.candidates)]
+            self.probe_cursor += 1
+            if b != self.current:
+                return b
+        return self.current
+
+    def select(self, chunk_idx: int) -> int:
+        if chunk_idx < self.warmup_chunks:
+            return self.candidates[chunk_idx % len(self.candidates)]
+        if self.probe_interval > 0:
+            since_warmup = chunk_idx - self.warmup_chunks
+            if since_warmup >= 0 and (since_warmup % self.probe_interval == 0):
+                return self._next_probe()
+        return self.current
+
+    def update(self, *, block_size: int, score: float) -> None:
+        b = int(block_size)
+        if b not in self.score_hat:
+            return
+        self.score_hat[b] = self._ewma(self.score_hat[b], float(score))
+        self.obs_count[b] += 1
+
+        scored = [(k, v) for k, v in self.score_hat.items() if v is not None]
+        if not scored:
+            return
+        best_b, best_score = max(scored, key=lambda x: x[1])
+        cur_score = self.score_hat.get(self.current)
+        if cur_score is None:
+            self.current = best_b
+            self.pending_target = self.current
+            self.pending_streak = 0
+            return
+
+        rel_improvement = (best_score - cur_score) / max(abs(cur_score), 1e-12)
+        eligible = best_b != self.current and rel_improvement > self.switch_margin
+        if not eligible:
+            self.pending_target = self.current
+            self.pending_streak = 0
+            return
+
+        if self.pending_target == best_b:
+            self.pending_streak += 1
+        else:
+            self.pending_target = best_b
+            self.pending_streak = 1
+
+        if self.pending_streak >= self.required_streak:
+            self.current = best_b
+            self.pending_target = self.current
+            self.pending_streak = 0
+
+
+def _aggregate_bench_metrics(metrics_list: list[BenchMetrics]) -> BenchMetrics:
+    if not metrics_list:
+        raise ValueError("Cannot aggregate empty metrics list.")
+
+    total_latency = float(sum(m.latency_s for m in metrics_list))
+    total_requests = int(sum(m.request_count for m in metrics_list))
+    total_tokens = int(sum(m.output_tokens for m in metrics_list))
+    total_verify_ct = int(sum(m.spec_verify_ct_sum for m in metrics_list))
+    total_accept_tokens = int(sum(m.spec_accept_token_sum for m in metrics_list))
+    total_draft_tokens = int(sum(m.spec_draft_token_sum for m in metrics_list))
+
+    def _wavg(attr: str) -> Optional[float]:
+        num = 0.0
+        den = 0.0
+        for m in metrics_list:
+            v = getattr(m, attr)
+            if v is None:
+                continue
+            w = float(max(1, m.request_count))
+            num += float(v) * w
+            den += w
+        return None if den <= 0.0 else float(num / den)
+
+    all_extra_keys: set[str] = set()
+    for m in metrics_list:
+        all_extra_keys.update(m.extra_timing_avgs_s.keys())
+    extra_timing_avgs: dict[str, Optional[float]] = {}
+    for key in sorted(all_extra_keys):
+        num = 0.0
+        den = 0.0
+        for m in metrics_list:
+            v = m.extra_timing_avgs_s.get(key)
+            if v is None:
+                continue
+            w = float(max(1, m.request_count))
+            num += float(v) * w
+            den += w
+        extra_timing_avgs[key] = None if den <= 0.0 else float(num / den)
+
+    return BenchMetrics(
+        latency_s=total_latency,
+        request_count=total_requests,
+        output_tokens=total_tokens,
+        output_toks_per_s=(float(total_tokens) / max(total_latency, 1e-6)),
+        spec_accept_length=_wavg("spec_accept_length"),
+        spec_verify_ct_sum=total_verify_ct,
+        spec_accept_rate=_wavg("spec_accept_rate"),
+        spec_accept_token_sum=total_accept_tokens,
+        spec_draft_token_sum=total_draft_tokens,
+        e2e_latency_avg_s=_wavg("e2e_latency_avg_s"),
+        e2e_latency_p50_s=_wavg("e2e_latency_p50_s"),
+        e2e_latency_p95_s=_wavg("e2e_latency_p95_s"),
+        inference_time_avg_s=_wavg("inference_time_avg_s"),
+        decode_throughput_avg_tok_s=_wavg("decode_throughput_avg_tok_s"),
+        extra_timing_avgs_s=extra_timing_avgs,
+    )
+
+
+def _run_dynamic_spec(
+    *,
+    urls_by_bs: dict[int, str],
+    prompts: list[str],
+    max_new_tokens: int,
+    concurrency: int,
+    batch_requests: bool,
+    stop: list[str],
+    timeout_s: int,
+    controller: DynamicBlockEWMAController,
+    score_metric: str,
+    trace_fp: Optional[TextIO],
+    trace_common: Optional[dict],
+    trace_include_prompt: bool,
+    trace_include_raw_meta: bool,
+) -> tuple[BenchMetrics, list[DynamicChunkRecord], dict[int, int]]:
+    if not urls_by_bs:
+        raise ValueError("Dynamic spec requires at least one block-size server URL.")
+
+    chunk_size = max(1, int(concurrency))
+    chunk_records: list[DynamicChunkRecord] = []
+    metrics_accum: list[BenchMetrics] = []
+    usage_counts: dict[int, int] = {int(k): 0 for k in sorted(urls_by_bs.keys())}
+
+    for chunk_idx, start_idx in enumerate(range(0, len(prompts), chunk_size)):
+        chunk_prompts = prompts[start_idx : start_idx + chunk_size]
+        if not chunk_prompts:
+            continue
+        chosen_bs = int(controller.select(chunk_idx))
+        if chosen_bs not in urls_by_bs:
+            # Safety fallback if controller selects a candidate not provisioned.
+            chosen_bs = max(urls_by_bs.keys())
+        usage_counts[chosen_bs] = usage_counts.get(chosen_bs, 0) + 1
+
+        m = _run_bench_requests(
+            urls_by_bs[chosen_bs],
+            prompts=chunk_prompts,
+            max_new_tokens=max_new_tokens,
+            concurrency=chunk_size,
+            batch_requests=batch_requests,
+            stop=stop,
+            timeout_s=timeout_s,
+            expect_dflash=True,
+            trace_fp=trace_fp,
+            trace_common={
+                **(trace_common or {}),
+                "dynamic_mode": True,
+                "dynamic_block_size": int(chosen_bs),
+                "dynamic_chunk_idx": int(chunk_idx),
+                "dynamic_chunk_size": int(len(chunk_prompts)),
+            },
+            trace_include_prompt=trace_include_prompt,
+            trace_include_raw_meta=trace_include_raw_meta,
+        )
+        metrics_accum.append(m)
+        chunk_records.append(
+            DynamicChunkRecord(
+                chunk_idx=int(chunk_idx),
+                block_size=int(chosen_bs),
+                request_count=int(m.request_count),
+                output_tokens=int(m.output_tokens),
+                latency_s=float(m.latency_s),
+                output_toks_per_s=float(m.output_toks_per_s),
+                tau=m.spec_accept_length,
+                accept_rate=m.spec_accept_rate,
+                verify_calls=int(m.spec_verify_ct_sum),
+                drafted_tokens=int(m.spec_draft_token_sum),
+                accepted_tokens=int(m.spec_accept_token_sum),
+            )
+        )
+
+        if score_metric == "accepted_toks_per_s":
+            score = float(m.spec_accept_token_sum) / max(float(m.latency_s), 1e-6)
+        elif score_metric == "tau_over_verify":
+            score = (
+                float(m.spec_accept_length) / max(float(m.spec_verify_ct_sum), 1.0)
+                if m.spec_accept_length is not None
+                else 0.0
+            )
+        else:
+            score = float(m.output_toks_per_s)
+        controller.update(block_size=chosen_bs, score=float(score))
+
+    return _aggregate_bench_metrics(metrics_accum), chunk_records, usage_counts
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -480,6 +752,55 @@ def main() -> None:
         type=int,
         default=None,
         help="DFLASH only. Sets --speculative-dflash-block-size on server.",
+    )
+    parser.add_argument(
+        "--dynamic-block-sizes",
+        type=str,
+        default="",
+        help="Optional comma-separated DFLASH block sizes (e.g. 8,16). If set, launches one speculative server per block size and routes chunks dynamically.",
+    )
+    parser.add_argument(
+        "--dynamic-gpu-map",
+        type=str,
+        default="",
+        help="Optional bs:gpu_id map for dynamic servers (e.g. 8:0,16:1). If omitted, inherits current CUDA_VISIBLE_DEVICES.",
+    )
+    parser.add_argument(
+        "--dynamic-ewma-alpha",
+        type=float,
+        default=0.20,
+        help="EWMA alpha for dynamic block-size controller.",
+    )
+    parser.add_argument(
+        "--dynamic-switch-margin",
+        type=float,
+        default=0.02,
+        help="Minimum relative score gain required to switch dynamic block size.",
+    )
+    parser.add_argument(
+        "--dynamic-required-streak",
+        type=int,
+        default=2,
+        help="Consecutive decisions needed before switching dynamic block size.",
+    )
+    parser.add_argument(
+        "--dynamic-warmup-chunks",
+        type=int,
+        default=4,
+        help="Number of initial chunks used for round-robin probing across candidate block sizes.",
+    )
+    parser.add_argument(
+        "--dynamic-probe-interval",
+        type=int,
+        default=8,
+        help="Periodic probe interval (in chunks) for non-current block sizes; 0 disables probing.",
+    )
+    parser.add_argument(
+        "--dynamic-score-metric",
+        type=str,
+        default="output_toks_per_s",
+        choices=["output_toks_per_s", "accepted_toks_per_s", "tau_over_verify"],
+        help="Objective metric used by dynamic block-size controller.",
     )
     parser.add_argument(
         "--speculative-num-draft-tokens",
@@ -562,6 +883,26 @@ def main() -> None:
         os.environ["SGLANG_DFLASH_REPORT_TIMING"] = "1"
         print("[setup] enabled SGLANG_DFLASH_REPORT_TIMING=1 for launched SGLang servers")
 
+    dynamic_block_sizes = sorted({int(x) for x in _parse_int_csv(args.dynamic_block_sizes)}) if args.dynamic_block_sizes.strip() else []
+    dynamic_mode = len(dynamic_block_sizes) > 0
+    dynamic_gpu_map = _parse_dynamic_gpu_map(args.dynamic_gpu_map)
+
+    if dynamic_mode:
+        if args.speculative_algorithm.upper() != "DFLASH":
+            raise RuntimeError("--dynamic-block-sizes is currently supported only with --speculative-algorithm DFLASH.")
+        if len(dynamic_block_sizes) < 2:
+            raise RuntimeError("Dynamic mode requires at least two block sizes.")
+        if args.speculative_dflash_block_size is not None:
+            print(
+                "[warn] --speculative-dflash-block-size is ignored in dynamic mode; using --dynamic-block-sizes.",
+                flush=True,
+            )
+        missing_gpu_map = [bs for bs in dynamic_block_sizes if bs not in dynamic_gpu_map]
+        if dynamic_gpu_map and missing_gpu_map:
+            raise RuntimeError(
+                f"--dynamic-gpu-map missing entries for block sizes: {missing_gpu_map}"
+            )
+
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this sweep.")
 
@@ -620,6 +961,8 @@ def main() -> None:
     dflash_accept_len: dict[tuple[str, int], Optional[float]] = {}
     baseline_metrics: dict[tuple[str, int], BenchMetrics] = {}
     dflash_metrics: dict[tuple[str, int], BenchMetrics] = {}
+    dynamic_usage_counts: dict[tuple[str, int], dict[int, int]] = {}
+    dynamic_chunk_logs: dict[tuple[str, int], list[DynamicChunkRecord]] = {}
     
     tp = args.tp_size  # Fixed TP size
 
@@ -721,111 +1064,234 @@ def main() -> None:
 
             spec_algo = args.speculative_algorithm.upper()
             print(f"\n=== backend={backend} tp={tp} ({spec_algo}) ===")
-            spec_server_args = [
-                *common_server_args,
-                "--speculative-algorithm",
-                spec_algo,
-            ]
-            if args.draft_model:
-                spec_server_args.extend(
-                    ["--speculative-draft-model-path", args.draft_model]
-                )
-            if args.speculative_dflash_block_size is not None:
-                spec_server_args.extend(
-                    [
-                        "--speculative-dflash-block-size",
-                        str(int(args.speculative_dflash_block_size)),
-                    ]
-                )
-            if args.speculative_num_draft_tokens is not None:
-                spec_server_args.extend(
-                    [
-                        "--speculative-num-draft-tokens",
-                        str(int(args.speculative_num_draft_tokens)),
-                    ]
-                )
-            if args.speculative_num_steps is not None:
-                spec_server_args.extend(
-                    ["--speculative-num-steps", str(int(args.speculative_num_steps))]
-                )
-            if args.speculative_eagle_topk is not None:
-                spec_server_args.extend(
-                    ["--speculative-eagle-topk", str(int(args.speculative_eagle_topk))]
-                )
-            dflash_port = find_available_port(port_base + 1)
-            dflash_url = f"http://127.0.0.1:{dflash_port}"
-            dflash_proc = popen_launch_server(
-                args.target_model,
-                dflash_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=spec_server_args,
-            )
-            try:
-                _send_generate(
-                    dflash_url,
-                    "Hello",
-                    max_new_tokens=8,
-                    stop=[],
-                    timeout_s=min(int(args.timeout_s), 300),
-                )
+            def _build_spec_server_args(block_size_override: Optional[int]) -> list[str]:
+                spec_server_args = [
+                    *common_server_args,
+                    "--speculative-algorithm",
+                    spec_algo,
+                ]
+                if args.draft_model:
+                    spec_server_args.extend(
+                        ["--speculative-draft-model-path", args.draft_model]
+                    )
+                if block_size_override is not None:
+                    spec_server_args.extend(
+                        [
+                            "--speculative-dflash-block-size",
+                            str(int(block_size_override)),
+                        ]
+                    )
+                elif args.speculative_dflash_block_size is not None:
+                    spec_server_args.extend(
+                        [
+                            "--speculative-dflash-block-size",
+                            str(int(args.speculative_dflash_block_size)),
+                        ]
+                    )
+                if args.speculative_num_draft_tokens is not None:
+                    spec_server_args.extend(
+                        [
+                            "--speculative-num-draft-tokens",
+                            str(int(args.speculative_num_draft_tokens)),
+                        ]
+                    )
+                if args.speculative_num_steps is not None:
+                    spec_server_args.extend(
+                        ["--speculative-num-steps", str(int(args.speculative_num_steps))]
+                    )
+                if args.speculative_eagle_topk is not None:
+                    spec_server_args.extend(
+                        ["--speculative-eagle-topk", str(int(args.speculative_eagle_topk))]
+                    )
+                return spec_server_args
 
-                for conc in concurrencies:
-                    n = num_questions_by_conc[conc]
-                    _flush_cache(dflash_url)
-                    print(
-                        f"[warmup] run 1 warmup batch (size={conc}) after /flush_cache; excluded from metrics."
-                    )
-                    metrics = _run_bench_requests(
-                        dflash_url,
-                        prompts=prompts[: n + conc],
-                        max_new_tokens=int(args.max_new_tokens),
-                        concurrency=int(conc),
-                        batch_requests=bool(args.batch_requests),
-                        stop=[],
-                        timeout_s=int(args.timeout_s),
-                        expect_dflash=True,
-                        trace_fp=call_trace_fp,
-                        trace_common={
-                            "mode": "speculative",
-                            "speculative_algorithm": spec_algo,
-                            "backend": backend,
-                            "tp_size": int(tp),
-                            "concurrency": int(conc),
-                            "question_count": int(n),
-                            "batch_requests": bool(args.batch_requests),
-                        },
-                        trace_include_prompt=bool(args.save_call_trace_prompt),
-                        trace_include_raw_meta=bool(args.save_call_trace_raw_meta),
-                    )
-                    dflash_toks[(backend, conc)] = metrics.output_toks_per_s
-                    dflash_accept_len[(backend, conc)] = metrics.spec_accept_length
-                    dflash_metrics[(backend, conc)] = metrics
-                    verify_calls_per_s = (
-                        metrics.spec_verify_ct_sum / max(metrics.latency_s, 1e-6)
-                        if metrics.spec_verify_ct_sum > 0
-                        else None
-                    )
-                    draft_tokens_per_s = (
-                        metrics.spec_draft_token_sum / max(metrics.latency_s, 1e-6)
-                        if metrics.spec_draft_token_sum > 0
-                        else None
-                    )
-                    print(
-                        f"[{spec_algo}]   conc={conc:>2} n={n:<4} "
-                        f"toks/s={metrics.output_toks_per_s:,.2f} "
-                        f"latency={metrics.latency_s:.1f}s "
-                        f"tau={_fmt_opt(metrics.spec_accept_length, '.3f')} "
-                        f"accept_rate={_fmt_opt(metrics.spec_accept_rate, '.3f')} "
-                        f"verify/s={_fmt_opt(verify_calls_per_s, ',.2f')} "
-                        f"draft_tok/s={_fmt_opt(draft_tokens_per_s, ',.2f')} "
-                        f"spec_verify_ct_sum={metrics.spec_verify_ct_sum}"
-                    )
-            finally:
-                kill_process_tree(dflash_proc.pid)
+            if dynamic_mode:
+                urls_by_bs: dict[int, str] = {}
+                procs_by_bs: dict[int, object] = {}
                 try:
-                    dflash_proc.wait(timeout=30)
-                except Exception:
-                    pass
+                    for idx, bs in enumerate(dynamic_block_sizes):
+                        dflash_port = find_available_port(port_base + 1 + idx * 10)
+                        dflash_url = f"http://127.0.0.1:{dflash_port}"
+                        launch_env = None
+                        if bs in dynamic_gpu_map:
+                            launch_env = {"CUDA_VISIBLE_DEVICES": str(dynamic_gpu_map[bs])}
+                        proc = popen_launch_server(
+                            args.target_model,
+                            dflash_url,
+                            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                            other_args=_build_spec_server_args(bs),
+                            env=launch_env,
+                        )
+                        urls_by_bs[int(bs)] = dflash_url
+                        procs_by_bs[int(bs)] = proc
+                        print(
+                            f"[dynamic] launched bs={bs} server at {dflash_url} "
+                            f"(gpu={dynamic_gpu_map.get(bs, 'inherit')})"
+                        )
+
+                    for bs, dflash_url in sorted(urls_by_bs.items()):
+                        _send_generate(
+                            dflash_url,
+                            "Hello",
+                            max_new_tokens=8,
+                            stop=[],
+                            timeout_s=min(int(args.timeout_s), 300),
+                        )
+                        print(f"[dynamic] warmed server bs={bs}")
+
+                    for conc in concurrencies:
+                        n = num_questions_by_conc[conc]
+                        for bs, dflash_url in sorted(urls_by_bs.items()):
+                            _flush_cache(dflash_url)
+                            print(f"[dynamic] flushed bs={bs} cache before conc={conc}")
+
+                        controller = DynamicBlockEWMAController(
+                            candidates=dynamic_block_sizes,
+                            ewma_alpha=float(args.dynamic_ewma_alpha),
+                            switch_margin=float(args.dynamic_switch_margin),
+                            required_streak=int(args.dynamic_required_streak),
+                            warmup_chunks=int(args.dynamic_warmup_chunks),
+                            probe_interval=int(args.dynamic_probe_interval),
+                        )
+
+                        metrics, chunk_records, usage = _run_dynamic_spec(
+                            urls_by_bs=urls_by_bs,
+                            prompts=prompts[:n],
+                            max_new_tokens=int(args.max_new_tokens),
+                            concurrency=int(conc),
+                            batch_requests=bool(args.batch_requests),
+                            stop=[],
+                            timeout_s=int(args.timeout_s),
+                            controller=controller,
+                            score_metric=str(args.dynamic_score_metric),
+                            trace_fp=call_trace_fp,
+                            trace_common={
+                                "mode": "speculative_dynamic",
+                                "speculative_algorithm": spec_algo,
+                                "backend": backend,
+                                "tp_size": int(tp),
+                                "concurrency": int(conc),
+                                "question_count": int(n),
+                                "batch_requests": bool(args.batch_requests),
+                            },
+                            trace_include_prompt=bool(args.save_call_trace_prompt),
+                            trace_include_raw_meta=bool(args.save_call_trace_raw_meta),
+                        )
+
+                        dflash_toks[(backend, conc)] = metrics.output_toks_per_s
+                        dflash_accept_len[(backend, conc)] = metrics.spec_accept_length
+                        dflash_metrics[(backend, conc)] = metrics
+                        dynamic_usage_counts[(backend, conc)] = usage
+                        dynamic_chunk_logs[(backend, conc)] = chunk_records
+
+                        verify_calls_per_s = (
+                            metrics.spec_verify_ct_sum / max(metrics.latency_s, 1e-6)
+                            if metrics.spec_verify_ct_sum > 0
+                            else None
+                        )
+                        draft_tokens_per_s = (
+                            metrics.spec_draft_token_sum / max(metrics.latency_s, 1e-6)
+                            if metrics.spec_draft_token_sum > 0
+                            else None
+                        )
+                        usage_str = ", ".join(
+                            [f"bs{b}:{usage.get(b, 0)}" for b in sorted(dynamic_block_sizes)]
+                        )
+                        print(
+                            f"[{spec_algo}-dynamic] conc={conc:>2} n={n:<4} "
+                            f"toks/s={metrics.output_toks_per_s:,.2f} "
+                            f"latency={metrics.latency_s:.1f}s "
+                            f"tau={_fmt_opt(metrics.spec_accept_length, '.3f')} "
+                            f"accept_rate={_fmt_opt(metrics.spec_accept_rate, '.3f')} "
+                            f"verify/s={_fmt_opt(verify_calls_per_s, ',.2f')} "
+                            f"draft_tok/s={_fmt_opt(draft_tokens_per_s, ',.2f')} "
+                            f"usage=[{usage_str}]"
+                        )
+                finally:
+                    for bs, proc in procs_by_bs.items():
+                        try:
+                            kill_process_tree(proc.pid)
+                        except Exception:
+                            pass
+                        try:
+                            proc.wait(timeout=30)
+                        except Exception:
+                            pass
+            else:
+                dflash_port = find_available_port(port_base + 1)
+                dflash_url = f"http://127.0.0.1:{dflash_port}"
+                dflash_proc = popen_launch_server(
+                    args.target_model,
+                    dflash_url,
+                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                    other_args=_build_spec_server_args(None),
+                )
+                try:
+                    _send_generate(
+                        dflash_url,
+                        "Hello",
+                        max_new_tokens=8,
+                        stop=[],
+                        timeout_s=min(int(args.timeout_s), 300),
+                    )
+
+                    for conc in concurrencies:
+                        n = num_questions_by_conc[conc]
+                        _flush_cache(dflash_url)
+                        print(
+                            f"[warmup] run 1 warmup batch (size={conc}) after /flush_cache; excluded from metrics."
+                        )
+                        metrics = _run_bench_requests(
+                            dflash_url,
+                            prompts=prompts[: n + conc],
+                            max_new_tokens=int(args.max_new_tokens),
+                            concurrency=int(conc),
+                            batch_requests=bool(args.batch_requests),
+                            stop=[],
+                            timeout_s=int(args.timeout_s),
+                            expect_dflash=True,
+                            trace_fp=call_trace_fp,
+                            trace_common={
+                                "mode": "speculative",
+                                "speculative_algorithm": spec_algo,
+                                "backend": backend,
+                                "tp_size": int(tp),
+                                "concurrency": int(conc),
+                                "question_count": int(n),
+                                "batch_requests": bool(args.batch_requests),
+                            },
+                            trace_include_prompt=bool(args.save_call_trace_prompt),
+                            trace_include_raw_meta=bool(args.save_call_trace_raw_meta),
+                        )
+                        dflash_toks[(backend, conc)] = metrics.output_toks_per_s
+                        dflash_accept_len[(backend, conc)] = metrics.spec_accept_length
+                        dflash_metrics[(backend, conc)] = metrics
+                        verify_calls_per_s = (
+                            metrics.spec_verify_ct_sum / max(metrics.latency_s, 1e-6)
+                            if metrics.spec_verify_ct_sum > 0
+                            else None
+                        )
+                        draft_tokens_per_s = (
+                            metrics.spec_draft_token_sum / max(metrics.latency_s, 1e-6)
+                            if metrics.spec_draft_token_sum > 0
+                            else None
+                        )
+                        print(
+                            f"[{spec_algo}]   conc={conc:>2} n={n:<4} "
+                            f"toks/s={metrics.output_toks_per_s:,.2f} "
+                            f"latency={metrics.latency_s:.1f}s "
+                            f"tau={_fmt_opt(metrics.spec_accept_length, '.3f')} "
+                            f"accept_rate={_fmt_opt(metrics.spec_accept_rate, '.3f')} "
+                            f"verify/s={_fmt_opt(verify_calls_per_s, ',.2f')} "
+                            f"draft_tok/s={_fmt_opt(draft_tokens_per_s, ',.2f')} "
+                            f"spec_verify_ct_sum={metrics.spec_verify_ct_sum}"
+                        )
+                finally:
+                    kill_process_tree(dflash_proc.pid)
+                    try:
+                        dflash_proc.wait(timeout=30)
+                    except Exception:
+                        pass
     finally:
         if call_trace_fp is not None:
             call_trace_fp.close()
@@ -842,6 +1308,17 @@ def main() -> None:
     md_lines.append(
         f"- speculative_dflash_block_size: `{args.speculative_dflash_block_size}`"
     )
+    md_lines.append(f"- dynamic_mode: `{bool(dynamic_mode)}`")
+    md_lines.append(
+        f"- dynamic_block_sizes: `{', '.join(str(x) for x in dynamic_block_sizes) if dynamic_block_sizes else ''}`"
+    )
+    md_lines.append(f"- dynamic_gpu_map: `{args.dynamic_gpu_map}`")
+    md_lines.append(f"- dynamic_ewma_alpha: `{args.dynamic_ewma_alpha}`")
+    md_lines.append(f"- dynamic_switch_margin: `{args.dynamic_switch_margin}`")
+    md_lines.append(f"- dynamic_required_streak: `{args.dynamic_required_streak}`")
+    md_lines.append(f"- dynamic_warmup_chunks: `{args.dynamic_warmup_chunks}`")
+    md_lines.append(f"- dynamic_probe_interval: `{args.dynamic_probe_interval}`")
+    md_lines.append(f"- dynamic_score_metric: `{args.dynamic_score_metric}`")
     md_lines.append(
         f"- speculative_num_draft_tokens: `{args.speculative_num_draft_tokens}`"
     )
@@ -925,6 +1402,21 @@ def main() -> None:
             )
         )
         md_lines.append("")
+
+        if dynamic_mode:
+            md_lines.append("### DFLASH dynamic block usage (chunk counts)")
+            md_lines.append("| conc | usage |")
+            md_lines.append("| --- | --- |")
+            for c in concurrencies:
+                usage = dynamic_usage_counts.get((backend, c))
+                if not usage:
+                    md_lines.append(f"| {c} | N/A |")
+                    continue
+                usage_str = ", ".join(
+                    [f"bs{b}:{usage.get(b, 0)}" for b in sorted(dynamic_block_sizes)]
+                )
+                md_lines.append(f"| {c} | {usage_str} |")
+            md_lines.append("")
 
         md_lines.append("### DFLASH acceptance rate")
         md_lines.append(
