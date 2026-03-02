@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
-import math
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
 from statistics import mean
@@ -42,7 +42,10 @@ def _load_rows(path: Path):
             try:
                 obj = json.loads(line)
             except json.JSONDecodeError as e:
-                raise ValueError(f"Invalid JSON at line {i}: {e}") from e
+                raise ValueError(
+                    f"Invalid JSON at line {i}: {e}. "
+                    f"Expected a JSONL call trace (e.g. *_calls.jsonl), got: {path}"
+                ) from e
 
             # Older traces may nest meta under meta_info_raw.
             meta_raw = obj.get("meta_info_raw")
@@ -123,6 +126,70 @@ def _load_rows(path: Path):
 
             rows.append(row)
     return rows
+
+
+def _resolve_candidate_path(candidate: str, *, log_path: Path) -> Path | None:
+    cand = candidate.strip().strip("'").strip('"')
+    if not cand:
+        return None
+    p = Path(cand)
+    if p.is_absolute() and p.exists():
+        return p
+
+    rel1 = (log_path.parent / p).resolve()
+    if rel1.exists():
+        return rel1
+
+    rel2 = (Path.cwd() / p).resolve()
+    if rel2.exists():
+        return rel2
+    return None
+
+
+def _extract_calls_jsonl_from_log(log_path: Path) -> Path | None:
+    """
+    Try to find the generated call-trace jsonl path from a benchmark run log.
+    Supports lines like:
+    - Wrote per-call JSONL trace to: ...
+    - Call trace: ...
+    - command: ... --save-call-trace-path <path> ...
+    """
+    patterns = [
+        re.compile(r"Wrote per-call JSONL trace to:\s*(\S+)"),
+        re.compile(r"Call trace:\s*(\S+)"),
+        re.compile(r"--save-call-trace-path\s+(\S+)"),
+    ]
+    with log_path.open() as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            for pat in patterns:
+                m = pat.search(s)
+                if not m:
+                    continue
+                resolved = _resolve_candidate_path(m.group(1), log_path=log_path)
+                if resolved is not None:
+                    return resolved
+    return None
+
+
+def _resolve_input_path(input_path: Path) -> Path:
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input file does not exist: {input_path}")
+
+    if input_path.suffix.lower() == ".log":
+        traced = _extract_calls_jsonl_from_log(input_path)
+        if traced is None:
+            raise ValueError(
+                "Input is a .log file, but no call-trace JSONL path was found in it. "
+                "Pass --input <..._calls.jsonl> directly, or ensure log contains "
+                "'Wrote per-call JSONL trace to: ...'."
+            )
+        print(f"Resolved call trace from log: {traced}")
+        return traced
+
+    return input_path
 
 
 def _wmean(values, weights):
@@ -273,19 +340,25 @@ def main():
         "--input",
         required=True,
         type=Path,
-        help="Path to *_calls.jsonl written by benchmark_sglang.py",
+        help=(
+            "Path to *_calls.jsonl written by benchmark_sglang.py. "
+            "You may also pass a run .log file; the script will auto-resolve the calls JSONL."
+        ),
     )
     ap.add_argument(
         "--output-md",
+        "--output",
         type=Path,
+        dest="output_md",
         default=None,
         help="Optional markdown output path. If omitted, prints to stdout only.",
     )
     args = ap.parse_args()
 
-    rows = _load_rows(args.input)
+    input_path = _resolve_input_path(args.input)
+    rows = _load_rows(input_path)
     if not rows:
-        raise ValueError(f"No rows found in {args.input}")
+        raise ValueError(f"No rows found in {input_path}")
     md = summarize(rows)
     print(md)
     if args.output_md is not None:
