@@ -497,6 +497,7 @@ class DynamicAdaptiveController:
         *,
         block_sizes: list[int],
         batch_sizes: list[int],
+        initial_block_size: Optional[int],
         policy: str,
         ewma_alpha: float,
         exploration_c: float,
@@ -532,6 +533,15 @@ class DynamicAdaptiveController:
         if not self.arms:
             raise ValueError("No dynamic controller arms could be constructed.")
 
+        if initial_block_size is None:
+            init_block = max(self.block_sizes)
+        else:
+            init_block = int(max(1, initial_block_size))
+        init_block = min(
+            self.block_sizes, key=lambda b: (abs(int(b) - init_block), int(b))
+        )
+        init_batch = max(self.batch_sizes)
+
         self.score_hat: dict[tuple[int, int], Optional[float]] = {
             (a.block_size, a.batch_size): None for a in self.arms
         }
@@ -539,9 +549,7 @@ class DynamicAdaptiveController:
             (a.block_size, a.batch_size): 0 for a in self.arms
         }
         self.total_obs = 0
-        self.current = DynamicChoice(
-            block_size=max(self.block_sizes), batch_size=max(self.batch_sizes)
-        )
+        self.current = DynamicChoice(block_size=int(init_block), batch_size=int(init_batch))
         self.pending_target = self.current
         self.pending_streak = 0
         self.probe_cursor = 0
@@ -905,7 +913,7 @@ def main() -> None:
         "--dynamic-block-sizes",
         type=str,
         default="",
-        help="Optional comma-separated DFLASH block sizes (e.g. 8,16). If set, launches one speculative server per block size and routes chunks dynamically.",
+        help="Optional comma-separated DFLASH block sizes (e.g. 8,12,16). Dynamic mode runs on a single speculative server and sends per-chunk runtime dflash_block_size via request custom_params.",
     )
     parser.add_argument(
         "--dynamic-batch-sizes",
@@ -1093,41 +1101,33 @@ def main() -> None:
             raise RuntimeError("--dynamic-block-sizes is currently supported only with --speculative-algorithm DFLASH.")
         if len(dynamic_block_sizes) < 2:
             raise RuntimeError("Dynamic mode requires at least two block sizes.")
+        if not args.dynamic_single_server:
+            print(
+                "[warn] Multi-server dynamic routing has been removed. "
+                "Forcing single-server dynamic mode.",
+                flush=True,
+            )
+            args.dynamic_single_server = True
         if args.speculative_dflash_block_size is not None:
             print(
                 "[warn] --speculative-dflash-block-size is ignored in dynamic mode; using --dynamic-block-sizes.",
                 flush=True,
             )
-        if args.dynamic_single_server and request_dflash_block_size is not None:
+        if request_dflash_block_size is not None:
             print(
                 "[warn] --request-dflash-block-size is ignored in --dynamic-single-server mode "
                 "(controller-selected block size is sent per chunk).",
                 flush=True,
             )
             request_dflash_block_size = None
-        elif request_dflash_block_size is not None:
-            print(
-                "[warn] --request-dflash-block-size is ignored in multi-server dynamic mode.",
-                flush=True,
-            )
-            request_dflash_block_size = None
         if dynamic_gpu_map:
-            if args.dynamic_single_server:
-                max_bs = max(dynamic_block_sizes)
-                ignored = sorted(bs for bs in dynamic_gpu_map.keys() if bs != max_bs)
-                if ignored:
-                    print(
-                        f"[warn] --dynamic-single-server ignores --dynamic-gpu-map entries for non-max block sizes: {ignored}",
-                        flush=True,
-                    )
-            else:
-                missing_gpu_map = [
-                    bs for bs in dynamic_block_sizes if bs not in dynamic_gpu_map
-                ]
-                if missing_gpu_map:
-                    raise RuntimeError(
-                        f"--dynamic-gpu-map missing entries for block sizes: {missing_gpu_map}"
-                    )
+            max_bs = max(dynamic_block_sizes)
+            ignored = sorted(bs for bs in dynamic_gpu_map.keys() if bs != max_bs)
+            if ignored:
+                print(
+                    f"[warn] --dynamic-single-server ignores --dynamic-gpu-map entries for non-max block sizes: {ignored}",
+                    flush=True,
+                )
         invalid_batch_sizes = [b for b in dynamic_batch_sizes if b < 1]
         if invalid_batch_sizes:
             raise RuntimeError(f"Invalid dynamic batch sizes: {invalid_batch_sizes}")
@@ -1349,83 +1349,42 @@ def main() -> None:
                 urls_by_bs: dict[int, str] = {}
                 procs_by_bs: dict[int, object] = {}
                 try:
-                    if args.dynamic_single_server:
-                        max_dynamic_bs = max(dynamic_block_sizes)
-                        dflash_port = find_available_port(port_base + 1)
-                        dflash_url = f"http://127.0.0.1:{dflash_port}"
-                        launch_env = None
-                        if max_dynamic_bs in dynamic_gpu_map:
-                            launch_env = {
-                                "CUDA_VISIBLE_DEVICES": str(
-                                    dynamic_gpu_map[max_dynamic_bs]
-                                )
-                            }
-                        proc = popen_launch_server(
-                            args.target_model,
-                            dflash_url,
-                            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                            other_args=_build_spec_server_args(max_dynamic_bs),
-                            env=launch_env,
-                        )
-                        for bs in dynamic_block_sizes:
-                            urls_by_bs[int(bs)] = dflash_url
-                            procs_by_bs[int(bs)] = proc
-                        print(
-                            f"[dynamic] launched single server at {dflash_url} "
-                            f"(max_bs={max_dynamic_bs}, gpu={dynamic_gpu_map.get(max_dynamic_bs, 'inherit')})"
-                        )
-                    else:
-                        for idx, bs in enumerate(dynamic_block_sizes):
-                            dflash_port = find_available_port(port_base + 1 + idx * 10)
-                            dflash_url = f"http://127.0.0.1:{dflash_port}"
-                            launch_env = None
-                            if bs in dynamic_gpu_map:
-                                launch_env = {
-                                    "CUDA_VISIBLE_DEVICES": str(dynamic_gpu_map[bs])
-                                }
-                            proc = popen_launch_server(
-                                args.target_model,
-                                dflash_url,
-                                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                                other_args=_build_spec_server_args(bs),
-                                env=launch_env,
-                            )
-                            urls_by_bs[int(bs)] = dflash_url
-                            procs_by_bs[int(bs)] = proc
-                            print(
-                                f"[dynamic] launched bs={bs} server at {dflash_url} "
-                                f"(gpu={dynamic_gpu_map.get(bs, 'inherit')})"
-                            )
+                    max_dynamic_bs = max(dynamic_block_sizes)
+                    dflash_port = find_available_port(port_base + 1)
+                    dflash_url = f"http://127.0.0.1:{dflash_port}"
+                    launch_env = None
+                    if max_dynamic_bs in dynamic_gpu_map:
+                        launch_env = {
+                            "CUDA_VISIBLE_DEVICES": str(dynamic_gpu_map[max_dynamic_bs])
+                        }
+                    proc = popen_launch_server(
+                        args.target_model,
+                        dflash_url,
+                        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                        other_args=_build_spec_server_args(max_dynamic_bs),
+                        env=launch_env,
+                    )
+                    for bs in dynamic_block_sizes:
+                        urls_by_bs[int(bs)] = dflash_url
+                        procs_by_bs[int(bs)] = proc
+                    print(
+                        f"[dynamic] launched single server at {dflash_url} "
+                        f"(max_bs={max_dynamic_bs}, gpu={dynamic_gpu_map.get(max_dynamic_bs, 'inherit')})"
+                    )
 
-                    warmed_urls: set[str] = set()
-                    for bs, dflash_url in sorted(urls_by_bs.items()):
-                        if dflash_url in warmed_urls:
-                            continue
-                        _send_generate(
-                            dflash_url,
-                            "Hello",
-                            max_new_tokens=8,
-                            stop=[],
-                            timeout_s=min(int(args.timeout_s), 300),
-                        )
-                        warmed_urls.add(dflash_url)
-                        if args.dynamic_single_server:
-                            print(f"[dynamic] warmed single server (max_bs={max(dynamic_block_sizes)})")
-                        else:
-                            print(f"[dynamic] warmed server bs={bs}")
+                    _send_generate(
+                        dflash_url,
+                        "Hello",
+                        max_new_tokens=8,
+                        stop=[],
+                        timeout_s=min(int(args.timeout_s), 300),
+                    )
+                    print(f"[dynamic] warmed single server (max_bs={max_dynamic_bs})")
 
                     for conc in concurrencies:
                         n = num_questions_by_conc[conc]
-                        flushed_urls: set[str] = set()
-                        for bs, dflash_url in sorted(urls_by_bs.items()):
-                            if dflash_url in flushed_urls:
-                                continue
-                            _flush_cache(dflash_url)
-                            flushed_urls.add(dflash_url)
-                            if args.dynamic_single_server:
-                                print(f"[dynamic] flushed single server cache before conc={conc}")
-                            else:
-                                print(f"[dynamic] flushed bs={bs} cache before conc={conc}")
+                        _flush_cache(dflash_url)
+                        print(f"[dynamic] flushed single server cache before conc={conc}")
 
                         batch_sizes_for_conc = (
                             sorted(
@@ -1443,6 +1402,9 @@ def main() -> None:
                         controller = DynamicAdaptiveController(
                             block_sizes=dynamic_block_sizes,
                             batch_sizes=batch_sizes_for_conc,
+                            initial_block_size=min(
+                                int(conc), int(max(dynamic_block_sizes))
+                            ),
                             policy=str(args.dynamic_policy),
                             ewma_alpha=float(args.dynamic_ewma_alpha),
                             exploration_c=float(args.dynamic_exploration_c),

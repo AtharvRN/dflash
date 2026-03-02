@@ -22,8 +22,9 @@ TIMEOUT_S="${TIMEOUT_S:-3600}"
 RUN_BASELINE="${RUN_BASELINE:-1}"
 BATCH_REQUESTS="${BATCH_REQUESTS:-1}"
 
-DYNAMIC_BLOCK_SIZES="${DYNAMIC_BLOCK_SIZES:-8,16}"
-DYNAMIC_GPU_MAP="${DYNAMIC_GPU_MAP:-8:0,16:1}"
+DYNAMIC_BLOCK_SIZES="${DYNAMIC_BLOCK_SIZES:-1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16}"
+# Single-server dynamic mode: only max block-size entry is used if provided.
+DYNAMIC_GPU_MAP="${DYNAMIC_GPU_MAP:-}"
 DYNAMIC_EWMA_ALPHA="${DYNAMIC_EWMA_ALPHA:-0.20}"
 DYNAMIC_SWITCH_MARGIN="${DYNAMIC_SWITCH_MARGIN:-0.02}"
 DYNAMIC_REQUIRED_STREAK="${DYNAMIC_REQUIRED_STREAK:-2}"
@@ -53,6 +54,7 @@ cmd=(
   --max-running-requests "${MAX_RUNNING_REQUESTS}"
   --timeout-s "${TIMEOUT_S}"
   --speculative-algorithm DFLASH
+  --dynamic-single-server
   --dynamic-block-sizes "${DYNAMIC_BLOCK_SIZES}"
   --dynamic-gpu-map "${DYNAMIC_GPU_MAP}"
   --dynamic-ewma-alpha "${DYNAMIC_EWMA_ALPHA}"
