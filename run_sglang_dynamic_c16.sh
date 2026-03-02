@@ -8,6 +8,8 @@ set -euo pipefail
 # Example:
 #   RUN_TAG=sg_dynamic_c16_$(date +%Y%m%d_%H%M%S) bash run_sglang_dynamic_c16.sh
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 DATASET_NAME="${DATASET_NAME:-gsm8k}"
 TARGET_MODEL="${TARGET_MODEL:-Qwen/Qwen3-4B}"
 DRAFT_MODEL="${DRAFT_MODEL:-z-lab/Qwen3-4B-DFlash-b16}"
@@ -39,6 +41,7 @@ mkdir -p "${LOG_DIR}"
 OUT_MD="${LOG_DIR}/${RUN_TAG}.md"
 OUT_TRACE="${LOG_DIR}/${RUN_TAG}_calls.jsonl"
 OUT_LOG="${LOG_DIR}/${RUN_TAG}.log"
+OUT_TRACE_SUMMARY_MD="${LOG_DIR}/${RUN_TAG}_calls_summary.md"
 
 cmd=(
   python benchmark_sglang.py
@@ -88,7 +91,16 @@ fi
 
 "${cmd[@]}" 2>&1 | tee -a "${OUT_LOG}"
 
+if [[ -f "${OUT_TRACE}" ]]; then
+  python "${SCRIPT_DIR}/scripts/summarize_sglang_calls.py" \
+    --input "${OUT_TRACE}" \
+    --output-md "${OUT_TRACE_SUMMARY_MD}" | tee -a "${OUT_LOG}"
+else
+  echo "Call trace not found at ${OUT_TRACE}; skipping summary generation." | tee -a "${OUT_LOG}"
+fi
+
 echo "Done."
 echo "Markdown: ${OUT_MD}"
 echo "Call trace: ${OUT_TRACE}"
+echo "Call trace summary: ${OUT_TRACE_SUMMARY_MD}"
 echo "Log: ${OUT_LOG}"
