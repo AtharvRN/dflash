@@ -946,6 +946,12 @@ def main() -> None:
         help="Server-side DFLASH adaptive maximum block size.",
     )
     parser.add_argument(
+        "--speculative-dflash-adaptive-k-start",
+        type=int,
+        default=None,
+        help="Server-side DFLASH adaptive initial block size per request.",
+    )
+    parser.add_argument(
         "--speculative-dflash-adaptive-low-accept-threshold",
         type=float,
         default=0.35,
@@ -1395,6 +1401,13 @@ def main() -> None:
                                 str(int(args.speculative_dflash_adaptive_k_max)),
                             ]
                         )
+                    if args.speculative_dflash_adaptive_k_start is not None:
+                        spec_server_args.extend(
+                            [
+                                "--speculative-dflash-adaptive-k-start",
+                                str(int(args.speculative_dflash_adaptive_k_start)),
+                            ]
+                        )
                 return spec_server_args
 
             if dynamic_mode:
@@ -1658,6 +1671,9 @@ def main() -> None:
     )
     md_lines.append(
         f"- speculative_dflash_adaptive_k_max: `{args.speculative_dflash_adaptive_k_max}`"
+    )
+    md_lines.append(
+        f"- speculative_dflash_adaptive_k_start: `{args.speculative_dflash_adaptive_k_start}`"
     )
     md_lines.append(
         f"- speculative_dflash_adaptive_low_accept_threshold: `{args.speculative_dflash_adaptive_low_accept_threshold}`"

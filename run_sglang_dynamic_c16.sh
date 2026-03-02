@@ -31,6 +31,7 @@ ADAPTIVE_RHO="${ADAPTIVE_RHO:-0.30}"
 ADAPTIVE_DELTA="${ADAPTIVE_DELTA:-1.0}"
 ADAPTIVE_K_MIN="${ADAPTIVE_K_MIN:-1}"
 ADAPTIVE_K_MAX="${ADAPTIVE_K_MAX:-16}"
+ADAPTIVE_K_START="${ADAPTIVE_K_START:-}"
 ADAPTIVE_LOW_ACCEPT_THRESHOLD="${ADAPTIVE_LOW_ACCEPT_THRESHOLD:-0.35}"
 ADAPTIVE_LOW_ACCEPT_STREAK="${ADAPTIVE_LOW_ACCEPT_STREAK:-2}"
 
@@ -72,6 +73,9 @@ cmd=(
 
 if [[ "${ADAPTIVE_ENABLED}" == "1" ]]; then
   cmd+=(--speculative-dflash-adaptive-block-size)
+fi
+if [[ -n "${ADAPTIVE_K_START}" ]]; then
+  cmd+=(--speculative-dflash-adaptive-k-start "${ADAPTIVE_K_START}")
 fi
 
 if [[ "${BATCH_REQUESTS}" == "1" ]]; then
