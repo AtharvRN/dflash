@@ -27,6 +27,7 @@ SKIP_BASELINE="${SKIP_BASELINE:-0}"
 ENABLE_SERVER_METRICS="${ENABLE_SERVER_METRICS:-1}"
 SAVE_CALL_TRACE_PROMPT="${SAVE_CALL_TRACE_PROMPT:-0}"
 SAVE_CALL_TRACE_RAW_META="${SAVE_CALL_TRACE_RAW_META:-0}"
+ENABLE_DFLASH_CYCLE_TRACE="${ENABLE_DFLASH_CYCLE_TRACE:-0}"
 DISABLE_OVERLAP_SCHEDULE="${DISABLE_OVERLAP_SCHEDULE:-0}"
 SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS:-}"
 
@@ -83,6 +84,7 @@ echo "block_sizes=${BS_LIST[*]}"
 echo "attention_backends=${ATTENTION_BACKENDS} speculative_algorithm=${SPECULATIVE_ALGORITHM}"
 echo "max_new_tokens=${MAX_NEW_TOKENS} qpc_base=${QUESTIONS_PER_CONCURRENCY_BASE} max_q_per_config=${MAX_QUESTIONS_PER_CONFIG}"
 echo "batch_requests=${BATCH_REQUESTS} skip_baseline=${SKIP_BASELINE} enable_server_metrics=${ENABLE_SERVER_METRICS}"
+echo "enable_dflash_cycle_trace=${ENABLE_DFLASH_CYCLE_TRACE}"
 echo "log_dir=${LOG_DIR}"
 
 for bs in "${BS_LIST[@]}"; do
@@ -132,6 +134,9 @@ for bs in "${BS_LIST[@]}"; do
     fi
     if [[ "${SAVE_CALL_TRACE_RAW_META}" == "1" ]]; then
       cmd+=(--save-call-trace-raw-meta)
+    fi
+    if [[ "${SPECULATIVE_ALGORITHM^^}" == "DFLASH" && "${ENABLE_DFLASH_CYCLE_TRACE}" == "1" ]]; then
+      cmd+=(--enable-dflash-cycle-trace)
     fi
     if [[ "${DISABLE_OVERLAP_SCHEDULE}" == "1" ]]; then
       cmd+=(--disable-overlap-schedule)

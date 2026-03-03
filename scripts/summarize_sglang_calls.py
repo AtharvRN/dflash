@@ -47,6 +47,31 @@ def _normalize_hist(raw_hist):
     return out
 
 
+def _normalize_cycle_trace(raw_trace):
+    if not isinstance(raw_trace, list):
+        return []
+
+    out = []
+    for item in raw_trace:
+        if not isinstance(item, dict):
+            continue
+        runtime_bs = _as_int(item.get("runtime_block_size"))
+        if runtime_bs is not None and runtime_bs <= 0:
+            runtime_bs = None
+        out.append(
+            {
+                "cycle_idx": _as_int(item.get("cycle_idx")),
+                "runtime_block_size": runtime_bs,
+                "accepted_draft_tokens": _as_int(item.get("accepted_draft_tokens")),
+                "accept_length": _as_float(item.get("accept_length")),
+                "accept_rate": _as_float(item.get("accept_rate")),
+                "draft_time_s": _as_float(item.get("draft_time_s")),
+                "verify_time_s": _as_float(item.get("verify_time_s")),
+            }
+        )
+    return out
+
+
 def _load_rows(path: Path):
     rows = []
     with path.open() as f:
@@ -109,6 +134,20 @@ def _load_rows(path: Path):
                     ],
                 )
             )
+            spec_cycle_trace = _normalize_cycle_trace(
+                _first_present(merged, ["spec_cycle_trace"])
+            )
+
+            if not runtime_bs_hist and spec_cycle_trace:
+                derived_hist = Counter()
+                for c in spec_cycle_trace:
+                    bs = c.get("runtime_block_size")
+                    if bs is not None and int(bs) > 0:
+                        derived_hist[int(bs)] += 1
+                runtime_bs_hist = dict(derived_hist)
+
+            if verify_ct is None and spec_cycle_trace:
+                verify_ct = len(spec_cycle_trace)
 
             row = {
                 "verify_ct": verify_ct if verify_ct is not None else 0,
@@ -144,6 +183,7 @@ def _load_rows(path: Path):
                 or 0,
                 "runtime_bs_exact": runtime_bs,
                 "runtime_bs_hist": runtime_bs_hist,
+                "spec_cycle_trace": spec_cycle_trace,
             }
 
             if row["runtime_bs_exact"] is None:
@@ -270,6 +310,73 @@ def summarize(rows):
     exact_bs_present = exact_hist_present or any(
         r["runtime_bs_exact"] is not None for r in rows
     )
+    cycle_trace_rows = [
+        c
+        for r in rows
+        for c in (r.get("spec_cycle_trace") or [])
+        if isinstance(c, dict)
+    ]
+
+    cycle_trace_bs_hist = Counter()
+    cycle_trace_accept_len_vals = []
+    cycle_trace_accept_rate_vals = []
+    cycle_trace_draft_time_vals = []
+    cycle_trace_verify_time_vals = []
+    cycle_trace_per_bs = defaultdict(
+        lambda: {
+            "cycles": 0,
+            "draft_tokens": 0,
+            "accepted_tokens": 0,
+            "accept_len_sum": 0.0,
+            "accept_len_cnt": 0,
+            "accept_rate_sum": 0.0,
+            "accept_rate_cnt": 0,
+            "draft_time_sum": 0.0,
+            "draft_time_cnt": 0,
+            "verify_time_sum": 0.0,
+            "verify_time_cnt": 0,
+        }
+    )
+
+    for c in cycle_trace_rows:
+        bs = _as_int(c.get("runtime_block_size"))
+        if bs is None or bs <= 0:
+            continue
+        bs = int(bs)
+        cycle_trace_bs_hist[bs] += 1
+        accepted = _as_int(c.get("accepted_draft_tokens"))
+        proposed = max(0, bs - 1)
+
+        d = cycle_trace_per_bs[bs]
+        d["cycles"] += 1
+        d["draft_tokens"] += proposed
+        if accepted is not None and accepted >= 0:
+            d["accepted_tokens"] += int(accepted)
+
+        accept_len = _as_float(c.get("accept_length"))
+        if accept_len is not None:
+            cycle_trace_accept_len_vals.append(accept_len)
+            d["accept_len_sum"] += float(accept_len)
+            d["accept_len_cnt"] += 1
+
+        accept_rate = _as_float(c.get("accept_rate"))
+        if accept_rate is not None:
+            cycle_trace_accept_rate_vals.append(accept_rate)
+            d["accept_rate_sum"] += float(accept_rate)
+            d["accept_rate_cnt"] += 1
+
+        draft_time_s = _as_float(c.get("draft_time_s"))
+        if draft_time_s is not None:
+            cycle_trace_draft_time_vals.append(draft_time_s)
+            d["draft_time_sum"] += float(draft_time_s)
+            d["draft_time_cnt"] += 1
+
+        verify_time_s = _as_float(c.get("verify_time_s"))
+        if verify_time_s is not None:
+            cycle_trace_verify_time_vals.append(verify_time_s)
+            d["verify_time_sum"] += float(verify_time_s)
+            d["verify_time_cnt"] += 1
+
     bs_cycle_hist = Counter()
     bs_request_hist = Counter()
     per_bs = defaultdict(
@@ -302,6 +409,10 @@ def summarize(rows):
             per_bs[int(bs)]["draft_tokens"] += r["draft_tokens"]
             per_bs[int(bs)]["accept_tokens"] += r["accept_tokens"]
             per_bs[int(bs)]["requests"] += 1
+
+    if cycle_trace_bs_hist:
+        # Prefer exact cycle-level block histogram when available.
+        bs_cycle_hist = cycle_trace_bs_hist
 
     most_common_cycle_bs = bs_cycle_hist.most_common(1)[0] if bs_cycle_hist else None
     most_common_request_bs = (
@@ -378,6 +489,13 @@ def summarize(rows):
         )
     else:
         lines.append("- requests_with_exact_runtime_hist: `0`")
+    if cycle_trace_rows:
+        lines.append(f"- cycle_trace_rows: `{len(cycle_trace_rows)}`")
+        lines.append(
+            f"- cycle_trace_rows_with_timing: `{len(cycle_trace_draft_time_vals)}` draft, `{len(cycle_trace_verify_time_vals)}` verify"
+        )
+    else:
+        lines.append("- cycle_trace_rows: `0`")
 
     lines.append("")
     lines.append("### Block-Size Cycle Histogram")
@@ -403,6 +521,31 @@ def summarize(rows):
     lines.append(
         f"- mean_verify_time_per_request_s: `{_fmt(verify_req_mean_s, 6)}`"
     )
+    if cycle_trace_rows:
+        cycle_draft_mean = (
+            mean(cycle_trace_draft_time_vals)
+            if cycle_trace_draft_time_vals
+            else None
+        )
+        cycle_verify_mean = (
+            mean(cycle_trace_verify_time_vals)
+            if cycle_trace_verify_time_vals
+            else None
+        )
+        lines.append(
+            f"- mean_draft_time_per_cycle_from_trace_s: `{_fmt(cycle_draft_mean, 6)}` "
+            f"({ _fmt(cycle_draft_mean * 1000.0, 3) if cycle_draft_mean is not None else 'N/A' } ms)"
+        )
+        lines.append(
+            f"- mean_verify_time_per_cycle_from_trace_s: `{_fmt(cycle_verify_mean, 6)}` "
+            f"({ _fmt(cycle_verify_mean * 1000.0, 3) if cycle_verify_mean is not None else 'N/A' } ms)"
+        )
+        lines.append(
+            f"- mean_accept_length_per_cycle_from_trace: `{_fmt(mean(cycle_trace_accept_len_vals), 4) if cycle_trace_accept_len_vals else 'N/A'}`"
+        )
+        lines.append(
+            f"- mean_accept_rate_per_cycle_from_trace: `{_fmt(mean(cycle_trace_accept_rate_vals), 4) if cycle_trace_accept_rate_vals else 'N/A'}`"
+        )
     lines.append("")
     lines.append("## Per-Request Block Usage")
     if requests_with_runtime_hist:
@@ -445,6 +588,45 @@ def summarize(rows):
         lines.append(
             "_No exact runtime block-size histogram in this trace; only inferred block size is available._"
         )
+    if cycle_trace_rows:
+        lines.append("")
+        lines.append("## Per-Block Breakdown (Cycle Trace, Exact)")
+        lines.append(
+            "| block_size | verify_cycles | draft_tokens | accepted_tokens | accept_rate | mean_accept_length | mean_accept_rate | mean_draft_ms | mean_verify_ms |"
+        )
+        lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        for bs in sorted(cycle_trace_per_bs):
+            d = cycle_trace_per_bs[bs]
+            accept_rate = (
+                (float(d["accepted_tokens"]) / float(d["draft_tokens"]))
+                if d["draft_tokens"] > 0
+                else None
+            )
+            mean_accept_length = (
+                d["accept_len_sum"] / float(d["accept_len_cnt"])
+                if d["accept_len_cnt"] > 0
+                else None
+            )
+            mean_accept_rate = (
+                d["accept_rate_sum"] / float(d["accept_rate_cnt"])
+                if d["accept_rate_cnt"] > 0
+                else None
+            )
+            mean_draft_ms = (
+                (d["draft_time_sum"] / float(d["draft_time_cnt"])) * 1000.0
+                if d["draft_time_cnt"] > 0
+                else None
+            )
+            mean_verify_ms = (
+                (d["verify_time_sum"] / float(d["verify_time_cnt"])) * 1000.0
+                if d["verify_time_cnt"] > 0
+                else None
+            )
+            lines.append(
+                f"| {bs} | {d['cycles']} | {d['draft_tokens']} | {d['accepted_tokens']} | {_fmt(accept_rate, 4)} | "
+                f"{_fmt(mean_accept_length, 4)} | {_fmt(mean_accept_rate, 4)} | {_fmt(mean_draft_ms, 3)} | {_fmt(mean_verify_ms, 3)} |"
+            )
+
     lines.append("")
     lines.append("## Per-Block Breakdown")
     lines.append("| block_size | requests(mode) | verify_cycles | draft_tokens | accepted_tokens | accept_rate |")

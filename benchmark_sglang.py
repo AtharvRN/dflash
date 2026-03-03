@@ -347,6 +347,7 @@ def _run_bench_requests(
                     "spec_runtime_bs_avg": _extract_float(
                         meta, ["spec_runtime_bs_avg"]
                     ),
+                    "spec_cycle_trace": meta.get("spec_cycle_trace"),
                     "client_request_wall_s": client_request_wall_s,
                     "client_batch_wall_s": client_batch_wall_s,
                     "client_batch_size": client_batch_size,
@@ -1080,6 +1081,11 @@ def main() -> None:
         action="store_true",
         help="Set SGLANG_DFLASH_REPORT_TIMING=1 for launched servers so DFLASH reports attributed draft/verify timing fields in meta_info.",
     )
+    parser.add_argument(
+        "--enable-dflash-cycle-trace",
+        action="store_true",
+        help="Pass --speculative-dflash-cycle-trace to SGLang so DFLASH emits per-request per-cycle trace in meta_info.",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--timeout-s", type=int, default=3600)
     parser.add_argument("--mem-fraction-static", type=float, default=0.75)
@@ -1159,6 +1165,10 @@ def main() -> None:
     if args.speculative_dflash_adaptive_block_size and args.speculative_algorithm.upper() != "DFLASH":
         raise RuntimeError(
             "--speculative-dflash-adaptive-block-size is only valid with --speculative-algorithm DFLASH."
+        )
+    if args.enable_dflash_cycle_trace and args.speculative_algorithm.upper() != "DFLASH":
+        raise RuntimeError(
+            "--enable-dflash-cycle-trace is only valid with --speculative-algorithm DFLASH."
         )
 
     if not torch.cuda.is_available():
@@ -1408,6 +1418,8 @@ def main() -> None:
                                 str(int(args.speculative_dflash_adaptive_k_start)),
                             ]
                         )
+                if spec_algo == "DFLASH" and bool(args.enable_dflash_cycle_trace):
+                    spec_server_args.extend(["--speculative-dflash-cycle-trace"])
                 return spec_server_args
 
             if dynamic_mode:
@@ -1706,6 +1718,9 @@ def main() -> None:
     md_lines.append(f"- disable_overlap_schedule: `{bool(args.disable_overlap_schedule)}`")
     md_lines.append(
         f"- enable_dflash_stage_timing: `{bool(args.enable_dflash_stage_timing)}`"
+    )
+    md_lines.append(
+        f"- enable_dflash_cycle_trace: `{bool(args.enable_dflash_cycle_trace)}`"
     )
     md_lines.append(f"- enable_server_metrics: `{bool(args.enable_server_metrics)}`")
     md_lines.append(f"- server_extra_args: `{args.server_extra_args}`")

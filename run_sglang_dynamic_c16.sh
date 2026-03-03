@@ -34,6 +34,7 @@ ADAPTIVE_K_MAX="${ADAPTIVE_K_MAX:-16}"
 ADAPTIVE_K_START="${ADAPTIVE_K_START:-}"
 ADAPTIVE_LOW_ACCEPT_THRESHOLD="${ADAPTIVE_LOW_ACCEPT_THRESHOLD:-0.35}"
 ADAPTIVE_LOW_ACCEPT_STREAK="${ADAPTIVE_LOW_ACCEPT_STREAK:-2}"
+ENABLE_DFLASH_CYCLE_TRACE="${ENABLE_DFLASH_CYCLE_TRACE:-0}"
 
 RUN_TAG="${RUN_TAG:-sglang_dynamic_c16_$(date +%Y%m%d_%H%M%S)}"
 LOG_DIR="${LOG_DIR:-logs/${RUN_TAG}}"
@@ -83,6 +84,9 @@ if [[ "${BATCH_REQUESTS}" == "1" ]]; then
 fi
 if [[ "${RUN_BASELINE}" == "0" ]]; then
   cmd+=(--skip-baseline)
+fi
+if [[ "${ENABLE_DFLASH_CYCLE_TRACE}" == "1" ]]; then
+  cmd+=(--enable-dflash-cycle-trace)
 fi
 
 {
