@@ -37,7 +37,10 @@ ADAPTIVE_K_MAX="${ADAPTIVE_K_MAX:-16}"
 ADAPTIVE_K_START="${ADAPTIVE_K_START:-}"
 ADAPTIVE_LOW_ACCEPT_THRESHOLD="${ADAPTIVE_LOW_ACCEPT_THRESHOLD:-0.35}"
 ADAPTIVE_LOW_ACCEPT_STREAK="${ADAPTIVE_LOW_ACCEPT_STREAK:-2}"
-ENABLE_DFLASH_CYCLE_TRACE="${ENABLE_DFLASH_CYCLE_TRACE:-0}"
+ADAPTIVE_HIGH_ACCEPT_THRESHOLD="${ADAPTIVE_HIGH_ACCEPT_THRESHOLD:-0.90}"
+ADAPTIVE_HIGH_ACCEPT_STREAK="${ADAPTIVE_HIGH_ACCEPT_STREAK:-2}"
+ADAPTIVE_COOLDOWN_CYCLES="${ADAPTIVE_COOLDOWN_CYCLES:-1}"
+ENABLE_DFLASH_CYCLE_TRACE="${ENABLE_DFLASH_CYCLE_TRACE:-1}"
 
 RUN_TAG="${RUN_TAG:-sglang_dynamic_c16_$(date +%Y%m%d_%H%M%S)}"
 LOG_DIR="${LOG_DIR:-logs/${RUN_TAG}}"
@@ -82,6 +85,9 @@ cmd=(
   --speculative-dflash-adaptive-k-max "${ADAPTIVE_K_MAX}"
   --speculative-dflash-adaptive-low-accept-threshold "${ADAPTIVE_LOW_ACCEPT_THRESHOLD}"
   --speculative-dflash-adaptive-low-accept-streak "${ADAPTIVE_LOW_ACCEPT_STREAK}"
+  --speculative-dflash-adaptive-high-accept-threshold "${ADAPTIVE_HIGH_ACCEPT_THRESHOLD}"
+  --speculative-dflash-adaptive-high-accept-streak "${ADAPTIVE_HIGH_ACCEPT_STREAK}"
+  --speculative-dflash-adaptive-cooldown-cycles "${ADAPTIVE_COOLDOWN_CYCLES}"
   --enable-server-metrics
   --enable-dflash-stage-timing
   --save-call-trace-path "${OUT_TRACE}"

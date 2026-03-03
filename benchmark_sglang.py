@@ -965,6 +965,24 @@ def main() -> None:
         help="Server-side DFLASH adaptive consecutive low-accept cycles before one-step fallback.",
     )
     parser.add_argument(
+        "--speculative-dflash-adaptive-high-accept-threshold",
+        type=float,
+        default=0.90,
+        help="Server-side DFLASH adaptive threshold for allowing one-step block-size increase.",
+    )
+    parser.add_argument(
+        "--speculative-dflash-adaptive-high-accept-streak",
+        type=int,
+        default=2,
+        help="Server-side DFLASH adaptive consecutive high-accept cycles before one-step increase.",
+    )
+    parser.add_argument(
+        "--speculative-dflash-adaptive-cooldown-cycles",
+        type=int,
+        default=1,
+        help="Server-side DFLASH adaptive hold cycles after each block-size change.",
+    )
+    parser.add_argument(
         "--dynamic-block-sizes",
         type=str,
         default="",
@@ -1461,6 +1479,12 @@ def main() -> None:
                             str(float(args.speculative_dflash_adaptive_low_accept_threshold)),
                             "--speculative-dflash-adaptive-low-accept-streak",
                             str(int(args.speculative_dflash_adaptive_low_accept_streak)),
+                            "--speculative-dflash-adaptive-high-accept-threshold",
+                            str(float(args.speculative_dflash_adaptive_high_accept_threshold)),
+                            "--speculative-dflash-adaptive-high-accept-streak",
+                            str(int(args.speculative_dflash_adaptive_high_accept_streak)),
+                            "--speculative-dflash-adaptive-cooldown-cycles",
+                            str(int(args.speculative_dflash_adaptive_cooldown_cycles)),
                         ]
                     )
                     if args.speculative_dflash_adaptive_k_min is not None:
@@ -1762,6 +1786,15 @@ def main() -> None:
     )
     md_lines.append(
         f"- speculative_dflash_adaptive_low_accept_streak: `{args.speculative_dflash_adaptive_low_accept_streak}`"
+    )
+    md_lines.append(
+        f"- speculative_dflash_adaptive_high_accept_threshold: `{args.speculative_dflash_adaptive_high_accept_threshold}`"
+    )
+    md_lines.append(
+        f"- speculative_dflash_adaptive_high_accept_streak: `{args.speculative_dflash_adaptive_high_accept_streak}`"
+    )
+    md_lines.append(
+        f"- speculative_dflash_adaptive_cooldown_cycles: `{args.speculative_dflash_adaptive_cooldown_cycles}`"
     )
     md_lines.append(f"- dynamic_mode: `{bool(dynamic_mode)}`")
     md_lines.append(

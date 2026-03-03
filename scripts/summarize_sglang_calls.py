@@ -58,6 +58,30 @@ def _normalize_cycle_trace(raw_trace):
         runtime_bs = _as_int(item.get("runtime_block_size"))
         if runtime_bs is not None and runtime_bs <= 0:
             runtime_bs = None
+        raw_decision = item.get("adaptive_decision")
+        adaptive_decision = None
+        if isinstance(raw_decision, dict):
+            adaptive_decision = {
+                "prev_bs": _as_int(raw_decision.get("prev_bs")),
+                "next_bs": _as_int(raw_decision.get("next_bs")),
+                "action": raw_decision.get("action"),
+                "reason": raw_decision.get("reason"),
+                "accept_ratio": _as_float(raw_decision.get("accept_ratio")),
+                "accept_ratio_ewma": _as_float(raw_decision.get("accept_ratio_ewma")),
+                "accepted_draft_tokens": _as_int(
+                    raw_decision.get("accepted_draft_tokens")
+                ),
+                "proposed_draft_tokens": _as_int(
+                    raw_decision.get("proposed_draft_tokens")
+                ),
+                "low_accept_count": _as_int(raw_decision.get("low_accept_count")),
+                "high_accept_count": _as_int(raw_decision.get("high_accept_count")),
+                "cooldown_remaining": _as_int(
+                    raw_decision.get("cooldown_remaining")
+                ),
+                "lgen_hat": _as_float(raw_decision.get("lgen_hat")),
+                "lacc_hat": _as_float(raw_decision.get("lacc_hat")),
+            }
         out.append(
             {
                 "cycle_idx": _as_int(item.get("cycle_idx")),
@@ -67,6 +91,7 @@ def _normalize_cycle_trace(raw_trace):
                 "accept_rate": _as_float(item.get("accept_rate")),
                 "draft_time_s": _as_float(item.get("draft_time_s")),
                 "verify_time_s": _as_float(item.get("verify_time_s")),
+                "adaptive_decision": adaptive_decision,
             }
         )
     return out
@@ -337,6 +362,11 @@ def summarize(rows):
             "verify_time_cnt": 0,
         }
     )
+    adaptive_action_hist = Counter()
+    adaptive_reason_hist = Counter()
+    adaptive_transition_hist = Counter()
+    adaptive_accept_ratio_ewma_vals = []
+    adaptive_decision_rows = 0
 
     for c in cycle_trace_rows:
         bs = _as_int(c.get("runtime_block_size"))
@@ -376,6 +406,28 @@ def summarize(rows):
             cycle_trace_verify_time_vals.append(verify_time_s)
             d["verify_time_sum"] += float(verify_time_s)
             d["verify_time_cnt"] += 1
+
+        decision = c.get("adaptive_decision")
+        if isinstance(decision, dict):
+            adaptive_decision_rows += 1
+            action = decision.get("action")
+            if isinstance(action, str) and action:
+                adaptive_action_hist[action] += 1
+            reason = decision.get("reason")
+            if isinstance(reason, str) and reason:
+                adaptive_reason_hist[reason] += 1
+            prev_bs = _as_int(decision.get("prev_bs"))
+            next_bs = _as_int(decision.get("next_bs"))
+            if (
+                prev_bs is not None
+                and next_bs is not None
+                and prev_bs > 0
+                and next_bs > 0
+            ):
+                adaptive_transition_hist[f"{prev_bs}->{next_bs}"] += 1
+            ar_ewma = _as_float(decision.get("accept_ratio_ewma"))
+            if ar_ewma is not None:
+                adaptive_accept_ratio_ewma_vals.append(ar_ewma)
 
     bs_cycle_hist = Counter()
     bs_request_hist = Counter()
@@ -546,6 +598,53 @@ def summarize(rows):
         lines.append(
             f"- mean_accept_rate_per_cycle_from_trace: `{_fmt(mean(cycle_trace_accept_rate_vals), 4) if cycle_trace_accept_rate_vals else 'N/A'}`"
         )
+    lines.append("")
+    lines.append("## Adaptive Decisions")
+    lines.append(
+        f"- cycle_rows_with_adaptive_decision: `{adaptive_decision_rows}`"
+    )
+    lines.append(
+        f"- mean_accept_ratio_ewma_from_trace: `{_fmt(mean(adaptive_accept_ratio_ewma_vals), 4) if adaptive_accept_ratio_ewma_vals else 'N/A'}`"
+    )
+    lines.append("")
+    lines.append("### Action Histogram")
+    lines.append("| action | cycles | pct |")
+    lines.append("|---|---:|---:|")
+    total_actions = sum(adaptive_action_hist.values())
+    if total_actions > 0:
+        for action, ct in sorted(
+            adaptive_action_hist.items(), key=lambda kv: (-kv[1], kv[0])
+        ):
+            pct = 100.0 * float(ct) / float(total_actions)
+            lines.append(f"| {action} | {ct} | {_fmt(pct, 2)}% |")
+    else:
+        lines.append("| N/A | 0 | 0.00% |")
+    lines.append("")
+    lines.append("### Reason Histogram")
+    lines.append("| reason | cycles | pct |")
+    lines.append("|---|---:|---:|")
+    total_reasons = sum(adaptive_reason_hist.values())
+    if total_reasons > 0:
+        for reason, ct in sorted(
+            adaptive_reason_hist.items(), key=lambda kv: (-kv[1], kv[0])
+        ):
+            pct = 100.0 * float(ct) / float(total_reasons)
+            lines.append(f"| {reason} | {ct} | {_fmt(pct, 2)}% |")
+    else:
+        lines.append("| N/A | 0 | 0.00% |")
+    lines.append("")
+    lines.append("### Top Block-Size Transitions")
+    lines.append("| transition | cycles | pct |")
+    lines.append("|---|---:|---:|")
+    total_transitions = sum(adaptive_transition_hist.values())
+    if total_transitions > 0:
+        for transition, ct in sorted(
+            adaptive_transition_hist.items(), key=lambda kv: (-kv[1], kv[0])
+        )[:12]:
+            pct = 100.0 * float(ct) / float(total_transitions)
+            lines.append(f"| {transition} | {ct} | {_fmt(pct, 2)}% |")
+    else:
+        lines.append("| N/A | 0 | 0.00% |")
     lines.append("")
     lines.append("## Per-Request Block Usage")
     if requests_with_runtime_hist:

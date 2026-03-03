@@ -33,6 +33,25 @@ sglang serve --help | grep speculative-dflash-adaptive-k-start
   - Initial runtime block size per request.
   - Must satisfy `k_min <= k_start <= k_max`.
   - Lets us run `k_max=16` but start each request at `k_start=8`.
+- Less brittle adaptive knobs (hysteresis + cooldown):
+  - `--speculative-dflash-adaptive-low-accept-threshold`, `--speculative-dflash-adaptive-low-accept-streak`:
+    - Downshift gate on EWMA acceptance ratio.
+  - `--speculative-dflash-adaptive-high-accept-threshold`, `--speculative-dflash-adaptive-high-accept-streak`:
+    - Upshift gate on EWMA acceptance ratio.
+  - `--speculative-dflash-adaptive-cooldown-cycles`:
+    - Hold cycles after block-size changes to reduce oscillation.
+
+## Fixed Subset Mode (apples-to-apples)
+- Benchmark now supports:
+  - `--fixed-question-count N`
+  - `--fixed-question-offset O`
+- When `N > 0`, every config/concurrency uses the exact same eval window
+  `dataset[O : O+N]`.
+- Warmup prompts are sourced from a separate prompt pool so drop-first-batch
+  no longer shifts which eval prompts are measured across concurrencies.
+- Runner env wiring:
+  - `run_sglang_tp1_sweep.sh`: `FIXED_QUESTION_COUNT`, `FIXED_QUESTION_OFFSET`
+  - `run_sglang_dynamic_c16.sh`: `FIXED_QUESTION_COUNT`, `FIXED_QUESTION_OFFSET`
 
 ## Key Scripts
 - Benchmark: `benchmark_sglang.py`
@@ -56,6 +75,11 @@ ADAPTIVE_K_MAX=16 \
 ADAPTIVE_K_START=8 \
 ADAPTIVE_LOW_ACCEPT_THRESHOLD=0.35 \
 ADAPTIVE_LOW_ACCEPT_STREAK=2 \
+ADAPTIVE_HIGH_ACCEPT_THRESHOLD=0.90 \
+ADAPTIVE_HIGH_ACCEPT_STREAK=2 \
+ADAPTIVE_COOLDOWN_CYCLES=1 \
+FIXED_QUESTION_COUNT=256 \
+FIXED_QUESTION_OFFSET=0 \
 bash run_sglang_dynamic_c16.sh
 ```
 
@@ -75,6 +99,9 @@ bash run_sglang_dynamic_c16.sh
 - `spec_runtime_bs_hist` (exact runtime block-size cycle histogram per request)
 - `spec_runtime_bs_mode`
 - `spec_runtime_bs_avg`
+- `spec_cycle_trace[*].adaptive_decision`:
+  - includes per-cycle `prev_bs`, `next_bs`, `action`, `reason`,
+    `accept_ratio`, `accept_ratio_ewma`, and streak/cooldown counters.
 
 ## Known Failure Modes
 - Unknown adaptive CLI args:
@@ -83,4 +110,3 @@ bash run_sglang_dynamic_c16.sh
   - `pip install imageio`
 - `libnuma.so.1` missing:
   - install `libnuma1` in pod image/env.
-
