@@ -1117,6 +1117,18 @@ def main() -> None:
         help="Cap num_questions per (tp, concurrency) run (default: 1024).",
     )
     parser.add_argument(
+        "--fixed-question-count",
+        type=int,
+        default=0,
+        help="If > 0, use the same fixed number of prompts for every concurrency/config.",
+    )
+    parser.add_argument(
+        "--fixed-question-offset",
+        type=int,
+        default=0,
+        help="Start index for fixed-question mode (only used when --fixed-question-count > 0).",
+    )
+    parser.add_argument(
         "--attention-backends",
         type=str,
         default="flashinfer,fa3,fa4",
@@ -1179,10 +1191,32 @@ def main() -> None:
     if not concurrencies:
         raise RuntimeError("No concurrencies specified.")
 
-    num_questions_by_conc = {
-        c: min(int(args.questions_per_concurrency_base) * int(c), int(args.max_questions_per_config))
-        for c in concurrencies
-    }
+    fixed_question_count = int(args.fixed_question_count)
+    fixed_question_offset = int(args.fixed_question_offset)
+    if fixed_question_count < 0:
+        raise RuntimeError(
+            f"--fixed-question-count must be >= 0, got {fixed_question_count}."
+        )
+    if fixed_question_offset < 0:
+        raise RuntimeError(
+            f"--fixed-question-offset must be >= 0, got {fixed_question_offset}."
+        )
+    if fixed_question_count == 0 and fixed_question_offset != 0:
+        raise RuntimeError(
+            "--fixed-question-offset requires --fixed-question-count > 0."
+        )
+    fixed_subset_mode = fixed_question_count > 0
+
+    if fixed_subset_mode:
+        num_questions_by_conc = {c: fixed_question_count for c in concurrencies}
+    else:
+        num_questions_by_conc = {
+            c: min(
+                int(args.questions_per_concurrency_base) * int(c),
+                int(args.max_questions_per_config),
+            )
+            for c in concurrencies
+        }
     max_questions = max(num_questions_by_conc.values())
     max_concurrency = max(concurrencies)
 
@@ -1198,7 +1232,14 @@ def main() -> None:
     # --- Load Data using the new function ---
     print(f"Loading dataset: {args.dataset_name}...")
     dataset = load_and_process_dataset(args.dataset_name)
-    required_questions = max_questions + max_concurrency
+    if not dataset:
+        raise RuntimeError(f"Dataset {args.dataset_name} is empty after preprocessing.")
+    if fixed_subset_mode:
+        required_questions = (
+            fixed_question_offset + fixed_question_count + max_concurrency
+        )
+    else:
+        required_questions = max_questions + max_concurrency
     
     if len(dataset) < required_questions:
          print(f"Warning: Dataset has {len(dataset)} items, but need up to {required_questions}. Reusing items.")
@@ -1221,6 +1262,31 @@ def main() -> None:
         prompts.append(prompt_text)
         if len(prompts) >= required_questions:
             break
+
+    fixed_eval_prompts: list[str] = []
+    fixed_warmup_prompts: list[str] = []
+    if fixed_subset_mode:
+        eval_start = fixed_question_offset
+        eval_end = eval_start + fixed_question_count
+        warmup_start = eval_end
+        warmup_end = warmup_start + max_concurrency
+        fixed_eval_prompts = prompts[eval_start:eval_end]
+        fixed_warmup_prompts = prompts[warmup_start:warmup_end]
+        if len(fixed_eval_prompts) != fixed_question_count:
+            raise RuntimeError(
+                "Failed to build fixed evaluation prompt window. "
+                f"wanted={fixed_question_count}, got={len(fixed_eval_prompts)}"
+            )
+        if len(fixed_warmup_prompts) != max_concurrency:
+            raise RuntimeError(
+                "Failed to build fixed warmup prompt pool. "
+                f"wanted={max_concurrency}, got={len(fixed_warmup_prompts)}"
+            )
+
+    def _prompts_for_run(n: int, conc: int) -> list[str]:
+        if not fixed_subset_mode:
+            return prompts[: n + conc]
+        return fixed_warmup_prompts[:conc] + fixed_eval_prompts[:n]
 
     # Results indexed by (backend, concurrency) for baseline + dflash.
     # Removed TP dimension from keys since we aren't sweeping it.
@@ -1297,7 +1363,7 @@ def main() -> None:
                         )
                         metrics = _run_bench_requests(
                             baseline_url,
-                            prompts=prompts[: n + conc],
+                            prompts=_prompts_for_run(n, int(conc)),
                             max_new_tokens=int(args.max_new_tokens),
                             concurrency=int(conc),
                             batch_requests=bool(args.batch_requests),
@@ -1499,7 +1565,11 @@ def main() -> None:
                             arm_usage,
                         ) = _run_dynamic_spec(
                             urls_by_bs=urls_by_bs,
-                            prompts=prompts[:n],
+                            prompts=(
+                                fixed_eval_prompts[:n]
+                                if fixed_subset_mode
+                                else prompts[:n]
+                            ),
                             max_new_tokens=int(args.max_new_tokens),
                             concurrency=int(conc),
                             batch_requests=bool(args.batch_requests),
@@ -1600,7 +1670,7 @@ def main() -> None:
                         )
                         metrics = _run_bench_requests(
                             dflash_url,
-                            prompts=prompts[: n + conc],
+                            prompts=_prompts_for_run(n, int(conc)),
                             max_new_tokens=int(args.max_new_tokens),
                             concurrency=int(conc),
                             batch_requests=bool(args.batch_requests),
@@ -1732,6 +1802,10 @@ def main() -> None:
     md_lines.append(f"- tp_size: `{tp}`")
     md_lines.append(f"- concurrencies: `{', '.join(str(x) for x in concurrencies)}`")
     md_lines.append(f"- questions_per_concurrency: `base={args.questions_per_concurrency_base}`")
+    md_lines.append(f"- max_questions_per_config: `{args.max_questions_per_config}`")
+    md_lines.append(f"- fixed_question_count: `{fixed_question_count}`")
+    md_lines.append(f"- fixed_question_offset: `{fixed_question_offset}`")
+    md_lines.append(f"- fixed_subset_mode: `{fixed_subset_mode}`")
     md_lines.append(f"- device_sm: `{device_sm}`")
     md_lines.append(f"- is_blackwell: `{is_blackwell}`")
     md_lines.append(f"- skip_baseline: `{bool(args.skip_baseline)}`")
