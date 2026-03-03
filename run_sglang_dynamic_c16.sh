@@ -112,7 +112,7 @@ if [[ "${ENABLE_DFLASH_CYCLE_TRACE}" == "1" ]]; then
   cmd+=(--enable-dflash-cycle-trace)
 fi
 if [[ -n "${SERVER_EXTRA_ARGS}" ]]; then
-  cmd+=(--server-extra-args "${SERVER_EXTRA_ARGS}")
+  cmd+=(--server-extra-args="${SERVER_EXTRA_ARGS}")
 fi
 
 {

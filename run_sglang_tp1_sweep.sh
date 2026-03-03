@@ -14,6 +14,8 @@ DRAFT_MODEL="${DRAFT_MODEL:-z-lab/Qwen3-4B-DFlash-b16}"
 CONCURRENCIES="${CONCURRENCIES:-1,2,4,8,16,32}"
 QUESTIONS_PER_CONCURRENCY_BASE="${QUESTIONS_PER_CONCURRENCY_BASE:-8}"
 MAX_QUESTIONS_PER_CONFIG="${MAX_QUESTIONS_PER_CONFIG:-1024}"
+FIXED_QUESTION_COUNT="${FIXED_QUESTION_COUNT:-0}"
+FIXED_QUESTION_OFFSET="${FIXED_QUESTION_OFFSET:-0}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-2048}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-128}"
 TIMEOUT_S="${TIMEOUT_S:-3600}"
@@ -40,6 +42,19 @@ conc_raw="${CONCURRENCIES//,/ }"
 read -r -a CONC_LIST <<< "${conc_raw}"
 if [[ "${#CONC_LIST[@]}" -eq 0 ]]; then
   echo "ERROR: no valid concurrencies in CONCURRENCIES=${CONCURRENCIES}" >&2
+  exit 1
+fi
+
+if ! [[ "${FIXED_QUESTION_COUNT}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: FIXED_QUESTION_COUNT must be a non-negative integer. Got '${FIXED_QUESTION_COUNT}'." >&2
+  exit 1
+fi
+if ! [[ "${FIXED_QUESTION_OFFSET}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: FIXED_QUESTION_OFFSET must be a non-negative integer. Got '${FIXED_QUESTION_OFFSET}'." >&2
+  exit 1
+fi
+if [[ "${FIXED_QUESTION_COUNT}" -eq 0 && "${FIXED_QUESTION_OFFSET}" -ne 0 ]]; then
+  echo "ERROR: FIXED_QUESTION_OFFSET requires FIXED_QUESTION_COUNT > 0." >&2
   exit 1
 fi
 
@@ -83,6 +98,7 @@ echo "concurrency_list=${CONC_LIST[*]}"
 echo "block_sizes=${BS_LIST[*]}"
 echo "attention_backends=${ATTENTION_BACKENDS} speculative_algorithm=${SPECULATIVE_ALGORITHM}"
 echo "max_new_tokens=${MAX_NEW_TOKENS} qpc_base=${QUESTIONS_PER_CONCURRENCY_BASE} max_q_per_config=${MAX_QUESTIONS_PER_CONFIG}"
+echo "fixed_question_count=${FIXED_QUESTION_COUNT} fixed_question_offset=${FIXED_QUESTION_OFFSET}"
 echo "batch_requests=${BATCH_REQUESTS} skip_baseline=${SKIP_BASELINE} enable_server_metrics=${ENABLE_SERVER_METRICS}"
 echo "enable_dflash_cycle_trace=${ENABLE_DFLASH_CYCLE_TRACE}"
 echo "log_dir=${LOG_DIR}"
@@ -116,6 +132,12 @@ for bs in "${BS_LIST[@]}"; do
       --output-md "${md_path}"
       --save-call-trace-path "${trace_path}"
     )
+    if [[ "${FIXED_QUESTION_COUNT}" -gt 0 ]]; then
+      cmd+=(
+        --fixed-question-count "${FIXED_QUESTION_COUNT}"
+        --fixed-question-offset "${FIXED_QUESTION_OFFSET}"
+      )
+    fi
 
     if [[ "${SPECULATIVE_ALGORITHM^^}" == "DFLASH" && "${bs}" != "NA" ]]; then
       cmd+=(--speculative-dflash-block-size "${bs}")
@@ -142,7 +164,7 @@ for bs in "${BS_LIST[@]}"; do
       cmd+=(--disable-overlap-schedule)
     fi
     if [[ -n "${SERVER_EXTRA_ARGS}" ]]; then
-      cmd+=(--server-extra-args "${SERVER_EXTRA_ARGS}")
+      cmd+=(--server-extra-args="${SERVER_EXTRA_ARGS}")
     fi
 
     {
