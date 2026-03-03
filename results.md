@@ -3,6 +3,9 @@
 Generated on: 2026-02-18  
 Scope: artifacts currently present in local `logs/` and `outputs/`.
 
+SGLang adaptive follow-up note:
+- `docs/SGLANG_ADAPTIVE_PREPATCH_20260303.md`
+
 ## 1) Completed AIME25 Block-Size Sweeps (`max_new_tokens=256`)
 
 ### AIME25, `max_samples=8` (aggregated across completed sweeps)

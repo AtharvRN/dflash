@@ -1,5 +1,8 @@
 # SGLang GSM8K TP=1 Block-Size x Concurrency Sweep (2026-03-02)
 
+Related follow-up:
+- `docs/SGLANG_ADAPTIVE_PREPATCH_20260303.md` (pre-patch adaptive behavior notes and cycle-trace summaries)
+
 ## Run Setup
 - Run tags: `sg_tp1_bsweep_g0_20260302_024551`, `sg_tp1_bsweep_g1_20260302_024701`
 - Source summaries: `pulled/sglang_sweeps_20260302_full/sg_tp1_bsweep_g0_20260302_024551/summary.csv`, `pulled/sglang_sweeps_20260302_full/sg_tp1_bsweep_g1_20260302_024701/summary.csv`
