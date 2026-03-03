@@ -19,8 +19,11 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-2048}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-128}"
 QUESTIONS_PER_CONCURRENCY_BASE="${QUESTIONS_PER_CONCURRENCY_BASE:-16}"
 MAX_QUESTIONS_PER_CONFIG="${MAX_QUESTIONS_PER_CONFIG:-256}"
+FIXED_QUESTION_COUNT="${FIXED_QUESTION_COUNT:-0}"
+FIXED_QUESTION_OFFSET="${FIXED_QUESTION_OFFSET:-0}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flashinfer}"
 TIMEOUT_S="${TIMEOUT_S:-3600}"
+SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS:-}"
 
 RUN_BASELINE="${RUN_BASELINE:-1}"
 BATCH_REQUESTS="${BATCH_REQUESTS:-1}"
@@ -44,6 +47,19 @@ OUT_MD="${LOG_DIR}/${RUN_TAG}.md"
 OUT_TRACE="${LOG_DIR}/${RUN_TAG}_calls.jsonl"
 OUT_LOG="${LOG_DIR}/${RUN_TAG}.log"
 OUT_TRACE_SUMMARY_MD="${LOG_DIR}/${RUN_TAG}_calls_summary.md"
+
+if ! [[ "${FIXED_QUESTION_COUNT}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: FIXED_QUESTION_COUNT must be a non-negative integer. Got '${FIXED_QUESTION_COUNT}'." >&2
+  exit 1
+fi
+if ! [[ "${FIXED_QUESTION_OFFSET}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: FIXED_QUESTION_OFFSET must be a non-negative integer. Got '${FIXED_QUESTION_OFFSET}'." >&2
+  exit 1
+fi
+if [[ "${FIXED_QUESTION_COUNT}" -eq 0 && "${FIXED_QUESTION_OFFSET}" -ne 0 ]]; then
+  echo "ERROR: FIXED_QUESTION_OFFSET requires FIXED_QUESTION_COUNT > 0." >&2
+  exit 1
+fi
 
 cmd=(
   python benchmark_sglang.py
@@ -72,6 +88,13 @@ cmd=(
   --output-md "${OUT_MD}"
 )
 
+if [[ "${FIXED_QUESTION_COUNT}" -gt 0 ]]; then
+  cmd+=(
+    --fixed-question-count "${FIXED_QUESTION_COUNT}"
+    --fixed-question-offset "${FIXED_QUESTION_OFFSET}"
+  )
+fi
+
 if [[ "${ADAPTIVE_ENABLED}" == "1" ]]; then
   cmd+=(--speculative-dflash-adaptive-block-size)
 fi
@@ -87,6 +110,9 @@ if [[ "${RUN_BASELINE}" == "0" ]]; then
 fi
 if [[ "${ENABLE_DFLASH_CYCLE_TRACE}" == "1" ]]; then
   cmd+=(--enable-dflash-cycle-trace)
+fi
+if [[ -n "${SERVER_EXTRA_ARGS}" ]]; then
+  cmd+=(--server-extra-args "${SERVER_EXTRA_ARGS}")
 fi
 
 {
