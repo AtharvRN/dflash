@@ -520,8 +520,8 @@ class DynamicAdaptiveController:
             raise ValueError("No dynamic block-size candidates provided.")
         if not self.batch_sizes:
             raise ValueError("No dynamic batch-size candidates provided.")
-        if policy not in {"ewma", "ucb"}:
-            raise ValueError("dynamic-policy must be one of: ewma, ucb.")
+        if policy not in {"ewma", "ucb", "linucb"}:
+            raise ValueError("dynamic-policy must be one of: ewma, ucb, linucb.")
         if not (0.0 < float(ewma_alpha) <= 1.0):
             raise ValueError("dynamic-ewma-alpha must be in (0, 1].")
 
@@ -609,7 +609,7 @@ class DynamicAdaptiveController:
             if since_warmup >= 0 and since_warmup % self.probe_interval == 0:
                 return self._next_probe(feasible)
 
-        if self.policy == "ucb":
+        if self.policy in {"ucb", "linucb"}:
             return max(feasible, key=self._ucb_value)
 
         if self.current in feasible:
@@ -926,7 +926,7 @@ def main() -> None:
         "--speculative-dflash-adaptive-algo",
         type=str,
         default="ewma",
-        choices=["ewma", "ucb"],
+        choices=["ewma", "ucb", "linucb"],
         help="Server-side DFLASH adaptive algorithm.",
     )
     parser.add_argument(
@@ -963,6 +963,18 @@ def main() -> None:
         type=float,
         default=0.05,
         help="Server-side DFLASH adaptive UCBSPEC confidence parameter delta.",
+    )
+    parser.add_argument(
+        "--speculative-dflash-adaptive-linucb-alpha",
+        type=float,
+        default=1.0,
+        help="Server-side DFLASH adaptive LinUCB exploration scale alpha.",
+    )
+    parser.add_argument(
+        "--speculative-dflash-adaptive-linucb-lambda",
+        type=float,
+        default=1.0,
+        help="Server-side DFLASH adaptive LinUCB ridge regularization lambda.",
     )
     parser.add_argument(
         "--speculative-dflash-adaptive-k-min",
@@ -1034,8 +1046,8 @@ def main() -> None:
         "--dynamic-policy",
         type=str,
         default="ewma",
-        choices=["ewma", "ucb"],
-        help="Dynamic controller policy. ewma = hysteresis switching; ucb = exploration-aware bandit.",
+        choices=["ewma", "ucb", "linucb"],
+        help="Dynamic controller policy. ewma = hysteresis switching; ucb/linucb = exploration-aware bandits.",
     )
     parser.add_argument(
         "--dynamic-gpu-map",
@@ -1547,6 +1559,10 @@ def main() -> None:
                             str(float(args.speculative_dflash_adaptive_ucb_c)),
                             "--speculative-dflash-adaptive-ucb-delta",
                             str(float(args.speculative_dflash_adaptive_ucb_delta)),
+                            "--speculative-dflash-adaptive-linucb-alpha",
+                            str(float(args.speculative_dflash_adaptive_linucb_alpha)),
+                            "--speculative-dflash-adaptive-linucb-lambda",
+                            str(float(args.speculative_dflash_adaptive_linucb_lambda)),
                             "--speculative-dflash-adaptive-low-accept-threshold",
                             str(float(args.speculative_dflash_adaptive_low_accept_threshold)),
                             "--speculative-dflash-adaptive-low-accept-streak",
@@ -1860,6 +1876,12 @@ def main() -> None:
     )
     md_lines.append(
         f"- speculative_dflash_adaptive_ucb_delta: `{args.speculative_dflash_adaptive_ucb_delta}`"
+    )
+    md_lines.append(
+        f"- speculative_dflash_adaptive_linucb_alpha: `{args.speculative_dflash_adaptive_linucb_alpha}`"
+    )
+    md_lines.append(
+        f"- speculative_dflash_adaptive_linucb_lambda: `{args.speculative_dflash_adaptive_linucb_lambda}`"
     )
     md_lines.append(
         f"- speculative_dflash_adaptive_k_min: `{args.speculative_dflash_adaptive_k_min}`"

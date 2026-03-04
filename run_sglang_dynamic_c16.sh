@@ -36,6 +36,8 @@ ADAPTIVE_DELTA="${ADAPTIVE_DELTA:-1.0}"
 ADAPTIVE_REWARD_MODE="${ADAPTIVE_REWARD_MODE:-accept_length}"
 ADAPTIVE_UCB_C="${ADAPTIVE_UCB_C:-1.0}"
 ADAPTIVE_UCB_DELTA="${ADAPTIVE_UCB_DELTA:-0.05}"
+ADAPTIVE_LINUCB_ALPHA="${ADAPTIVE_LINUCB_ALPHA:-1.0}"
+ADAPTIVE_LINUCB_LAMBDA="${ADAPTIVE_LINUCB_LAMBDA:-1.0}"
 ADAPTIVE_K_MIN="${ADAPTIVE_K_MIN:-1}"
 ADAPTIVE_K_MAX="${ADAPTIVE_K_MAX:-16}"
 ADAPTIVE_K_START="${ADAPTIVE_K_START:-}"
@@ -46,6 +48,8 @@ ADAPTIVE_HIGH_ACCEPT_THRESHOLD="${ADAPTIVE_HIGH_ACCEPT_THRESHOLD:-0.90}"
 ADAPTIVE_HIGH_ACCEPT_STREAK="${ADAPTIVE_HIGH_ACCEPT_STREAK:-2}"
 ADAPTIVE_COOLDOWN_CYCLES="${ADAPTIVE_COOLDOWN_CYCLES:-1}"
 ENABLE_DFLASH_CYCLE_TRACE="${ENABLE_DFLASH_CYCLE_TRACE:-1}"
+ENABLE_GPU_MONITOR="${ENABLE_GPU_MONITOR:-1}"
+GPU_MONITOR_INTERVAL_S="${GPU_MONITOR_INTERVAL_S:-1}"
 
 RUN_TAG="${RUN_TAG:-sglang_dynamic_c16_$(date +%Y%m%d_%H%M%S)}"
 LOG_DIR="${LOG_DIR:-logs/${RUN_TAG}}"
@@ -55,6 +59,41 @@ OUT_MD="${LOG_DIR}/${RUN_TAG}.md"
 OUT_TRACE="${LOG_DIR}/${RUN_TAG}_calls.jsonl"
 OUT_LOG="${LOG_DIR}/${RUN_TAG}.log"
 OUT_TRACE_SUMMARY_MD="${LOG_DIR}/${RUN_TAG}_calls_summary.md"
+OUT_GPU_METRICS_CSV="${LOG_DIR}/${RUN_TAG}_gpu_metrics.csv"
+OUT_GPU_SUMMARY_MD="${LOG_DIR}/${RUN_TAG}_gpu_metrics_summary.md"
+OUT_GPU_SUMMARY_JSON="${LOG_DIR}/${RUN_TAG}_gpu_metrics_summary.json"
+
+GPU_MONITOR_PID=""
+
+start_gpu_monitor() {
+  if [[ "${ENABLE_GPU_MONITOR}" != "1" ]]; then
+    return
+  fi
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    echo "[gpu-monitor] nvidia-smi not found; skipping GPU metrics capture." | tee -a "${OUT_LOG}"
+    return
+  fi
+  bash "${SCRIPT_DIR}/scripts/record_gpu_metrics.sh" \
+    "${OUT_GPU_METRICS_CSV}" \
+    "${GPU_MONITOR_INTERVAL_S}" >> "${OUT_LOG}" 2>&1 &
+  GPU_MONITOR_PID=$!
+  echo "[gpu-monitor] started pid=${GPU_MONITOR_PID}, csv=${OUT_GPU_METRICS_CSV}, interval_s=${GPU_MONITOR_INTERVAL_S}" | tee -a "${OUT_LOG}"
+}
+
+stop_gpu_monitor() {
+  if [[ -n "${GPU_MONITOR_PID}" ]]; then
+    kill "${GPU_MONITOR_PID}" >/dev/null 2>&1 || true
+    wait "${GPU_MONITOR_PID}" 2>/dev/null || true
+    echo "[gpu-monitor] stopped pid=${GPU_MONITOR_PID}" | tee -a "${OUT_LOG}"
+    GPU_MONITOR_PID=""
+  fi
+}
+
+cleanup() {
+  stop_gpu_monitor
+}
+
+trap cleanup EXIT
 
 if ! [[ "${FIXED_QUESTION_COUNT}" =~ ^[0-9]+$ ]]; then
   echo "ERROR: FIXED_QUESTION_COUNT must be a non-negative integer. Got '${FIXED_QUESTION_COUNT}'." >&2
@@ -90,6 +129,8 @@ cmd=(
   --speculative-dflash-adaptive-reward-mode "${ADAPTIVE_REWARD_MODE}"
   --speculative-dflash-adaptive-ucb-c "${ADAPTIVE_UCB_C}"
   --speculative-dflash-adaptive-ucb-delta "${ADAPTIVE_UCB_DELTA}"
+  --speculative-dflash-adaptive-linucb-alpha "${ADAPTIVE_LINUCB_ALPHA}"
+  --speculative-dflash-adaptive-linucb-lambda "${ADAPTIVE_LINUCB_LAMBDA}"
   --speculative-dflash-adaptive-k-min "${ADAPTIVE_K_MIN}"
   --speculative-dflash-adaptive-k-max "${ADAPTIVE_K_MAX}"
   --speculative-dflash-adaptive-low-accept-threshold "${ADAPTIVE_LOW_ACCEPT_THRESHOLD}"
@@ -141,7 +182,9 @@ fi
   printf "\n"
 } | tee "${OUT_LOG}"
 
+start_gpu_monitor
 "${cmd[@]}" 2>&1 | tee -a "${OUT_LOG}"
+stop_gpu_monitor
 
 if [[ -f "${OUT_TRACE}" ]]; then
   python "${SCRIPT_DIR}/scripts/summarize_sglang_calls.py" \
@@ -151,8 +194,20 @@ else
   echo "Call trace not found at ${OUT_TRACE}; skipping summary generation." | tee -a "${OUT_LOG}"
 fi
 
+if [[ -s "${OUT_GPU_METRICS_CSV}" ]]; then
+  python "${SCRIPT_DIR}/scripts/summarize_gpu_metrics.py" \
+    --input "${OUT_GPU_METRICS_CSV}" \
+    --output-md "${OUT_GPU_SUMMARY_MD}" \
+    --output-json "${OUT_GPU_SUMMARY_JSON}" | tee -a "${OUT_LOG}"
+else
+  echo "GPU metrics not found at ${OUT_GPU_METRICS_CSV}; skipping GPU summary generation." | tee -a "${OUT_LOG}"
+fi
+
 echo "Done."
 echo "Markdown: ${OUT_MD}"
 echo "Call trace: ${OUT_TRACE}"
 echo "Call trace summary: ${OUT_TRACE_SUMMARY_MD}"
+echo "GPU metrics: ${OUT_GPU_METRICS_CSV}"
+echo "GPU summary: ${OUT_GPU_SUMMARY_MD}"
+echo "GPU summary JSON: ${OUT_GPU_SUMMARY_JSON}"
 echo "Log: ${OUT_LOG}"
