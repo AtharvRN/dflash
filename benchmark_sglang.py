@@ -953,6 +953,12 @@ def main() -> None:
         help="Server-side DFLASH adaptive initial block size per request.",
     )
     parser.add_argument(
+        "--speculative-dflash-adaptive-block-buckets",
+        type=str,
+        default="",
+        help="Optional comma-separated runtime block-size buckets for adaptive mode (e.g., 8,12,16).",
+    )
+    parser.add_argument(
         "--speculative-dflash-adaptive-low-accept-threshold",
         type=float,
         default=0.35,
@@ -1163,6 +1169,7 @@ def main() -> None:
     dynamic_mode = False
     dynamic_gpu_map: dict[int, str] = {}
     request_dflash_block_size: Optional[int] = None
+    adaptive_block_buckets: list[int] = []
 
     # Legacy client-side dynamic routing is intentionally retired in favor of
     # true server-side adaptive DFLASH block size.
@@ -1192,9 +1199,36 @@ def main() -> None:
         else:
             request_dflash_block_size = req_bs
 
+    raw_adaptive_block_buckets = args.speculative_dflash_adaptive_block_buckets.strip()
+    if raw_adaptive_block_buckets:
+        bucket_tokens = [x.strip() for x in raw_adaptive_block_buckets.split(",") if x.strip()]
+        if not bucket_tokens:
+            raise RuntimeError(
+                "--speculative-dflash-adaptive-block-buckets is set but empty."
+            )
+        seen_buckets: set[int] = set()
+        for token in bucket_tokens:
+            try:
+                bucket_value = int(token)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Invalid adaptive bucket value '{token}'. Expected comma-separated integers."
+                ) from exc
+            if bucket_value <= 0:
+                raise RuntimeError(
+                    f"Adaptive bucket values must be > 0, got {bucket_value}."
+                )
+            if bucket_value not in seen_buckets:
+                seen_buckets.add(bucket_value)
+                adaptive_block_buckets.append(bucket_value)
+
     if args.speculative_dflash_adaptive_block_size and args.speculative_algorithm.upper() != "DFLASH":
         raise RuntimeError(
             "--speculative-dflash-adaptive-block-size is only valid with --speculative-algorithm DFLASH."
+        )
+    if adaptive_block_buckets and not args.speculative_dflash_adaptive_block_size:
+        raise RuntimeError(
+            "--speculative-dflash-adaptive-block-buckets requires --speculative-dflash-adaptive-block-size."
         )
     if args.enable_dflash_cycle_trace and args.speculative_algorithm.upper() != "DFLASH":
         raise RuntimeError(
@@ -1507,6 +1541,11 @@ def main() -> None:
                                 "--speculative-dflash-adaptive-k-start",
                                 str(int(args.speculative_dflash_adaptive_k_start)),
                             ]
+                        )
+                    if adaptive_block_buckets:
+                        spec_server_args.extend(
+                            ["--speculative-dflash-adaptive-block-buckets"]
+                            + [str(int(x)) for x in adaptive_block_buckets]
                         )
                 if spec_algo == "DFLASH" and bool(args.enable_dflash_cycle_trace):
                     spec_server_args.extend(["--speculative-dflash-cycle-trace"])
@@ -1825,6 +1864,15 @@ def main() -> None:
     md_lines.append(
         f"- enable_dflash_cycle_trace: `{bool(args.enable_dflash_cycle_trace)}`"
     )
+    if bool(args.speculative_dflash_adaptive_block_size):
+        adaptive_bucket_str = (
+            ",".join(str(x) for x in adaptive_block_buckets)
+            if adaptive_block_buckets
+            else "auto"
+        )
+    else:
+        adaptive_bucket_str = "N/A"
+    md_lines.append(f"- adaptive_block_buckets: `{adaptive_bucket_str}`")
     md_lines.append(f"- enable_server_metrics: `{bool(args.enable_server_metrics)}`")
     md_lines.append(f"- server_extra_args: `{args.server_extra_args}`")
     md_lines.append(f"- save_call_trace_path: `{args.save_call_trace_path}`")

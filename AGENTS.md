@@ -33,6 +33,10 @@ sglang serve --help | grep speculative-dflash-adaptive-k-start
   - Initial runtime block size per request.
   - Must satisfy `k_min <= k_start <= k_max`.
   - Lets us run `k_max=16` but start each request at `k_start=8`.
+- `--speculative-dflash-adaptive-block-buckets`:
+  - Optional runtime bucket set for adaptive mode (e.g. `8 12 16`).
+  - For FlashInfer + CUDA graph, use explicit buckets to keep replay on captured shapes.
+  - If unset, server auto-picks `{8,12,16}` intersected with `[k_min, k_max]`.
 - Less brittle adaptive knobs (hysteresis + cooldown):
   - `--speculative-dflash-adaptive-low-accept-threshold`, `--speculative-dflash-adaptive-low-accept-streak`:
     - Downshift gate on EWMA acceptance ratio.
@@ -73,6 +77,7 @@ ADAPTIVE_DELTA=1.0 \
 ADAPTIVE_K_MIN=1 \
 ADAPTIVE_K_MAX=16 \
 ADAPTIVE_K_START=8 \
+ADAPTIVE_BLOCK_BUCKETS=8,12,16 \
 ADAPTIVE_LOW_ACCEPT_THRESHOLD=0.35 \
 ADAPTIVE_LOW_ACCEPT_STREAK=2 \
 ADAPTIVE_HIGH_ACCEPT_THRESHOLD=0.90 \
@@ -110,3 +115,6 @@ bash run_sglang_dynamic_c16.sh
   - `pip install imageio`
 - `libnuma.so.1` missing:
   - install `libnuma1` in pod image/env.
+- FlashInfer CUDA-graph mismatch (e.g. `qo_indptr ... cannot exceed ... set during initialization`):
+  - Ensure bucketed adaptive flags are wired through benchmark/server.
+  - Use `--speculative-dflash-adaptive-block-buckets` (or `ADAPTIVE_BLOCK_BUCKETS` in runner).
