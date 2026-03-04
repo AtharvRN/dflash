@@ -30,7 +30,7 @@ ENABLE_GPU_MONITOR="${ENABLE_GPU_MONITOR:-1}"
 ADAPTIVE_K_MIN="${ADAPTIVE_K_MIN:-1}"
 ADAPTIVE_K_MAX="${ADAPTIVE_K_MAX:-18}"
 ADAPTIVE_K_START="${ADAPTIVE_K_START:-12}"
-ADAPTIVE_BLOCK_BUCKETS="${ADAPTIVE_BLOCK_BUCKETS:-8,10,12,14,16,18}"
+ADAPTIVE_BLOCK_BUCKETS="${ADAPTIVE_BLOCK_BUCKETS:-}"
 ADAPTIVE_RHO="${ADAPTIVE_RHO:-0.30}"
 ADAPTIVE_DELTA="${ADAPTIVE_DELTA:-1.0}"
 ADAPTIVE_UCB_C="${ADAPTIVE_UCB_C:-1.0}"
@@ -51,6 +51,11 @@ echo "dataset=${DATASET_NAME}"
 echo "static_block_sizes=8,10,12,14,16,18"
 echo "adaptive_algos=ewma,ucb,linucb"
 echo "adaptive_reward_modes=accept_length,throughput"
+if [[ -n "${ADAPTIVE_BLOCK_BUCKETS}" ]]; then
+  echo "adaptive_block_buckets=${ADAPTIVE_BLOCK_BUCKETS}"
+else
+  echo "adaptive_block_buckets=<none> (full integer range allowed)"
+fi
 
 run_case() {
   local case_name="$1"
