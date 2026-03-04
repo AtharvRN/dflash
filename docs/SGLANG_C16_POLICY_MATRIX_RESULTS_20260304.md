@@ -55,3 +55,10 @@ Adaptive best (`UCB accept_length`) vs static best (`bs=16`):
 
 - `bs=8` is weak in this matrix because the draft model is `b16`; forcing small runtime block size can reduce speculative efficiency.
 - Per-cycle draft/verify time increases with larger static block sizes, but throughput still depends on how much tau improves.
+- GPU monitor scripts were missing from git during this matrix run, so per-run GPU CSV/summary files were not generated for `sglang_c16_policy_matrix_20260304_080903`.
+  - Fixed in commit `b18738b` by adding:
+    - `scripts/record_gpu_metrics.sh`
+    - `scripts/summarize_gpu_metrics.py`
+  - Verified via smoke run:
+    - `logs/sg_gpu_metrics_smoke_20260304_084123/sg_gpu_metrics_smoke_20260304_084123_gpu_metrics.csv`
+    - `logs/sg_gpu_metrics_smoke_20260304_084123/sg_gpu_metrics_smoke_20260304_084123_gpu_metrics_summary.md`
