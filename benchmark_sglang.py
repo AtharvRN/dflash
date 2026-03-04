@@ -923,6 +923,13 @@ def main() -> None:
         help="Enable true server-side adaptive DFLASH block size (per-request state updated each verify cycle).",
     )
     parser.add_argument(
+        "--speculative-dflash-adaptive-algo",
+        type=str,
+        default="ewma",
+        choices=["ewma", "ucb"],
+        help="Server-side DFLASH adaptive algorithm.",
+    )
+    parser.add_argument(
         "--speculative-dflash-adaptive-rho",
         type=float,
         default=0.30,
@@ -933,6 +940,29 @@ def main() -> None:
         type=float,
         default=1.0,
         help="Server-side DFLASH adaptive growth delta.",
+    )
+    parser.add_argument(
+        "--speculative-dflash-adaptive-reward-mode",
+        type=str,
+        default="accept_length",
+        choices=["accept_length", "throughput"],
+        help=(
+            "Server-side DFLASH adaptive reward mode. "
+            "accept_length uses accepted tokens per cycle; "
+            "throughput uses accepted tokens divided by attributed draft+verify time."
+        ),
+    )
+    parser.add_argument(
+        "--speculative-dflash-adaptive-ucb-c",
+        type=float,
+        default=1.0,
+        help="Server-side DFLASH adaptive UCB exploration coefficient.",
+    )
+    parser.add_argument(
+        "--speculative-dflash-adaptive-ucb-delta",
+        type=float,
+        default=0.05,
+        help="Server-side DFLASH adaptive UCBSPEC confidence parameter delta.",
     )
     parser.add_argument(
         "--speculative-dflash-adaptive-k-min",
@@ -1505,10 +1535,18 @@ def main() -> None:
                     )
                     spec_server_args.extend(
                         [
+                            "--speculative-dflash-adaptive-algo",
+                            str(args.speculative_dflash_adaptive_algo),
                             "--speculative-dflash-adaptive-rho",
                             str(float(args.speculative_dflash_adaptive_rho)),
                             "--speculative-dflash-adaptive-delta",
                             str(float(args.speculative_dflash_adaptive_delta)),
+                            "--speculative-dflash-adaptive-reward-mode",
+                            str(args.speculative_dflash_adaptive_reward_mode),
+                            "--speculative-dflash-adaptive-ucb-c",
+                            str(float(args.speculative_dflash_adaptive_ucb_c)),
+                            "--speculative-dflash-adaptive-ucb-delta",
+                            str(float(args.speculative_dflash_adaptive_ucb_delta)),
                             "--speculative-dflash-adaptive-low-accept-threshold",
                             str(float(args.speculative_dflash_adaptive_low_accept_threshold)),
                             "--speculative-dflash-adaptive-low-accept-streak",
@@ -1806,10 +1844,22 @@ def main() -> None:
         f"- speculative_dflash_adaptive_block_size: `{bool(args.speculative_dflash_adaptive_block_size)}`"
     )
     md_lines.append(
+        f"- speculative_dflash_adaptive_algo: `{args.speculative_dflash_adaptive_algo}`"
+    )
+    md_lines.append(
         f"- speculative_dflash_adaptive_rho: `{args.speculative_dflash_adaptive_rho}`"
     )
     md_lines.append(
         f"- speculative_dflash_adaptive_delta: `{args.speculative_dflash_adaptive_delta}`"
+    )
+    md_lines.append(
+        f"- speculative_dflash_adaptive_reward_mode: `{args.speculative_dflash_adaptive_reward_mode}`"
+    )
+    md_lines.append(
+        f"- speculative_dflash_adaptive_ucb_c: `{args.speculative_dflash_adaptive_ucb_c}`"
+    )
+    md_lines.append(
+        f"- speculative_dflash_adaptive_ucb_delta: `{args.speculative_dflash_adaptive_ucb_delta}`"
     )
     md_lines.append(
         f"- speculative_dflash_adaptive_k_min: `{args.speculative_dflash_adaptive_k_min}`"
