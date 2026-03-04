@@ -268,6 +268,8 @@ def _run_bench_requests(
     }
     extra_timing_samples: dict[str, list[float]] = defaultdict(list)
 
+    batch_network_wait_s = 0.0
+
     def _consume_meta(
         meta: dict,
         *,
@@ -358,7 +360,6 @@ def _run_bench_requests(
             if trace_include_raw_meta:
                 row["meta_info_raw"] = meta
             trace_fp.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
-            trace_fp.flush()
 
     if batch_requests:
         bs = max(int(concurrency), 1)
@@ -374,6 +375,7 @@ def _run_bench_requests(
                 sampling_custom_params=sampling_custom_params,
             )
             batch_wall_s = time.perf_counter() - batch_t0
+            batch_network_wait_s += float(batch_wall_s)
             if len(outs) != len(chunk_prompts):
                 raise RuntimeError(
                     "Batched /generate output length mismatch: "
@@ -416,7 +418,16 @@ def _run_bench_requests(
                     client_request_wall_s=float(req_wall_s),
                 )
 
-    latency = time.perf_counter() - start
+    total_wall_latency = time.perf_counter() - start
+    # In batch mode, use only HTTP request wait time for throughput/latency metrics.
+    # This avoids inflating benchmark latency with local trace serialization overhead.
+    if batch_requests and batch_network_wait_s > 0.0:
+        latency = float(batch_network_wait_s)
+    else:
+        latency = float(total_wall_latency)
+
+    if trace_fp is not None:
+        trace_fp.flush()
     toks_per_s = total_tokens / max(latency, 1e-6)
 
     if expect_dflash and spec_verify_ct_sum <= 0:
