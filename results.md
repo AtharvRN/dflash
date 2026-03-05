@@ -5,6 +5,10 @@ Scope: artifacts currently present in local `logs/` and `outputs/`.
 
 SGLang adaptive follow-up note:
 - `docs/SGLANG_ADAPTIVE_PREPATCH_20260303.md`
+- `docs/SGLANG_C16_FIXED256_BUCKETED_COMPARISON_20260304.md` (includes static vs EWMA vs UCB on fixed 256-sample GSM8K subset)
+- `docs/SGLANG_C16_POLICY_MATRIX_PROTOCOL_20260303.md` (full static + EWMA/UCB/LinUCB matrix protocol)
+- `docs/SGLANG_FIXED128_STATIC_SWEEP_20260304.md` (full static bs={8,12,16} across c={1,4,8,16,32}, plus LinUCB-vs-static comparison)
+- `docs/SGLANG_FIXED128_UCB_THOMPSON_SWEEP_20260305.md` (UCB + Thompson across c={1,4,8,16,32} on fixed-128 GSM8K)
 
 ## 1) Completed AIME25 Block-Size Sweeps (`max_new_tokens=256`)
 
@@ -248,6 +252,95 @@ Generated plots:
 Saved analysis files:
 - `outputs/analysis_remote_aime25_candidate_plots_512/summary_metrics.csv`
 - `outputs/analysis_remote_aime25_candidate_plots_512/README.md`
+
+## CUDA-Graph Memory Overhead (Bucketed Replay: `{8,12,16}`)
+
+Measured from SGLang server logs on fixed GSM8K C=16 runs:
+
+Static single-size reference (`bs=12`):
+- `logs/sg_cmp_c16_fixed256_20260304_044006_bs12/sg_cmp_c16_fixed256_20260304_044006_bs12.log`
+  - Target graph mem usage: `1.04 GB`
+  - Draft graph mem usage: `0.71 GB`
+  - Total graph mem: `1.75 GB`
+
+Bucketed replay (`{8,12,16}`):
+- `logs/sg_ucb_c16_throughput_20260304_055330/sg_ucb_c16_throughput_20260304_055330.log`
+  - Target graph mem usage: `2.38 GB`
+  - Draft graph mem usage: `1.55 GB`
+  - Total graph mem: `3.93 GB`
+
+Estimated extra CUDA-graph memory for 3 buckets vs single-size:
+- Target: `+1.34 GB`
+- Draft: `+0.84 GB`
+- Total: `+2.18 GB` (about `2.25x` graph-memory footprint)
+
+Capture-time impact in the same runs:
+- Single-size: ~`4.53 s` total graph capture (`3.33 s` target + `1.20 s` draft)
+- Bucketed: ~`10.19 s` total graph capture (`7.67 s` target + `2.52 s` draft)
+
+Important:
+- These are graph-capture memory deltas, not full model+KV memory.
+
+## Future Run Policy: Always Capture GPU Utilization + Memory
+
+All new SGLang experiments should save GPU telemetry for analysis.
+
+Wiring added:
+- `run_sglang_dynamic_c16.sh`
+- `run_sglang_tp1_sweep.sh`
+
+New artifacts generated per run/config:
+- Raw metrics CSV:
+  - `<run_log_dir>/<run_tag>_gpu_metrics.csv` (dynamic launcher)
+  - `<run_log_dir>/<run_tag>_..._bsX_cY_gpu_metrics.csv` (tp1 sweep)
+- Summary markdown:
+  - `*_gpu_metrics_summary.md`
+- Summary JSON:
+  - `*_gpu_metrics_summary.json`
+
+Helper scripts:
+- `scripts/record_gpu_metrics.sh`
+- `scripts/summarize_gpu_metrics.py`
+
+Control knobs:
+- `ENABLE_GPU_MONITOR=1` (default on)
+- `GPU_MONITOR_INTERVAL_S=1` (default 1s sampling)
+
+## Advisor Update Snapshot (2026-03-03)
+
+### What was completed
+- Added DFLASH timing and cycle telemetry in SGLang call traces:
+  - `draft_time_s`, `verify_time_s`
+  - `draft_time_per_cycle_s`, `verify_time_per_cycle_s`
+  - `spec_runtime_bs_hist`, `spec_runtime_bs_mode`, `spec_runtime_bs_avg`
+  - per-cycle trace rows with `runtime_block_size`, `accept_length`, `accept_rate`
+- Standardized comparisons on fixed GSM8K subsets (`fixed_question_count`) for controlled runs.
+- Restored old EWMA controller path for adaptive block-size experiments and continued hyperparameter sweeps.
+
+### Current performance picture (C=16)
+- Adaptive is better than target-only baseline in multiple runs.
+- Adaptive is still not consistently beating best static DFLASH settings (`bs=8` or `bs=16`) on throughput.
+- Main observed pattern: adaptive acceptance can improve in some settings, but per-cycle overhead and runtime block-size coupling reduce net speedup.
+
+### CUDA graph issue (must-mention)
+- Dynamic/adaptive runtime block sizes with FlashInfer are sensitive to CUDA graph replay shape constraints.
+- Observed failure mode during adaptive runs:
+  - `ValueError: The total number of rows in qo_indptr 12 in cuda graph mode cannot exceed the number of rows set during initialization 8.`
+- Additional instability seen in one mixed-size path:
+  - non-contiguous tensor error in RoPE kernel when runtime block sizes mixed in-batch.
+- Practical impact:
+  - adaptive runs may crash or require conservative settings when replay metadata shape exceeds captured graph assumptions.
+- Current mitigation:
+  - run conservative adaptive ranges,
+  - keep runtime block-size behavior tightly bounded,
+  - use non-adaptive static baselines as the reliability reference.
+
+### Ongoing experiment
+- Launched 2xA100 matrix job to run:
+  - concurrencies: `1,4,8,16,32`
+  - modes: baseline, static `bs=8`, static `bs=16`, adaptive
+  - fixed subset size: `128` examples
+- Purpose: produce a clean per-concurrency comparison table under one controlled configuration.
 
 ## 11) Latest Matched AA10 Runs (10 samples, `bs=16`, `max_new_tokens=512`)
 
