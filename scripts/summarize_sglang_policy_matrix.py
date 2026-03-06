@@ -107,8 +107,9 @@ class Row:
 
 
 def _mode_from_case(case: str) -> str:
-    if case == "baseline_and_static_bs8":
-        return "baseline+static_bs8"
+    m = re.fullmatch(r"baseline_and_static_bs(\d+)", case)
+    if m:
+        return f"baseline+static_bs{m.group(1)}"
     if case.startswith("static_bs"):
         return case
     if case.startswith("adaptive_"):
@@ -287,7 +288,7 @@ def main() -> None:
 
     baseline_global: Optional[float] = None
     for r in rows:
-        if r.case == "baseline_and_static_bs8" and r.baseline_toks_s is not None:
+        if r.case.startswith("baseline_and_static_bs") and r.baseline_toks_s is not None:
             baseline_global = r.baseline_toks_s
             break
     if baseline_global is None:

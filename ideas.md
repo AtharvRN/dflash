@@ -355,3 +355,60 @@ Status legend:
 - If revisited:
   - use strict streak-based downshift and immediate upshift recovery,
   - and couple budget upper bound to `branch_top_k` (avoid ineffective budget states).
+
+## 20) Bucketed CUDA Graph Pool for DFLASH (TLT-inspired)
+- Status: `proposed`
+- Reference:
+  - TLT paper (arXiv:2511.16665): https://arxiv.org/pdf/2511.16665
+  - Relevant section: "Memory-Efficient CUDAGraph Capture" (Section 5, Table 5)
+- Why this matters for our current blocker:
+  - We hit CUDA graph replay failures when runtime shapes exceed capture shapes in adaptive runs (FlashInfer metadata size mismatch).
+  - Capturing many strategy variants naively is memory-heavy and causes practical limits at high concurrency.
+- TLT ideas to transfer:
+  - bucketed batch-size capture (capture representative buckets, not every exact size),
+  - disaggregated capture for draft vs target graphs (avoid multiplicative strategy x model capture),
+  - merged capture when strategies share identical capture requirements.
+- DFLASH mapping (first implementation target):
+  - define strategy key as `(runtime_block_size_bucket, batch_size_bucket)`,
+  - build graph pool entries only for allowed buckets (start with `{8, 12, 16}` block buckets),
+  - route each decode cycle to matching bucket graph; if no safe graph exists, fallback to eager for that cycle,
+  - keep target and draft graph resources separate so changing draft block-size bucket does not force redundant target captures.
+- Expected upside:
+  - lower graph-memory footprint for multi-strategy adaptive serving,
+  - fewer replay-shape mismatch failures,
+  - preserve CUDA graph speedups where shape-compatible.
+- Acceptance criteria:
+  - no graph replay shape errors on adaptive c=16 runs,
+  - graph memory overhead significantly below naive per-strategy capture,
+  - throughput at least matches current no-graph adaptive baseline and ideally improves.
+
+## 21) Reframe Adaptive Block Size as Online Control (Not Plain MAB)
+- Status: `proposed`
+- Core reframing:
+  - treat block-size selection as **online adaptive control under non-stationary dynamics**, not stationary MAB.
+  - practical sources of non-stationarity:
+    - decode phase / position-in-sequence drift,
+    - prompt/prefix-length variation,
+    - changing queue pressure / effective concurrency,
+    - backend/runtime shape effects (including graph bucket constraints).
+- Suggested formalization:
+  - state `s_t`:
+    - recent acceptance statistics (EWMA tau / accept rate),
+    - recent cycle-time proxy,
+    - active concurrency/load proxy,
+    - previous block size.
+  - action `k_t`: runtime block size (or bucketed block size).
+  - utility `r_t`: throughput/speedup proxy (e.g., tau and cycle-time based).
+  - objective:
+    - maximize cumulative utility with switching regularization:
+      - `max sum_t [ r_t - lambda * |k_t - k_{t-1}| ]`
+    - subject to system constraints (`k_min/k_max`, bucketed graph compatibility).
+- Recommended naming in write-up:
+  - if retaining UCB/TS machinery:
+    - "non-stationary contextual bandit scheduler"
+  - if adding explicit dynamics/lookahead:
+    - "MPC-style adaptive block-size scheduler"
+- Why this helps:
+  - aligns assumptions with observed behavior (reward surface shifts over time),
+  - makes failures of stationary MAB interpretable (regret under drift, delayed adaptation),
+  - gives a principled path for adding context features and stability constraints.

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # TP is intentionally fixed to 1 for this sweep script.
 TP_SIZE="${TP_SIZE:-1}"
 if [[ "${TP_SIZE}" != "1" ]]; then
@@ -32,6 +34,8 @@ SAVE_CALL_TRACE_RAW_META="${SAVE_CALL_TRACE_RAW_META:-0}"
 ENABLE_DFLASH_CYCLE_TRACE="${ENABLE_DFLASH_CYCLE_TRACE:-0}"
 DISABLE_OVERLAP_SCHEDULE="${DISABLE_OVERLAP_SCHEDULE:-0}"
 SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS:-}"
+ENABLE_GPU_MONITOR="${ENABLE_GPU_MONITOR:-1}"
+GPU_MONITOR_INTERVAL_S="${GPU_MONITOR_INTERVAL_S:-1}"
 
 RUN_TAG="${RUN_TAG:-sglang_tp1_sweep_$(date +%Y%m%d_%H%M%S)}"
 LOG_DIR="${LOG_DIR:-logs/${RUN_TAG}}"
@@ -90,7 +94,7 @@ done
 
 mkdir -p "${LOG_DIR}"
 
-echo "block_size,concurrency,status,baseline_toks_per_s,spec_toks_per_s,speedup,tau,accept_rate,verify_calls_total,verify_per_s,draft_tok_per_s,accepted_tok_per_s,wall_per_verify_s,spec_e2e_avg_s,spec_e2e_p95_s,baseline_e2e_avg_s,draft_time_avg_s,verify_time_avg_s,call_rows,non_null_draft_time_rows,non_null_verify_time_rows,md_path,call_trace_jsonl,log_path" > "${SUMMARY_CSV}"
+echo "block_size,concurrency,status,baseline_toks_per_s,spec_toks_per_s,speedup,tau,accept_rate,verify_calls_total,verify_per_s,draft_tok_per_s,accepted_tok_per_s,wall_per_verify_s,spec_e2e_avg_s,spec_e2e_p95_s,baseline_e2e_avg_s,draft_time_avg_s,verify_time_avg_s,call_rows,non_null_draft_time_rows,non_null_verify_time_rows,md_path,call_trace_jsonl,log_path,gpu_metrics_csv,gpu_metrics_summary_md,gpu_metrics_summary_json" > "${SUMMARY_CSV}"
 
 echo "Running SGLang TP=1 sweep (with block-size sweep support)"
 echo "dataset=${DATASET_NAME} model=${TARGET_MODEL} draft=${DRAFT_MODEL}"
@@ -101,6 +105,7 @@ echo "max_new_tokens=${MAX_NEW_TOKENS} qpc_base=${QUESTIONS_PER_CONCURRENCY_BASE
 echo "fixed_question_count=${FIXED_QUESTION_COUNT} fixed_question_offset=${FIXED_QUESTION_OFFSET}"
 echo "batch_requests=${BATCH_REQUESTS} skip_baseline=${SKIP_BASELINE} enable_server_metrics=${ENABLE_SERVER_METRICS}"
 echo "enable_dflash_cycle_trace=${ENABLE_DFLASH_CYCLE_TRACE}"
+echo "enable_gpu_monitor=${ENABLE_GPU_MONITOR} gpu_monitor_interval_s=${GPU_MONITOR_INTERVAL_S}"
 echo "log_dir=${LOG_DIR}"
 
 for bs in "${BS_LIST[@]}"; do
@@ -114,6 +119,9 @@ for bs in "${BS_LIST[@]}"; do
     md_path="${LOG_DIR}/${RUN_TAG}_${DATASET_NAME}_bs${bs_tag}_c${conc}.md"
     trace_path="${LOG_DIR}/${RUN_TAG}_${DATASET_NAME}_bs${bs_tag}_c${conc}_calls.jsonl"
     log_path="${LOG_DIR}/${RUN_TAG}_${DATASET_NAME}_bs${bs_tag}_c${conc}.log"
+    gpu_metrics_path="${LOG_DIR}/${RUN_TAG}_${DATASET_NAME}_bs${bs_tag}_c${conc}_gpu_metrics.csv"
+    gpu_metrics_summary_md="${LOG_DIR}/${RUN_TAG}_${DATASET_NAME}_bs${bs_tag}_c${conc}_gpu_metrics_summary.md"
+    gpu_metrics_summary_json="${LOG_DIR}/${RUN_TAG}_${DATASET_NAME}_bs${bs_tag}_c${conc}_gpu_metrics_summary.json"
 
     cmd=(
       "${PYTHON_BIN}" benchmark_sglang.py
@@ -176,8 +184,37 @@ for bs in "${BS_LIST[@]}"; do
     } | tee "${log_path}"
 
     set +e
+    gpu_monitor_pid=""
+    if [[ "${ENABLE_GPU_MONITOR}" == "1" ]]; then
+      if command -v nvidia-smi >/dev/null 2>&1; then
+        bash "${SCRIPT_DIR}/scripts/record_gpu_metrics.sh" \
+          "${gpu_metrics_path}" \
+          "${GPU_MONITOR_INTERVAL_S}" >> "${log_path}" 2>&1 &
+        gpu_monitor_pid=$!
+        echo "[gpu-monitor] started pid=${gpu_monitor_pid}, csv=${gpu_metrics_path}, interval_s=${GPU_MONITOR_INTERVAL_S}" | tee -a "${log_path}"
+      else
+        echo "[gpu-monitor] nvidia-smi not found; skipping GPU metrics capture." | tee -a "${log_path}"
+      fi
+    fi
+
     "${cmd[@]}" 2>&1 | tee -a "${log_path}"
     status=${PIPESTATUS[0]}
+
+    if [[ -n "${gpu_monitor_pid}" ]]; then
+      kill "${gpu_monitor_pid}" >/dev/null 2>&1 || true
+      wait "${gpu_monitor_pid}" 2>/dev/null || true
+      echo "[gpu-monitor] stopped pid=${gpu_monitor_pid}" | tee -a "${log_path}"
+    fi
+
+    if [[ -s "${gpu_metrics_path}" ]]; then
+      "${PYTHON_BIN}" "${SCRIPT_DIR}/scripts/summarize_gpu_metrics.py" \
+        --input "${gpu_metrics_path}" \
+        --output-md "${gpu_metrics_summary_md}" \
+        --output-json "${gpu_metrics_summary_json}" >> "${log_path}" 2>&1 || true
+    else
+      echo "[gpu-monitor] metrics file not found or empty: ${gpu_metrics_path}" | tee -a "${log_path}"
+    fi
+
     set -e
 
     row="$("${PYTHON_BIN}" - "${md_path}" "${trace_path}" "${status}" "${bs}" "${conc}" "${log_path}" <<'PY'
@@ -318,7 +355,7 @@ print(buf.getvalue().strip())
 PY
 )"
 
-    echo "${row}" >> "${SUMMARY_CSV}"
+    echo "${row},${gpu_metrics_path},${gpu_metrics_summary_md},${gpu_metrics_summary_json}" >> "${SUMMARY_CSV}"
   done
 done
 

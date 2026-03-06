@@ -39,6 +39,7 @@ DRAFT_MODEL="${DRAFT_MODEL:-z-lab/Qwen3-4B-DFlash-b16}"
 ENABLE_DFLASH_CYCLE_TRACE="${ENABLE_DFLASH_CYCLE_TRACE:-1}"
 ENABLE_DFLASH_STAGE_TIMING="${ENABLE_DFLASH_STAGE_TIMING:-1}"
 ENABLE_GPU_MONITOR="${ENABLE_GPU_MONITOR:-1}"
+CPUSET="${CPUSET:-}"
 
 _parse_csv_to_array() {
   local raw="$1"
@@ -51,6 +52,16 @@ _parse_csv_to_array() {
       out_ref+=("${_p}")
     fi
   done
+}
+
+run_with_affinity() {
+  local cpuset="$1"
+  shift
+  if [[ -n "${cpuset}" ]]; then
+    taskset -c "${cpuset}" "$@"
+  else
+    "$@"
+  fi
 }
 
 declare -a _DATASET_LIST
@@ -92,6 +103,7 @@ echo "datasets=${DATASETS}"
 echo "concurrencies=${CONCURRENCIES}"
 echo "static_block_sizes=${STATIC_BLOCK_SIZES}"
 echo "fixed_subset=count=${FIXED_QUESTION_COUNT},offset=${FIXED_QUESTION_OFFSET}"
+echo "cpuset=${CPUSET:-<none>}"
 
 run_case() {
   local run_tag="$1"
@@ -103,27 +115,28 @@ run_case() {
   echo "log_dir=${log_dir}"
   echo "============================================================"
 
-  env \
-    RUN_TAG="${run_tag}" \
-    LOG_DIR="${log_dir}" \
-    TP_SIZE="${TP_SIZE}" \
-    DATASET_NAME="${DATASET_NAME}" \
-    TARGET_MODEL="${TARGET_MODEL}" \
-    DRAFT_MODEL="${DRAFT_MODEL}" \
-    CONCURRENCY="${CONCURRENCY}" \
-    QUESTIONS_PER_CONCURRENCY_BASE="${QUESTIONS_PER_CONCURRENCY_BASE}" \
-    MAX_QUESTIONS_PER_CONFIG="${MAX_QUESTIONS_PER_CONFIG}" \
-    FIXED_QUESTION_COUNT="${FIXED_QUESTION_COUNT}" \
-    FIXED_QUESTION_OFFSET="${FIXED_QUESTION_OFFSET}" \
-    MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS}" \
-    MAX_NEW_TOKENS="${MAX_NEW_TOKENS}" \
-    ATTENTION_BACKEND="${ATTENTION_BACKEND}" \
-    TIMEOUT_S="${TIMEOUT_S}" \
-    ENABLE_DFLASH_CYCLE_TRACE="${ENABLE_DFLASH_CYCLE_TRACE}" \
-    ENABLE_DFLASH_STAGE_TIMING="${ENABLE_DFLASH_STAGE_TIMING}" \
-    ENABLE_GPU_MONITOR="${ENABLE_GPU_MONITOR}" \
-    "$@" \
-    bash "${SCRIPT_DIR}/run_sglang_dynamic_c16.sh"
+  run_with_affinity "${CPUSET}" \
+    env \
+      RUN_TAG="${run_tag}" \
+      LOG_DIR="${log_dir}" \
+      TP_SIZE="${TP_SIZE}" \
+      DATASET_NAME="${DATASET_NAME}" \
+      TARGET_MODEL="${TARGET_MODEL}" \
+      DRAFT_MODEL="${DRAFT_MODEL}" \
+      CONCURRENCY="${CONCURRENCY}" \
+      QUESTIONS_PER_CONCURRENCY_BASE="${QUESTIONS_PER_CONCURRENCY_BASE}" \
+      MAX_QUESTIONS_PER_CONFIG="${MAX_QUESTIONS_PER_CONFIG}" \
+      FIXED_QUESTION_COUNT="${FIXED_QUESTION_COUNT}" \
+      FIXED_QUESTION_OFFSET="${FIXED_QUESTION_OFFSET}" \
+      MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS}" \
+      MAX_NEW_TOKENS="${MAX_NEW_TOKENS}" \
+      ATTENTION_BACKEND="${ATTENTION_BACKEND}" \
+      TIMEOUT_S="${TIMEOUT_S}" \
+      ENABLE_DFLASH_CYCLE_TRACE="${ENABLE_DFLASH_CYCLE_TRACE}" \
+      ENABLE_DFLASH_STAGE_TIMING="${ENABLE_DFLASH_STAGE_TIMING}" \
+      ENABLE_GPU_MONITOR="${ENABLE_GPU_MONITOR}" \
+      "$@" \
+      bash "${SCRIPT_DIR}/run_sglang_dynamic_c16.sh"
 }
 
 for dataset in "${_DATASET_LIST[@]}"; do

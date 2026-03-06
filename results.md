@@ -9,6 +9,14 @@ SGLang adaptive follow-up note:
 - `docs/SGLANG_C16_POLICY_MATRIX_PROTOCOL_20260303.md` (full static + EWMA/UCB/LinUCB matrix protocol)
 - `docs/SGLANG_FIXED128_STATIC_SWEEP_20260304.md` (full static bs={8,12,16} across c={1,4,8,16,32}, plus LinUCB-vs-static comparison)
 - `docs/SGLANG_FIXED128_UCB_THOMPSON_SWEEP_20260305.md` (UCB + Thompson across c={1,4,8,16,32} on fixed-128 GSM8K)
+- `docs/sglang_static_multi_20260305_061629_summary.md` (full multi-dataset static matrix summary; best bs per dataset/concurrency from pulled final run artifacts)
+- `docs/SGLANG_UCB_MULTISET_VS_STATIC_20260305.md` (full 25-config UCB-vs-static comparison across datasets/concurrencies; includes per-config table and aggregate ratios)
+- `docs/SGLANG_GSM8K_C16_UCB_POWERLAW_GRID_20260306.md` (16-point `ucb_c x time_exp` grid on GSM8K `c=16`; best config and direct comparison to static `bs={8,12,16}`)
+- `docs/SGLANG_UNDOCUMENTED_RESULTS_20260306.md` (backfill of previously undocumented run tags found under `logs/`, with extracted throughput/tau/accept/timing/block-usage metrics plus companion CSV)
+- `docs/sglang_static_multi_20260305_061629_plots.md` (per-dataset plots: speedup, tau, verify ms/cycle, draft ms/cycle vs block size; lines by concurrency)
+- `docs/sglang_static_multi_20260305_061629_plots_trace.md` (same plots but verify/draft use explicit cycle-trace timing fields: `mean_*_time_per_cycle_from_trace_s`)
+- `docs/sglang_static_multi_20260305_061629_plots_batch.md` (recommended for concurrency scaling: verify/draft shown as batch-cycle time estimate = trace per-cycle time x concurrency)
+- V1 status note: current static multi-dataset conclusions are accepted as Version-1; a dedicated rerun with strict CPU-affinity pinning per GPU worker is queued as follow-up.
 
 ## 1) Completed AIME25 Block-Size Sweeps (`max_new_tokens=256`)
 

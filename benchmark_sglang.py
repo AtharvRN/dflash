@@ -956,11 +956,20 @@ def main() -> None:
         "--speculative-dflash-adaptive-reward-mode",
         type=str,
         default="accept_length",
-        choices=["accept_length", "throughput", "throughput_proxy"],
+        choices=[
+            "accept_length",
+            "throughput",
+            "throughput_cycle_e2e",
+            "throughput_cycle_rate",
+            "throughput_proxy",
+        ],
         help=(
             "Server-side DFLASH adaptive reward mode. "
             "accept_length uses accepted tokens per cycle; "
             "throughput uses accepted tokens divided by attributed draft+verify time; "
+            "throughput_cycle_e2e uses accepted tokens divided by measured per-cycle end-to-end wall time; "
+            "throughput_cycle_rate uses UCB mean reward as ratio-of-sums "
+            "(sum accepted / sum e2e_cycle_time) per arm; "
             "throughput_proxy uses tau/cycle-cost proxy from estimated cycle time maps "
             "or power-law estimator, without runtime timing synchronization overhead."
         ),
