@@ -937,7 +937,7 @@ def main() -> None:
         "--speculative-dflash-adaptive-algo",
         type=str,
         default="ewma",
-        choices=["ewma", "ucb", "linucb"],
+        choices=["ewma", "ucb", "linucb", "thompson"],
         help="Server-side DFLASH adaptive algorithm.",
     )
     parser.add_argument(
@@ -956,11 +956,13 @@ def main() -> None:
         "--speculative-dflash-adaptive-reward-mode",
         type=str,
         default="accept_length",
-        choices=["accept_length", "throughput"],
+        choices=["accept_length", "throughput", "throughput_proxy"],
         help=(
             "Server-side DFLASH adaptive reward mode. "
             "accept_length uses accepted tokens per cycle; "
-            "throughput uses accepted tokens divided by attributed draft+verify time."
+            "throughput uses accepted tokens divided by attributed draft+verify time; "
+            "throughput_proxy uses tau/cycle-cost proxy from estimated cycle time maps "
+            "or power-law estimator, without runtime timing synchronization overhead."
         ),
     )
     parser.add_argument(
@@ -986,6 +988,49 @@ def main() -> None:
         type=float,
         default=1.0,
         help="Server-side DFLASH adaptive LinUCB ridge regularization lambda.",
+    )
+    parser.add_argument(
+        "--speculative-dflash-adaptive-proxy-cycle-ms",
+        type=str,
+        default="",
+        help=(
+            "Optional per-block estimated cycle-time map for reward_mode=throughput_proxy. "
+            "Formats: '8:1.85,12:2.05,16:2.25' (k->ms) or "
+            "'1x8:7.5,4x8:3.2,16x8:1.9' ((c,k)->ms)."
+        ),
+    )
+    parser.add_argument(
+        "--speculative-dflash-adaptive-proxy-powerlaw-a",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional power-law cycle-time estimator scale for reward_mode=throughput_proxy: "
+            "t_batch_ms = a * c^c_exp * k^k_exp. Disabled when a <= 0."
+        ),
+    )
+    parser.add_argument(
+        "--speculative-dflash-adaptive-proxy-powerlaw-c-exp",
+        type=float,
+        default=0.430,
+        help="Power-law cycle-time estimator concurrency exponent c_exp.",
+    )
+    parser.add_argument(
+        "--speculative-dflash-adaptive-proxy-powerlaw-k-exp",
+        type=float,
+        default=0.160,
+        help="Power-law cycle-time estimator block-size exponent k_exp.",
+    )
+    parser.add_argument(
+        "--speculative-dflash-adaptive-proxy-tau-exp",
+        type=float,
+        default=1.0,
+        help="Throughput-proxy reward numerator exponent (tau_exp).",
+    )
+    parser.add_argument(
+        "--speculative-dflash-adaptive-proxy-time-exp",
+        type=float,
+        default=0.2,
+        help="Throughput-proxy reward denominator exponent (time_exp).",
     )
     parser.add_argument(
         "--speculative-dflash-adaptive-k-min",
@@ -1057,7 +1102,7 @@ def main() -> None:
         "--dynamic-policy",
         type=str,
         default="ewma",
-        choices=["ewma", "ucb", "linucb"],
+        choices=["ewma", "ucb", "linucb", "thompson"],
         help="Dynamic controller policy. ewma = hysteresis switching; ucb/linucb = exploration-aware bandits.",
     )
     parser.add_argument(
@@ -1574,6 +1619,32 @@ def main() -> None:
                             str(float(args.speculative_dflash_adaptive_linucb_alpha)),
                             "--speculative-dflash-adaptive-linucb-lambda",
                             str(float(args.speculative_dflash_adaptive_linucb_lambda)),
+                            "--speculative-dflash-adaptive-proxy-powerlaw-a",
+                            str(
+                                float(
+                                    args.speculative_dflash_adaptive_proxy_powerlaw_a
+                                )
+                            ),
+                            "--speculative-dflash-adaptive-proxy-powerlaw-c-exp",
+                            str(
+                                float(
+                                    args.speculative_dflash_adaptive_proxy_powerlaw_c_exp
+                                )
+                            ),
+                            "--speculative-dflash-adaptive-proxy-powerlaw-k-exp",
+                            str(
+                                float(
+                                    args.speculative_dflash_adaptive_proxy_powerlaw_k_exp
+                                )
+                            ),
+                            "--speculative-dflash-adaptive-proxy-tau-exp",
+                            str(
+                                float(args.speculative_dflash_adaptive_proxy_tau_exp)
+                            ),
+                            "--speculative-dflash-adaptive-proxy-time-exp",
+                            str(
+                                float(args.speculative_dflash_adaptive_proxy_time_exp)
+                            ),
                             "--speculative-dflash-adaptive-low-accept-threshold",
                             str(float(args.speculative_dflash_adaptive_low_accept_threshold)),
                             "--speculative-dflash-adaptive-low-accept-streak",
@@ -1586,6 +1657,13 @@ def main() -> None:
                             str(int(args.speculative_dflash_adaptive_cooldown_cycles)),
                         ]
                     )
+                    if str(args.speculative_dflash_adaptive_proxy_cycle_ms).strip():
+                        spec_server_args.extend(
+                            [
+                                "--speculative-dflash-adaptive-proxy-cycle-ms",
+                                str(args.speculative_dflash_adaptive_proxy_cycle_ms),
+                            ]
+                        )
                     if args.speculative_dflash_adaptive_k_min is not None:
                         spec_server_args.extend(
                             [
@@ -1893,6 +1971,24 @@ def main() -> None:
     )
     md_lines.append(
         f"- speculative_dflash_adaptive_linucb_lambda: `{args.speculative_dflash_adaptive_linucb_lambda}`"
+    )
+    md_lines.append(
+        f"- speculative_dflash_adaptive_proxy_cycle_ms: `{args.speculative_dflash_adaptive_proxy_cycle_ms}`"
+    )
+    md_lines.append(
+        f"- speculative_dflash_adaptive_proxy_powerlaw_a: `{args.speculative_dflash_adaptive_proxy_powerlaw_a}`"
+    )
+    md_lines.append(
+        f"- speculative_dflash_adaptive_proxy_powerlaw_c_exp: `{args.speculative_dflash_adaptive_proxy_powerlaw_c_exp}`"
+    )
+    md_lines.append(
+        f"- speculative_dflash_adaptive_proxy_powerlaw_k_exp: `{args.speculative_dflash_adaptive_proxy_powerlaw_k_exp}`"
+    )
+    md_lines.append(
+        f"- speculative_dflash_adaptive_proxy_tau_exp: `{args.speculative_dflash_adaptive_proxy_tau_exp}`"
+    )
+    md_lines.append(
+        f"- speculative_dflash_adaptive_proxy_time_exp: `{args.speculative_dflash_adaptive_proxy_time_exp}`"
     )
     md_lines.append(
         f"- speculative_dflash_adaptive_k_min: `{args.speculative_dflash_adaptive_k_min}`"
