@@ -38,6 +38,13 @@ ADAPTIVE_UCB_C="${ADAPTIVE_UCB_C:-1.0}"
 ADAPTIVE_UCB_DELTA="${ADAPTIVE_UCB_DELTA:-0.05}"
 ADAPTIVE_LINUCB_ALPHA="${ADAPTIVE_LINUCB_ALPHA:-1.0}"
 ADAPTIVE_LINUCB_LAMBDA="${ADAPTIVE_LINUCB_LAMBDA:-1.0}"
+ADAPTIVE_PROXY_CYCLE_MS="${ADAPTIVE_PROXY_CYCLE_MS:-}"
+ADAPTIVE_PROXY_POWERLAW_A="${ADAPTIVE_PROXY_POWERLAW_A:-0.0}"
+ADAPTIVE_PROXY_POWERLAW_C_EXP="${ADAPTIVE_PROXY_POWERLAW_C_EXP:-0.430}"
+ADAPTIVE_PROXY_POWERLAW_K_EXP="${ADAPTIVE_PROXY_POWERLAW_K_EXP:-0.160}"
+ADAPTIVE_PROXY_TAU_EXP="${ADAPTIVE_PROXY_TAU_EXP:-1.0}"
+ADAPTIVE_PROXY_TIME_EXP="${ADAPTIVE_PROXY_TIME_EXP:-1.0}"
+ADAPTIVE_ALLOW_PROXY_FALLBACK="${ADAPTIVE_ALLOW_PROXY_FALLBACK:-0}"
 ADAPTIVE_K_MIN="${ADAPTIVE_K_MIN:-1}"
 ADAPTIVE_K_MAX="${ADAPTIVE_K_MAX:-16}"
 ADAPTIVE_K_START="${ADAPTIVE_K_START:-}"
@@ -48,6 +55,7 @@ ADAPTIVE_HIGH_ACCEPT_THRESHOLD="${ADAPTIVE_HIGH_ACCEPT_THRESHOLD:-0.90}"
 ADAPTIVE_HIGH_ACCEPT_STREAK="${ADAPTIVE_HIGH_ACCEPT_STREAK:-2}"
 ADAPTIVE_COOLDOWN_CYCLES="${ADAPTIVE_COOLDOWN_CYCLES:-1}"
 ENABLE_DFLASH_CYCLE_TRACE="${ENABLE_DFLASH_CYCLE_TRACE:-1}"
+ENABLE_DFLASH_STAGE_TIMING="${ENABLE_DFLASH_STAGE_TIMING:-1}"
 ENABLE_GPU_MONITOR="${ENABLE_GPU_MONITOR:-1}"
 GPU_MONITOR_INTERVAL_S="${GPU_MONITOR_INTERVAL_S:-1}"
 
@@ -108,6 +116,24 @@ if [[ "${FIXED_QUESTION_COUNT}" -eq 0 && "${FIXED_QUESTION_OFFSET}" -ne 0 ]]; th
   exit 1
 fi
 
+# Guard against silent legacy proxy fallback:
+# reward_mode=throughput_proxy with no cycle-ms map and no power-law estimator
+# degrades to proxy reward tau/k (block-size units), which is usually unintended.
+if [[ "${ADAPTIVE_ENABLED}" == "1" && "${ADAPTIVE_REWARD_MODE}" == "throughput_proxy" ]]; then
+  _powerlaw_enabled="$(awk "BEGIN { print (${ADAPTIVE_PROXY_POWERLAW_A} > 0.0) ? 1 : 0 }")"
+  if [[ -z "${ADAPTIVE_PROXY_CYCLE_MS}" && "${_powerlaw_enabled}" != "1" ]]; then
+    if [[ "${ADAPTIVE_ALLOW_PROXY_FALLBACK}" != "1" ]]; then
+      echo "ERROR: throughput_proxy reward requires either:" >&2
+      echo "  1) ADAPTIVE_PROXY_CYCLE_MS (recommended, explicit lookup), or" >&2
+      echo "  2) ADAPTIVE_PROXY_POWERLAW_A > 0 (power-law estimator)." >&2
+      echo "Current config would silently fall back to tau/k proxy units." >&2
+      echo "If you really want legacy fallback, set ADAPTIVE_ALLOW_PROXY_FALLBACK=1." >&2
+      exit 1
+    fi
+    echo "WARNING: Using legacy throughput_proxy fallback (tau/k units)." | tee -a "${OUT_LOG}"
+  fi
+fi
+
 cmd=(
   python benchmark_sglang.py
   --dataset-name "${DATASET_NAME}"
@@ -131,6 +157,11 @@ cmd=(
   --speculative-dflash-adaptive-ucb-delta "${ADAPTIVE_UCB_DELTA}"
   --speculative-dflash-adaptive-linucb-alpha "${ADAPTIVE_LINUCB_ALPHA}"
   --speculative-dflash-adaptive-linucb-lambda "${ADAPTIVE_LINUCB_LAMBDA}"
+  --speculative-dflash-adaptive-proxy-powerlaw-a "${ADAPTIVE_PROXY_POWERLAW_A}"
+  --speculative-dflash-adaptive-proxy-powerlaw-c-exp "${ADAPTIVE_PROXY_POWERLAW_C_EXP}"
+  --speculative-dflash-adaptive-proxy-powerlaw-k-exp "${ADAPTIVE_PROXY_POWERLAW_K_EXP}"
+  --speculative-dflash-adaptive-proxy-tau-exp "${ADAPTIVE_PROXY_TAU_EXP}"
+  --speculative-dflash-adaptive-proxy-time-exp "${ADAPTIVE_PROXY_TIME_EXP}"
   --speculative-dflash-adaptive-k-min "${ADAPTIVE_K_MIN}"
   --speculative-dflash-adaptive-k-max "${ADAPTIVE_K_MAX}"
   --speculative-dflash-adaptive-low-accept-threshold "${ADAPTIVE_LOW_ACCEPT_THRESHOLD}"
@@ -139,7 +170,6 @@ cmd=(
   --speculative-dflash-adaptive-high-accept-streak "${ADAPTIVE_HIGH_ACCEPT_STREAK}"
   --speculative-dflash-adaptive-cooldown-cycles "${ADAPTIVE_COOLDOWN_CYCLES}"
   --enable-server-metrics
-  --enable-dflash-stage-timing
   --save-call-trace-path "${OUT_TRACE}"
   --output-md "${OUT_MD}"
 )
@@ -160,6 +190,9 @@ fi
 if [[ -n "${ADAPTIVE_BLOCK_BUCKETS}" ]]; then
   cmd+=(--speculative-dflash-adaptive-block-buckets "${ADAPTIVE_BLOCK_BUCKETS}")
 fi
+if [[ -n "${ADAPTIVE_PROXY_CYCLE_MS}" ]]; then
+  cmd+=(--speculative-dflash-adaptive-proxy-cycle-ms "${ADAPTIVE_PROXY_CYCLE_MS}")
+fi
 
 if [[ "${BATCH_REQUESTS}" == "1" ]]; then
   cmd+=(--batch-requests)
@@ -169,6 +202,9 @@ if [[ "${RUN_BASELINE}" == "0" ]]; then
 fi
 if [[ "${ENABLE_DFLASH_CYCLE_TRACE}" == "1" ]]; then
   cmd+=(--enable-dflash-cycle-trace)
+fi
+if [[ "${ENABLE_DFLASH_STAGE_TIMING}" == "1" ]]; then
+  cmd+=(--enable-dflash-stage-timing)
 fi
 if [[ -n "${SERVER_EXTRA_ARGS}" ]]; then
   cmd+=(--server-extra-args="${SERVER_EXTRA_ARGS}")
