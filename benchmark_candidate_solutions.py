@@ -158,6 +158,8 @@ def build_candidate_blocks(
     metadata.append({"candidate_idx": 0, "draft_score": base_score, "replaced_positions": []})
 
     for assignment, score in beams:
+        if len(candidates) >= max_candidates:
+            break
         candidate = base_block_output_ids.clone()
         replaced_positions = []
         for pos, token_id in assignment.items():
@@ -177,8 +179,6 @@ def build_candidate_blocks(
                 "replaced_positions": replaced_positions,
             }
         )
-        if len(candidates) >= max_candidates:
-            break
 
     return candidates, metadata
 
