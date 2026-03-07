@@ -494,6 +494,99 @@ def resolve_cycle_max_candidates(
     return int(max(1, min(max_candidates, selected)))
 
 
+def verify_candidates_tree(
+    *,
+    target: AutoModelForCausalLM,
+    candidate_blocks: list[torch.Tensor],
+    block_position_ids: torch.Tensor,
+    past_key_values_target: DynamicCache,
+    verify_cache_clone_mode: str,
+    temperature: float,
+    collect_hidden_states: bool,
+    target_layer_ids: list[int],
+) -> dict:
+    """Verify candidates via shared-prefix rollout.
+
+    We generate one posterior chain p_0..p_{k-1} and score each candidate by
+    longest-prefix match against that chain. This computes identical tau
+    semantics to the batched verifier while avoiding N-way target batching.
+    """
+    num_candidates = len(candidate_blocks)
+    effective_block_size = int(candidate_blocks[0].shape[1])
+    device = candidate_blocks[0].device
+
+    if verify_cache_clone_mode == "inplace":
+        verify_cache = past_key_values_target
+    else:
+        verify_cache = clone_dynamic_cache(
+            past_key_values_target,
+            deep_copy_tensors=(verify_cache_clone_mode == "deep"),
+        )
+
+    root_token = candidate_blocks[0][:, :1]
+    for candidate in candidate_blocks[1:]:
+        if int(candidate[0, 0].item()) != int(root_token[0, 0].item()):
+            raise ValueError("Tree verification requires all candidates to share the same first token.")
+
+    if effective_block_size > 1:
+        candidate_suffix_tokens = torch.stack([candidate[0, 1:effective_block_size] for candidate in candidate_blocks], dim=0)
+        acceptance_lengths = torch.full((num_candidates,), -1, dtype=torch.long, device=device)
+        alive = torch.ones((num_candidates,), dtype=torch.bool, device=device)
+    else:
+        candidate_suffix_tokens = None
+        acceptance_lengths = torch.zeros((num_candidates,), dtype=torch.long, device=device)
+        alive = None
+
+    posterior_steps: list[torch.Tensor] = []
+    target_hidden_steps: list[torch.Tensor] = []
+    verify_target_calls = 0
+
+    for step in range(effective_block_size):
+        step_token = root_token if step == 0 else posterior_steps[-1].reshape(1, 1)
+        step_position_ids = block_position_ids[:, step : step + 1]
+        verify_output = target(
+            step_token,
+            position_ids=step_position_ids,
+            past_key_values=verify_cache,
+            use_cache=True,
+            output_hidden_states=collect_hidden_states,
+        )
+        verify_target_calls += 1
+
+        step_posterior = sample(verify_output.logits, temperature)[:, 0]
+        posterior_steps.append(step_posterior)
+
+        if collect_hidden_states:
+            target_hidden_steps.append(extract_context_feature(verify_output.hidden_states, target_layer_ids))
+
+        if effective_block_size <= 1 or step >= effective_block_size - 1:
+            continue
+
+        matches = candidate_suffix_tokens[:, step].eq(step_posterior[0])
+        dead = alive & (~matches)
+        if bool(dead.any()):
+            acceptance_lengths[dead] = step
+        alive = alive & matches
+        if not bool(alive.any()):
+            break
+
+    if effective_block_size > 1:
+        unresolved = acceptance_lengths.lt(0)
+        if bool(unresolved.any()):
+            acceptance_lengths[unresolved] = effective_block_size - 1
+
+    posterior_steps_tensor = torch.cat(posterior_steps, dim=0)
+    next_tokens = posterior_steps_tensor.index_select(0, acceptance_lengths)
+
+    return {
+        "acceptance_lengths": acceptance_lengths,
+        "next_tokens": next_tokens,
+        "verify_cache": verify_cache,
+        "verify_target_calls": int(verify_target_calls),
+        "target_hidden_steps": target_hidden_steps,
+    }
+
+
 @torch.inference_mode()
 def dflash_generate_candidate_solutions(
     model: DFlashDraftModel,
@@ -519,6 +612,7 @@ def dflash_generate_candidate_solutions(
     detailed_cycle_metadata: bool,
     candidate_verify_static_shape: bool,
     verify_cache_clone_mode: str,
+    candidate_verify_mode: str,
     temperature: float = 0.0,
     collect_profile: bool = False,
 ) -> SimpleNamespace:
@@ -675,60 +769,87 @@ def dflash_generate_candidate_solutions(
                     }
                 )
 
-        # Verify all candidates in one target call by expanding batch.
+        # Verify candidates: either one batched call or shared-prefix tree rollout.
         num_candidates = len(candidate_blocks)
-        if num_candidates == 1:
-            stacked_candidates = candidate_blocks[0]
-            stacked_position_ids = block_position_ids
-            verify_cache = past_key_values_target
-        else:
-            if (
-                candidate_token_buffer is None
-                or candidate_token_buffer.shape[0] < num_candidates
-                or candidate_token_buffer.shape[1] < effective_block_size
-            ):
-                candidate_token_buffer = torch.empty(
-                    (max_candidates, block_size),
-                    dtype=block_output_ids.dtype,
-                    device=block_output_ids.device,
-                )
-                candidate_pos_buffer = torch.empty(
-                    (max_candidates, block_size),
-                    dtype=block_position_ids.dtype,
-                    device=block_position_ids.device,
-                )
-            for i, candidate in enumerate(candidate_blocks):
-                candidate_token_buffer[i, :effective_block_size] = candidate[0, :effective_block_size]
-            candidate_pos_buffer[:num_candidates, :effective_block_size] = block_position_ids[0, :effective_block_size]
-            stacked_candidates = candidate_token_buffer[:num_candidates, :effective_block_size]
-            stacked_position_ids = candidate_pos_buffer[:num_candidates, :effective_block_size]
-            if verify_cache_clone_mode == "inplace":
+        verify_target_calls_this_cycle = 0
+        tree_hidden_steps = None
+
+        if candidate_verify_mode == "batch":
+            if num_candidates == 1:
+                stacked_candidates = candidate_blocks[0]
+                stacked_position_ids = block_position_ids
                 verify_cache = past_key_values_target
             else:
-                verify_cache = clone_dynamic_cache(
-                    past_key_values_target,
-                    deep_copy_tensors=(verify_cache_clone_mode == "deep"),
-                )
-            verify_cache.batch_repeat_interleave(num_candidates)
+                if (
+                    candidate_token_buffer is None
+                    or candidate_token_buffer.shape[0] < num_candidates
+                    or candidate_token_buffer.shape[1] < effective_block_size
+                ):
+                    candidate_token_buffer = torch.empty(
+                        (max_candidates, block_size),
+                        dtype=block_output_ids.dtype,
+                        device=block_output_ids.device,
+                    )
+                    candidate_pos_buffer = torch.empty(
+                        (max_candidates, block_size),
+                        dtype=block_position_ids.dtype,
+                        device=block_position_ids.device,
+                    )
+                for i, candidate in enumerate(candidate_blocks):
+                    candidate_token_buffer[i, :effective_block_size] = candidate[0, :effective_block_size]
+                candidate_pos_buffer[:num_candidates, :effective_block_size] = block_position_ids[0, :effective_block_size]
+                stacked_candidates = candidate_token_buffer[:num_candidates, :effective_block_size]
+                stacked_position_ids = candidate_pos_buffer[:num_candidates, :effective_block_size]
+                if verify_cache_clone_mode == "inplace":
+                    verify_cache = past_key_values_target
+                else:
+                    verify_cache = clone_dynamic_cache(
+                        past_key_values_target,
+                        deep_copy_tensors=(verify_cache_clone_mode == "deep"),
+                    )
+                verify_cache.batch_repeat_interleave(num_candidates)
 
-        if collect_profile:
-            target_events = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
-            target_events[0].record()
-        verify_output = target(
-            stacked_candidates,
-            position_ids=stacked_position_ids,
-            past_key_values=verify_cache,
-            use_cache=True,
-            output_hidden_states=True if effective_block_size > 1 else False,
-        )
-        if collect_profile:
-            target_events[1].record()
-        candidate_verify_calls += 1
+            if collect_profile:
+                target_events = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+                target_events[0].record()
+            verify_output = target(
+                stacked_candidates,
+                position_ids=stacked_position_ids,
+                past_key_values=verify_cache,
+                use_cache=True,
+                output_hidden_states=True if effective_block_size > 1 else False,
+            )
+            if collect_profile:
+                target_events[1].record()
+            verify_target_calls_this_cycle = 1
+            candidate_verify_calls += 1
 
-        posterior_all = sample(verify_output.logits, temperature)
-        acceptance_lengths_all = (
-            (stacked_candidates[:, 1:] == posterior_all[:, :-1]).cumprod(dim=1).sum(dim=1)
-        )
+            posterior_all = sample(verify_output.logits, temperature)
+            acceptance_lengths_all = (stacked_candidates[:, 1:] == posterior_all[:, :-1]).cumprod(dim=1).sum(dim=1)
+            next_tokens_all = posterior_all.gather(1, acceptance_lengths_all.unsqueeze(1)).squeeze(1)
+        else:
+            if collect_profile:
+                target_events = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+                target_events[0].record()
+            tree_verify = verify_candidates_tree(
+                target=target,
+                candidate_blocks=candidate_blocks,
+                block_position_ids=block_position_ids,
+                past_key_values_target=past_key_values_target,
+                verify_cache_clone_mode=verify_cache_clone_mode,
+                temperature=temperature,
+                collect_hidden_states=(effective_block_size > 1),
+                target_layer_ids=model.target_layer_ids,
+            )
+            if collect_profile:
+                target_events[1].record()
+
+            verify_cache = tree_verify["verify_cache"]
+            acceptance_lengths_all = tree_verify["acceptance_lengths"]
+            next_tokens_all = tree_verify["next_tokens"]
+            tree_hidden_steps = tree_verify["target_hidden_steps"]
+            verify_target_calls_this_cycle = int(tree_verify["verify_target_calls"])
+            candidate_verify_calls += verify_target_calls_this_cycle
 
         tau_all = acceptance_lengths_all + 1
         draft_scores = torch.tensor(
@@ -742,19 +863,19 @@ def dflash_generate_candidate_solutions(
         composite = tau_all.float() * 1e6 + draft_scores - candidate_indices * 1e-3
         chosen_candidate_idx = int(torch.argmax(composite).item())
         chosen_candidate_block = candidate_blocks[chosen_candidate_idx]
-        posterior = posterior_all[chosen_candidate_idx : chosen_candidate_idx + 1]
+        chosen_next_token = next_tokens_all[chosen_candidate_idx]
         acceptance_length = int(acceptance_lengths_all[chosen_candidate_idx].item())
         tau = acceptance_length + 1
 
         # Keep only chosen branch cache for next cycle.
-        if num_candidates > 1:
+        if candidate_verify_mode == "batch" and num_candidates > 1:
             verify_cache.batch_select_indices(
                 torch.tensor([chosen_candidate_idx], dtype=torch.long, device=stacked_candidates.device)
             )
         past_key_values_target = verify_cache
 
         output_ids[:, start : start + tau] = chosen_candidate_block[:, :tau]
-        output_ids[:, start + tau] = posterior[:, acceptance_length]
+        output_ids[:, start + tau] = chosen_next_token.reshape(1)
         acceptance_lengths.append(tau)
 
         cycle_row = {
@@ -768,6 +889,7 @@ def dflash_generate_candidate_solutions(
             "cycle_max_candidates": int(cycle_max_candidates),
             "selected_positions": [int(x) for x in selected_positions],
             "chosen_candidate_idx": int(chosen_candidate_idx),
+            "verify_target_calls": int(verify_target_calls_this_cycle),
         }
         if detailed_cycle_metadata:
             cycle_row["candidate_taus"] = [int(x) for x in tau_all.tolist()]
@@ -786,8 +908,11 @@ def dflash_generate_candidate_solutions(
         start += tau
         past_key_values_target.crop(start)
         if effective_block_size > 1:
-            chosen_hidden_states = [h[chosen_candidate_idx : chosen_candidate_idx + 1] for h in verify_output.hidden_states]
-            target_hidden = extract_context_feature(chosen_hidden_states, model.target_layer_ids)[:, :tau, :]
+            if candidate_verify_mode == "batch":
+                chosen_hidden_states = [h[chosen_candidate_idx : chosen_candidate_idx + 1] for h in verify_output.hidden_states]
+                target_hidden = extract_context_feature(chosen_hidden_states, model.target_layer_ids)[:, :tau, :]
+            else:
+                target_hidden = torch.cat(tree_hidden_steps[:tau], dim=1)
 
         if stop_token_ids is not None and any(
             stop_token_id in output_ids[:, num_input_tokens:] for stop_token_id in stop_token_ids
@@ -815,6 +940,7 @@ def dflash_generate_candidate_solutions(
         "candidate_mode": str(candidate_mode),
         "candidate_sample_temperature": float(candidate_sample_temperature),
         "candidate_verify_static_shape": bool(candidate_verify_static_shape),
+        "candidate_verify_mode": str(candidate_verify_mode),
         "verify_cache_clone_mode": str(verify_cache_clone_mode),
         "fixed_prefix_len": int(fixed_prefix_len),
         "sparse_max_positions": int(sparse_max_positions),
@@ -990,6 +1116,17 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--candidate-verify-mode",
+        type=str,
+        choices=["batch", "tree"],
+        default="batch",
+        help=(
+            "Candidate verification mode. "
+            "'batch' verifies all candidates in one expanded target call; "
+            "'tree' rolls out a shared-prefix verify chain and scores all candidates."
+        ),
+    )
+    parser.add_argument(
         "--detailed-cycle-metadata",
         action="store_true",
         help="Include full per-cycle candidate arrays (taus/scores/variants) in cycle trace.",
@@ -1059,7 +1196,8 @@ def main() -> None:
             f"adaptive_candidates={args.adaptive_candidates}, adaptive_budgets={adaptive_budget_vals}, "
             f"adaptive_accept_thresholds={adaptive_threshold_vals}, "
             f"adaptive_warmup_cycles={args.adaptive_warmup_cycles}, "
-            f"adaptive_probe_interval={args.adaptive_probe_interval}"
+            f"adaptive_probe_interval={args.adaptive_probe_interval}, "
+            f"candidate_verify_mode={args.candidate_verify_mode}"
         ),
         pre_dist=True,
     )
@@ -1180,6 +1318,7 @@ def main() -> None:
                     detailed_cycle_metadata=args.detailed_cycle_metadata,
                     candidate_verify_static_shape=args.candidate_verify_static_shape,
                     verify_cache_clone_mode=args.verify_cache_clone_mode,
+                    candidate_verify_mode=args.candidate_verify_mode,
                     temperature=args.temperature,
                     collect_profile=collect_profile,
                 )
@@ -1231,6 +1370,7 @@ def main() -> None:
                     "candidate_mode": args.candidate_mode,
                     "candidate_sample_temperature": args.candidate_sample_temperature,
                     "candidate_verify_static_shape": args.candidate_verify_static_shape,
+                    "candidate_verify_mode": args.candidate_verify_mode,
                     "verify_cache_clone_mode": args.verify_cache_clone_mode,
                     "fixed_prefix_len": args.fixed_prefix_len,
                     "sparse_max_positions": args.sparse_max_positions,
@@ -1340,6 +1480,7 @@ def main() -> None:
     print(f"Candidate mode: {args.candidate_mode}")
     print(f"Candidate sample_temperature: {args.candidate_sample_temperature}")
     print(f"Candidate verify_static_shape: {args.candidate_verify_static_shape}")
+    print(f"Candidate verify_mode: {args.candidate_verify_mode}")
     print(f"Candidate verify_cache_clone_mode: {args.verify_cache_clone_mode}")
     print(f"Candidate fixed_prefix_len: {args.fixed_prefix_len}")
     print(f"Candidate sparse_max_positions: {args.sparse_max_positions}")
