@@ -1,7 +1,30 @@
+# Python 3.12 environment in pod.
+# Keep torch stack pinned to match SGLang 0.5.9 and FA prebuilt wheel.
+torch==2.9.1
+torchvision==0.24.1
+torchaudio==2.9.1
+
+# SGLang with DFLASH PR changes.
 git+https://github.com/sgl-project/sglang.git@refs/pull/16818/head#subdirectory=python
-# Use prebuilt FlashAttention wheel (avoid local source build in pod envs).
-flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1%2Bcu12torch2.2cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+
+# Prebuilt FlashAttention wheel (avoid source build in pod envs).
+flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+
+# Extra runtime deps that sglang serve --help currently pulls in via multimodal imports.
+imageio
+diffusers
+cache_dit
+av
+addict
+
+# Utility libs used across scripts.
 accelerate
 rich
 packaging
 ninja
+datasets
+loguru
+pandas
+matplotlib
+tqdm
+requests
