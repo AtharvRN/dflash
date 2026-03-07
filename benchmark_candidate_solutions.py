@@ -517,6 +517,7 @@ def dflash_generate_candidate_solutions(
     adaptive_warmup_cycles: int,
     adaptive_probe_interval: int,
     detailed_cycle_metadata: bool,
+    candidate_verify_static_shape: bool,
     verify_cache_clone_mode: str,
     temperature: float = 0.0,
     collect_profile: bool = False,
@@ -657,7 +658,22 @@ def dflash_generate_candidate_solutions(
             if collect_profile:
                 draft_events[1].record()
 
-        candidate_count_sum += len(candidate_blocks)
+        num_candidates_raw = len(candidate_blocks)
+        candidate_count_sum += num_candidates_raw
+
+        if candidate_verify_static_shape and num_candidates_raw < cycle_max_candidates:
+            pad_count = cycle_max_candidates - num_candidates_raw
+            pad_block = candidate_blocks[0]
+            for _ in range(pad_count):
+                candidate_blocks.append(pad_block)
+                candidate_meta.append(
+                    {
+                        "candidate_idx": len(candidate_blocks) - 1,
+                        "draft_score": 0.0,
+                        "replaced_positions": [],
+                        "rank_variant": 1,
+                    }
+                )
 
         # Verify all candidates in one target call by expanding batch.
         num_candidates = len(candidate_blocks)
@@ -686,10 +702,13 @@ def dflash_generate_candidate_solutions(
             candidate_pos_buffer[:num_candidates, :effective_block_size] = block_position_ids[0, :effective_block_size]
             stacked_candidates = candidate_token_buffer[:num_candidates, :effective_block_size]
             stacked_position_ids = candidate_pos_buffer[:num_candidates, :effective_block_size]
-            verify_cache = clone_dynamic_cache(
-                past_key_values_target,
-                deep_copy_tensors=(verify_cache_clone_mode == "deep"),
-            )
+            if verify_cache_clone_mode == "inplace":
+                verify_cache = past_key_values_target
+            else:
+                verify_cache = clone_dynamic_cache(
+                    past_key_values_target,
+                    deep_copy_tensors=(verify_cache_clone_mode == "deep"),
+                )
             verify_cache.batch_repeat_interleave(num_candidates)
 
         if collect_profile:
@@ -745,6 +764,7 @@ def dflash_generate_candidate_solutions(
             "tau": int(tau),
             "acceptance_ratio": float(tau / max(1, effective_block_size)),
             "num_candidates": int(len(candidate_blocks)),
+            "num_candidates_raw": int(num_candidates_raw),
             "cycle_max_candidates": int(cycle_max_candidates),
             "selected_positions": [int(x) for x in selected_positions],
             "chosen_candidate_idx": int(chosen_candidate_idx),
@@ -794,6 +814,7 @@ def dflash_generate_candidate_solutions(
     candidate_summary = {
         "candidate_mode": str(candidate_mode),
         "candidate_sample_temperature": float(candidate_sample_temperature),
+        "candidate_verify_static_shape": bool(candidate_verify_static_shape),
         "verify_cache_clone_mode": str(verify_cache_clone_mode),
         "fixed_prefix_len": int(fixed_prefix_len),
         "sparse_max_positions": int(sparse_max_positions),
@@ -951,12 +972,21 @@ def main() -> None:
     parser.add_argument(
         "--verify-cache-clone-mode",
         type=str,
-        choices=["shallow", "deep"],
-        default="shallow",
+        choices=["inplace", "shallow", "deep"],
+        default="inplace",
         help=(
             "How to copy target KV cache before multi-candidate verification. "
-            "'shallow' shares prefix tensor storage and is faster; "
+            "'inplace' reuses live cache directly (fastest); "
+            "'shallow' shares prefix tensor storage via copied cache wrapper; "
             "'deep' clones tensors and is safer."
+        ),
+    )
+    parser.add_argument(
+        "--candidate-verify-static-shape",
+        action="store_true",
+        help=(
+            "Pad candidate list to cycle_max_candidates each cycle to stabilize "
+            "verify batch shape (graph-friendly)."
         ),
     )
     parser.add_argument(
@@ -1148,6 +1178,7 @@ def main() -> None:
                     adaptive_warmup_cycles=args.adaptive_warmup_cycles,
                     adaptive_probe_interval=args.adaptive_probe_interval,
                     detailed_cycle_metadata=args.detailed_cycle_metadata,
+                    candidate_verify_static_shape=args.candidate_verify_static_shape,
                     verify_cache_clone_mode=args.verify_cache_clone_mode,
                     temperature=args.temperature,
                     collect_profile=collect_profile,
@@ -1199,6 +1230,7 @@ def main() -> None:
                     "branch_margin_threshold": args.branch_margin_threshold,
                     "candidate_mode": args.candidate_mode,
                     "candidate_sample_temperature": args.candidate_sample_temperature,
+                    "candidate_verify_static_shape": args.candidate_verify_static_shape,
                     "verify_cache_clone_mode": args.verify_cache_clone_mode,
                     "fixed_prefix_len": args.fixed_prefix_len,
                     "sparse_max_positions": args.sparse_max_positions,
@@ -1307,6 +1339,7 @@ def main() -> None:
     print(f"Candidate avg_verify_calls_per_sample: {avg_verify_calls:.1f}")
     print(f"Candidate mode: {args.candidate_mode}")
     print(f"Candidate sample_temperature: {args.candidate_sample_temperature}")
+    print(f"Candidate verify_static_shape: {args.candidate_verify_static_shape}")
     print(f"Candidate verify_cache_clone_mode: {args.verify_cache_clone_mode}")
     print(f"Candidate fixed_prefix_len: {args.fixed_prefix_len}")
     print(f"Candidate sparse_max_positions: {args.sparse_max_positions}")
