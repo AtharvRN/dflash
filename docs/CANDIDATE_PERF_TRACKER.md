@@ -16,6 +16,7 @@ This file tracks throughput changes for candidate verification experiments on th
 | `aime25_30_lowrisk_20260307_053907` | low-risk buffer + metadata gating (`9e96b4e`) | 131.23 | 129.60 | -1.25% |
 | `aime25_30_shallow_20260307_054825` | + shallow clone option (`e7e69ec`) | 131.06 | 129.59 | -1.12% |
 | `aime25_30_opt2_20260307_055245` | + streamlined `sample_multi` metadata/scoring (`aa36f6e`) | 130.27 | 135.19 | +3.78% |
+| `aime25_30_opt3_20260307_061401` | + inplace verify cache + static verify shape (`cf1c64c`) | 131.52 | 137.10 | +4.24% |
 
 ## Notes
 
