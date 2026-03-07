@@ -519,6 +519,7 @@ def dflash_generate_candidate_solutions(
     adaptive_accept_thresholds: tuple[float, float],
     adaptive_warmup_cycles: int,
     adaptive_probe_interval: int,
+    detailed_cycle_metadata: bool,
     temperature: float = 0.0,
     collect_profile: bool = False,
 ) -> SimpleNamespace:
@@ -565,6 +566,8 @@ def dflash_generate_candidate_solutions(
     first_prompt_cycle_done = False
     last_accept_ratio = None
     adaptive_budget_counts: Counter[int] = Counter()
+    candidate_token_buffer = None
+    candidate_pos_buffer = None
 
     while start < max_length:
         cycle_start = None
@@ -660,8 +663,30 @@ def dflash_generate_candidate_solutions(
 
         # Verify all candidates in one target call by expanding batch.
         num_candidates = len(candidate_blocks)
-        stacked_candidates = torch.cat(candidate_blocks, dim=0)
-        stacked_position_ids = block_position_ids.repeat(num_candidates, 1)
+        if num_candidates == 1:
+            stacked_candidates = candidate_blocks[0]
+            stacked_position_ids = block_position_ids
+        else:
+            if (
+                candidate_token_buffer is None
+                or candidate_token_buffer.shape[0] < num_candidates
+                or candidate_token_buffer.shape[1] < effective_block_size
+            ):
+                candidate_token_buffer = torch.empty(
+                    (max_candidates, block_size),
+                    dtype=block_output_ids.dtype,
+                    device=block_output_ids.device,
+                )
+                candidate_pos_buffer = torch.empty(
+                    (max_candidates, block_size),
+                    dtype=block_position_ids.dtype,
+                    device=block_position_ids.device,
+                )
+            for i, candidate in enumerate(candidate_blocks):
+                candidate_token_buffer[i, :effective_block_size] = candidate[0, :effective_block_size]
+            candidate_pos_buffer[:num_candidates, :effective_block_size] = block_position_ids[0, :effective_block_size]
+            stacked_candidates = candidate_token_buffer[:num_candidates, :effective_block_size]
+            stacked_position_ids = candidate_pos_buffer[:num_candidates, :effective_block_size]
         verify_cache = clone_dynamic_cache(past_key_values_target)
         if num_candidates > 1:
             verify_cache.batch_repeat_interleave(num_candidates)
@@ -722,10 +747,11 @@ def dflash_generate_candidate_solutions(
             "cycle_max_candidates": int(cycle_max_candidates),
             "selected_positions": [int(x) for x in selected_positions],
             "chosen_candidate_idx": int(chosen_candidate_idx),
-            "candidate_taus": [int(x) for x in tau_all.tolist()],
-            "candidate_draft_scores": [float(x) for x in draft_scores.tolist()],
-            "candidate_rank_variants": [int(x.get("rank_variant", 1)) for x in candidate_meta],
         }
+        if detailed_cycle_metadata:
+            cycle_row["candidate_taus"] = [int(x) for x in tau_all.tolist()]
+            cycle_row["candidate_draft_scores"] = [float(x) for x in draft_scores.tolist()]
+            cycle_row["candidate_rank_variants"] = [int(x.get("rank_variant", 1)) for x in candidate_meta]
         if collect_profile:
             cycle_end.record()
             cycle_row["_events"] = {
@@ -920,6 +946,11 @@ def main() -> None:
         action="store_true",
         help="Collect per-cycle profiling stats (target/draft/cycle timings).",
     )
+    parser.add_argument(
+        "--detailed-cycle-metadata",
+        action="store_true",
+        help="Include full per-cycle candidate arrays (taus/scores/variants) in cycle trace.",
+    )
     args = parser.parse_args()
 
     if args.branch_depth < 0:
@@ -1103,6 +1134,7 @@ def main() -> None:
                     adaptive_accept_thresholds=adaptive_threshold_vals,
                     adaptive_warmup_cycles=args.adaptive_warmup_cycles,
                     adaptive_probe_interval=args.adaptive_probe_interval,
+                    detailed_cycle_metadata=args.detailed_cycle_metadata,
                     temperature=args.temperature,
                     collect_profile=collect_profile,
                 )
