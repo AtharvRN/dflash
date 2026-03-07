@@ -937,10 +937,11 @@ def dflash_generate_candidate_solutions(
         tau = acceptance_length + 1
 
         # Keep only chosen branch cache for next cycle.
-        if candidate_verify_mode == "batch" and num_candidates > 1:
-            verify_cache.batch_select_indices(
-                torch.tensor([chosen_candidate_idx], dtype=torch.long, device=stacked_candidates.device)
-            )
+        if candidate_verify_mode == "batch":
+            if num_candidates > 1:
+                verify_cache.batch_select_indices(
+                    torch.tensor([chosen_candidate_idx], dtype=torch.long, device=stacked_candidates.device)
+                )
             past_key_values_target = verify_cache
         elif candidate_verify_mode == "tree_chain":
             past_key_values_target = verify_cache
