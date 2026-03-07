@@ -409,7 +409,6 @@ def build_sampled_candidates(
         )
 
     temp = float(max(sample_temperature, 1e-6))
-    log_probs = torch.log_softmax((draft_logits.float() / temp), dim=-1)[0]
     probs = torch.softmax((draft_logits.float() / temp), dim=-1)[0]
 
     # [num_extra, suffix_len, vocab] -> [num_extra * suffix_len, vocab]
@@ -427,12 +426,12 @@ def build_sampled_candidates(
     base_key = tuple(int(x) for x in base_block_output_ids[0, 1:].tolist())
     seen.add(base_key)
     candidates.append(base_block_output_ids.clone())
-    base_tokens = base_block_output_ids[0, 1:]
-    base_score = float(log_probs.gather(1, base_tokens.unsqueeze(-1)).sum().item())
     metadata.append(
         {
             "candidate_idx": 0,
-            "draft_score": base_score,
+            # For sample_multi, selection is primarily driven by accepted length (tau).
+            # Keep draft_score neutral to avoid extra per-cycle scoring overhead.
+            "draft_score": 0.0,
             "replaced_positions": [],
             "rank_variant": 1,
         }
@@ -445,19 +444,12 @@ def build_sampled_candidates(
         if key in seen:
             continue
         seen.add(key)
-        cand_tokens = candidate[0, 1:].unsqueeze(-1)
-        cand_score = float(log_probs.gather(1, cand_tokens).sum().item())
-        replaced = [
-            int(pos)
-            for pos in suffix_positions
-            if int(candidate[0, pos].item()) != int(base_block_output_ids[0, pos].item())
-        ]
         candidates.append(candidate)
         metadata.append(
             {
                 "candidate_idx": len(candidates) - 1,
-                "draft_score": cand_score,
-                "replaced_positions": replaced,
+                "draft_score": 0.0,
+                "replaced_positions": [],
                 "rank_variant": 1,
             }
         )
