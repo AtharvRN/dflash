@@ -137,3 +137,88 @@ CUDA_VISIBLE_DEVICES=0 python -u benchmark_candidate_solutions.py \
   - `draft ms/cycle`,
   - `verify ms/cycle`,
   - `cycle ms`.
+
+## Candidate Diversity Check (`sample_multi`, `max_candidates=8`)
+
+Run tag: `aime25_diversity_mc8_20260307_182701`  
+Executed on: `atharv-rwx-pod` (`dflash` env)  
+Config: `candidate_mode=sample_multi`, `candidate_verify_mode=tree`, `max_candidates=8`, `block_size=16`, `max_samples=30`, `max_new_tokens=512`, `--detailed-cycle-metadata`
+
+### Core performance
+
+- `tokens/s`: `137.8855`
+- `avg_candidates_per_cycle`: `7.376` (from run log)
+- `avg_verify_calls_per_sample`: `71.8` (from run log)
+- `mean acceptance length`: `7.57` (from run log histogram summary)
+
+### Diversity metrics from per-cycle `candidate_taus`
+
+- `cycles_with_candidate_taus`: `2153`
+- `avg_num_candidates`: `8.0`
+- `avg_chosen_tau`: `7.1342`
+- `avg_best_candidate_tau`: `7.1342`
+- `avg_mean_candidate_tau`: `4.9808`
+- `avg_tau_spread (max-min)`: `4.0186`
+- `% cycles spread > 0`: `90.52%`
+- `% cycles spread >= 2`: `73.20%`
+- `% cycles unique_tau >= 2`: `90.52%`
+- `% cycles unique_tau >= 3`: `66.84%`
+
+Interpretation:
+- Candidate set is highly diverse in tau for this run.
+- Selection is consistently finding the best tau among sampled candidates (`avg_chosen_tau == avg_best_candidate_tau`).
+
+### Artifacts
+
+- `outputs/aime25_diversity_mc8_20260307_182701/sample.jsonl`
+- `outputs/aime25_diversity_mc8_20260307_182701/cycle.jsonl`
+- `outputs/aime25_diversity_mc8_20260307_182701/diversity_summary.json`
+- `outputs/aime25_diversity_mc8_20260307_182701/diversity_summary.md`
+- `logs/aime25_diversity_mc8_20260307_182701/run.log`
+
+## Full Multi-Candidate Resweep (`sample_multi`, `tree`, `mc=1..16`)
+
+Run tag: `aime25_mc_resweep_20260307_190046`  
+Executed on: `atharv-rwx-pod` (2x A100, parallel execution across both GPUs)
+
+### Config
+
+- Candidate mode: `sample_multi`
+- Verify mode: `tree`
+- `--candidate-verify-static-shape`
+- `--verify-cache-clone-mode inplace`
+- `--detailed-cycle-metadata`
+- Dataset: `aime25`
+- `max_samples=30`
+- `block_size=16`
+- `max_new_tokens=512`
+
+### Runs Executed
+
+- Baseline DFLASH: one run
+- Multi-candidate sweep: `mc in {1,2,4,6,8,10,12,14,16}`
+
+### Artifacts
+
+- `outputs/aime25_mc_resweep_20260307_190046/mc_resweep_summary.md`
+- `outputs/aime25_mc_resweep_20260307_190046/mc_resweep_summary.csv`
+- Per-run sample/cycle traces in `outputs/aime25_mc_resweep_20260307_190046/`
+- Logs in `logs/aime25_mc_resweep_20260307_190046/`
+
+### Key Results (vs same-run baseline DFLASH `123.21 tok/s`)
+
+- `mc14`: `144.78 tok/s` (`1.175x`, best)
+- `mc10`: `143.23 tok/s` (`1.162x`)
+- `mc16`: `142.30 tok/s` (`1.155x`)
+- `mc8`: `141.63 tok/s` (`1.150x`)
+
+### Trends
+
+- Tau increases with candidates: baseline `6.44` -> `mc14 7.48`.
+- Verify time per cycle is mostly flat for `mc>=4` (`~37.7-38.3 ms`).
+- Draft time per cycle increases with candidates (`~6.3 ms` at `mc1` -> `~8.0 ms` at `mc16`).
+- Non-greedy chosen rate increases with candidates: `mc2=8.03%`, `mc8=32.98%`, `mc14=41.48%`, `mc16=45.02%`.
+- Greedy-best-tau rate decreases with candidates: `mc1=100%`, `mc8=67.02%`, `mc14=58.52%`, `mc16=54.98%`.
+
+Conclusion:
+- For this setup, `mc14` is the throughput optimum; beyond that, additional draft overhead dominates the marginal acceptance gains.
