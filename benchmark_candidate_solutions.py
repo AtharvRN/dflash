@@ -620,6 +620,26 @@ def build_block_diagonal_tree_attention_mask(
     return mask
 
 
+def select_tree_branch_cache_from_packed(
+    *,
+    cache: DynamicCache,
+    past_len: int,
+    block_len: int,
+    candidate_idx: int,
+    keep_len: int,
+) -> DynamicCache:
+    """Select [prefix + chosen-branch accepted tokens] from packed tree cache."""
+    legacy = cache.to_legacy_cache()
+    selected_legacy = []
+    branch_start = past_len + candidate_idx * block_len
+    for k, v in legacy:
+        prefix_idx = torch.arange(past_len, device=k.device, dtype=torch.long)
+        branch_idx = torch.arange(branch_start, branch_start + keep_len, device=k.device, dtype=torch.long)
+        idx = torch.cat([prefix_idx, branch_idx], dim=0)
+        selected_legacy.append((k.index_select(-2, idx), v.index_select(-2, idx)))
+    return DynamicCache.from_legacy_cache(tuple(selected_legacy))
+
+
 @torch.inference_mode()
 def dflash_generate_candidate_solutions(
     model: DFlashDraftModel,
@@ -887,6 +907,7 @@ def dflash_generate_candidate_solutions(
         else:
             # Attention-tree verification: pack candidates in one sequence and
             # constrain attention with block-diagonal causal mask.
+            packed_past_len = past_key_values_target.get_seq_length()
             stacked_candidates = torch.stack(
                 [candidate[0, :effective_block_size] for candidate in candidate_blocks], dim=0
             )
@@ -896,10 +917,18 @@ def dflash_generate_candidate_solutions(
             tree_attn_mask = build_block_diagonal_tree_attention_mask(
                 num_candidates=num_candidates,
                 block_len=effective_block_size,
-                past_len=past_key_values_target.get_seq_length(),
+                past_len=packed_past_len,
                 device=packed_candidates.device,
                 dtype=target.dtype,
             )
+
+            if verify_cache_clone_mode == "inplace":
+                verify_cache = past_key_values_target
+            else:
+                verify_cache = clone_dynamic_cache(
+                    past_key_values_target,
+                    deep_copy_tensors=(verify_cache_clone_mode == "deep"),
+                )
 
             if collect_profile:
                 target_events = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
@@ -908,11 +937,13 @@ def dflash_generate_candidate_solutions(
             verify_output = target(
                 packed_candidates,
                 position_ids=packed_position_ids,
-                past_key_values=past_key_values_target,
-                use_cache=False,
-                output_hidden_states=False,
+                past_key_values=verify_cache,
+                use_cache=True,
+                output_hidden_states=True if effective_block_size > 1 else False,
                 attention_mask=tree_attn_mask,
             )
+            if collect_profile:
+                target_events[1].record()
             verify_target_calls_this_cycle = 1
             candidate_verify_calls += 1
 
@@ -946,18 +977,13 @@ def dflash_generate_candidate_solutions(
         elif candidate_verify_mode == "tree_chain":
             past_key_values_target = verify_cache
         else:
-            # Commit only accepted tokens for the chosen branch into live cache.
-            chosen_commit_tokens = chosen_candidate_block[:, :tau]
-            chosen_commit_pos = block_position_ids[:, :tau]
-            commit_output = target(
-                chosen_commit_tokens,
-                position_ids=chosen_commit_pos,
-                past_key_values=past_key_values_target,
-                use_cache=True,
-                output_hidden_states=True if effective_block_size > 1 else False,
+            past_key_values_target = select_tree_branch_cache_from_packed(
+                cache=verify_cache,
+                past_len=packed_past_len,
+                block_len=effective_block_size,
+                candidate_idx=chosen_candidate_idx,
+                keep_len=tau,
             )
-            candidate_verify_calls += 1
-            commit_target_calls_this_cycle = 1
 
         output_ids[:, start : start + tau] = chosen_candidate_block[:, :tau]
         output_ids[:, start + tau] = chosen_next_token.reshape(1)
@@ -1000,11 +1026,11 @@ def dflash_generate_candidate_solutions(
             elif candidate_verify_mode == "tree_chain":
                 target_hidden = torch.cat(tree_hidden_steps[:tau], dim=1)
             else:
-                target_hidden = extract_context_feature(commit_output.hidden_states, model.target_layer_ids)[:, :tau, :]
-
-        if collect_profile and candidate_verify_mode == "tree":
-            # close profile span after explicit commit call
-            target_events[1].record()
+                packed_offset = chosen_candidate_idx * effective_block_size
+                chosen_hidden_states = [
+                    h[:, packed_offset : packed_offset + tau, :] for h in verify_output.hidden_states
+                ]
+                target_hidden = extract_context_feature(chosen_hidden_states, model.target_layer_ids)[:, :tau, :]
 
         if stop_token_ids is not None and any(
             stop_token_id in output_ids[:, num_input_tokens:] for stop_token_id in stop_token_ids
