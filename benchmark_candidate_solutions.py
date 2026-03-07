@@ -379,6 +379,89 @@ def build_uncertainty_sparse_rank_candidates(
     return candidates, metadata, [int(p) for p in selected_block_positions.tolist()]
 
 
+def build_sampled_candidates(
+    base_block_output_ids: torch.Tensor,
+    draft_logits: torch.Tensor,
+    max_candidates: int,
+    sample_temperature: float,
+) -> tuple[list[torch.Tensor], list[dict], list[int]]:
+    """Build candidates by sampling full draft suffix tokens from draft logits.
+
+    Candidate 0 is the provided base block (typically greedy when temperature=0).
+    Remaining candidates independently sample each suffix position from the
+    draft-token distribution.
+    """
+    if max_candidates < 1:
+        raise ValueError("max_candidates must be >= 1")
+
+    effective_block_size = int(base_block_output_ids.shape[1])
+    suffix_positions = list(range(1, effective_block_size))
+    if len(suffix_positions) == 0 or max_candidates == 1:
+        return (
+            [base_block_output_ids.clone()],
+            [{"candidate_idx": 0, "draft_score": 0.0, "replaced_positions": [], "rank_variant": 1}],
+            suffix_positions,
+        )
+
+    temp = float(max(sample_temperature, 1e-6))
+    log_probs = torch.log_softmax((draft_logits.float() / temp), dim=-1)[0]
+    probs = torch.softmax((draft_logits.float() / temp), dim=-1)[0]
+
+    # [num_extra, suffix_len, vocab] -> [num_extra * suffix_len, vocab]
+    num_extra = int(max_candidates - 1)
+    probs_expand = probs.unsqueeze(0).expand(num_extra, -1, -1).contiguous()
+    sampled = torch.multinomial(
+        probs_expand.view(-1, probs_expand.shape[-1]),
+        num_samples=1,
+    ).view(num_extra, probs_expand.shape[1])
+
+    candidates: list[torch.Tensor] = []
+    metadata: list[dict] = []
+    seen = set()
+
+    base_key = tuple(int(x) for x in base_block_output_ids[0, 1:].tolist())
+    seen.add(base_key)
+    candidates.append(base_block_output_ids.clone())
+    base_tokens = base_block_output_ids[0, 1:]
+    base_score = float(log_probs.gather(1, base_tokens.unsqueeze(-1)).sum().item())
+    metadata.append(
+        {
+            "candidate_idx": 0,
+            "draft_score": base_score,
+            "replaced_positions": [],
+            "rank_variant": 1,
+        }
+    )
+
+    for i in range(num_extra):
+        candidate = base_block_output_ids.clone()
+        candidate[0, 1:] = sampled[i]
+        key = tuple(int(x) for x in candidate[0, 1:].tolist())
+        if key in seen:
+            continue
+        seen.add(key)
+        cand_tokens = candidate[0, 1:].unsqueeze(-1)
+        cand_score = float(log_probs.gather(1, cand_tokens).sum().item())
+        replaced = [
+            int(pos)
+            for pos in suffix_positions
+            if int(candidate[0, pos].item()) != int(base_block_output_ids[0, pos].item())
+        ]
+        candidates.append(candidate)
+        metadata.append(
+            {
+                "candidate_idx": len(candidates) - 1,
+                "draft_score": cand_score,
+                "replaced_positions": replaced,
+                "rank_variant": 1,
+            }
+        )
+        if len(candidates) >= max_candidates:
+            break
+
+    return candidates, metadata, suffix_positions
+
+
 def resolve_cycle_max_candidates(
     *,
     enabled: bool,
@@ -430,6 +513,7 @@ def dflash_generate_candidate_solutions(
     candidate_mode: str,
     fixed_prefix_len: int,
     sparse_max_positions: int,
+    candidate_sample_temperature: float,
     adaptive_candidates: bool,
     adaptive_budgets: tuple[int, int, int],
     adaptive_accept_thresholds: tuple[float, float],
@@ -537,6 +621,13 @@ def dflash_generate_candidate_solutions(
                     fixed_prefix_len=fixed_prefix_len,
                     rank_top_k=branch_top_k,
                     max_candidates=cycle_max_candidates,
+                )
+            elif candidate_mode == "sample_multi":
+                candidate_blocks, candidate_meta, selected_positions = build_sampled_candidates(
+                    base_block_output_ids=block_output_ids,
+                    draft_logits=draft_logits,
+                    max_candidates=cycle_max_candidates,
+                    sample_temperature=candidate_sample_temperature,
                 )
             elif candidate_mode == "uncertainty_sparse_rank":
                 candidate_blocks, candidate_meta, selected_positions = build_uncertainty_sparse_rank_candidates(
@@ -675,6 +766,7 @@ def dflash_generate_candidate_solutions(
 
     candidate_summary = {
         "candidate_mode": str(candidate_mode),
+        "candidate_sample_temperature": float(candidate_sample_temperature),
         "fixed_prefix_len": int(fixed_prefix_len),
         "sparse_max_positions": int(sparse_max_positions),
         "adaptive_candidates": bool(adaptive_candidates),
@@ -756,13 +848,20 @@ def main() -> None:
     parser.add_argument(
         "--candidate-mode",
         type=str,
-        choices=["branch_beam", "fixed_prefix_rank", "uncertainty_sparse_rank"],
+        choices=["branch_beam", "fixed_prefix_rank", "uncertainty_sparse_rank", "sample_multi"],
         default="branch_beam",
         help=(
             "Candidate generation mode. "
             "fixed_prefix_rank = greedy + global rank-suffix variants; "
-            "uncertainty_sparse_rank = modify only uncertain suffix positions."
+            "uncertainty_sparse_rank = modify only uncertain suffix positions; "
+            "sample_multi = sample multiple full-suffix candidates from draft logits."
         ),
+    )
+    parser.add_argument(
+        "--candidate-sample-temperature",
+        type=float,
+        default=1.0,
+        help="Sampling temperature for candidate_mode=sample_multi.",
     )
     parser.add_argument(
         "--fixed-prefix-len",
@@ -833,6 +932,8 @@ def main() -> None:
         raise ValueError("--fixed-prefix-len must be >= 0")
     if args.sparse_max_positions < 1:
         raise ValueError("--sparse-max-positions must be >= 1")
+    if args.candidate_sample_temperature <= 0.0:
+        raise ValueError("--candidate-sample-temperature must be > 0")
     if args.adaptive_warmup_cycles < 0:
         raise ValueError("--adaptive-warmup-cycles must be >= 0")
     if args.adaptive_probe_interval < 0:
@@ -880,6 +981,7 @@ def main() -> None:
             f"candidate_mode={args.candidate_mode}, fixed_prefix_len={args.fixed_prefix_len}, "
             f"branch_depth={args.branch_depth}, top_k={args.branch_top_k}, max_candidates={args.max_candidates}, "
             f"margin_threshold={args.branch_margin_threshold}, sparse_max_positions={args.sparse_max_positions}, "
+            f"candidate_sample_temperature={args.candidate_sample_temperature}, "
             f"adaptive_candidates={args.adaptive_candidates}, adaptive_budgets={adaptive_budget_vals}, "
             f"adaptive_accept_thresholds={adaptive_threshold_vals}, "
             f"adaptive_warmup_cycles={args.adaptive_warmup_cycles}, "
@@ -995,6 +1097,7 @@ def main() -> None:
                     candidate_mode=args.candidate_mode,
                     fixed_prefix_len=args.fixed_prefix_len,
                     sparse_max_positions=args.sparse_max_positions,
+                    candidate_sample_temperature=args.candidate_sample_temperature,
                     adaptive_candidates=args.adaptive_candidates,
                     adaptive_budgets=adaptive_budget_vals,
                     adaptive_accept_thresholds=adaptive_threshold_vals,
@@ -1049,6 +1152,7 @@ def main() -> None:
                     "max_candidates": args.max_candidates,
                     "branch_margin_threshold": args.branch_margin_threshold,
                     "candidate_mode": args.candidate_mode,
+                    "candidate_sample_temperature": args.candidate_sample_temperature,
                     "fixed_prefix_len": args.fixed_prefix_len,
                     "sparse_max_positions": args.sparse_max_positions,
                     "adaptive_candidates": args.adaptive_candidates,
@@ -1155,6 +1259,7 @@ def main() -> None:
     print(f"Candidate avg_candidates_per_cycle: {avg_candidates_per_cycle:.3f}")
     print(f"Candidate avg_verify_calls_per_sample: {avg_verify_calls:.1f}")
     print(f"Candidate mode: {args.candidate_mode}")
+    print(f"Candidate sample_temperature: {args.candidate_sample_temperature}")
     print(f"Candidate fixed_prefix_len: {args.fixed_prefix_len}")
     print(f"Candidate sparse_max_positions: {args.sparse_max_positions}")
     print(f"Candidate branch_depth: {args.branch_depth}")
