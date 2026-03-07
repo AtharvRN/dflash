@@ -73,11 +73,16 @@ def summarize_profile(samples: list[SimpleNamespace]) -> dict[str, float] | None
     }
 
 
-def clone_dynamic_cache(cache: DynamicCache) -> DynamicCache:
-    # Clone tensors to avoid mutating the live prefix cache when expanding batch
-    # for candidate verification.
+def clone_dynamic_cache(cache: DynamicCache, *, deep_copy_tensors: bool) -> DynamicCache:
+    # Copy cache structure for candidate verification.
+    # deep_copy_tensors=True  -> clone K/V tensors (safe, expensive).
+    # deep_copy_tensors=False -> share prefix tensor storage and rely on
+    #                            append/select paths creating new tensors.
     legacy = cache.to_legacy_cache()
-    cloned_legacy = tuple((k.clone(), v.clone()) for k, v in legacy)
+    if deep_copy_tensors:
+        cloned_legacy = tuple((k.clone(), v.clone()) for k, v in legacy)
+    else:
+        cloned_legacy = tuple((k, v) for k, v in legacy)
     return DynamicCache.from_legacy_cache(cloned_legacy)
 
 
@@ -520,6 +525,7 @@ def dflash_generate_candidate_solutions(
     adaptive_warmup_cycles: int,
     adaptive_probe_interval: int,
     detailed_cycle_metadata: bool,
+    verify_cache_clone_mode: str,
     temperature: float = 0.0,
     collect_profile: bool = False,
 ) -> SimpleNamespace:
@@ -666,6 +672,7 @@ def dflash_generate_candidate_solutions(
         if num_candidates == 1:
             stacked_candidates = candidate_blocks[0]
             stacked_position_ids = block_position_ids
+            verify_cache = past_key_values_target
         else:
             if (
                 candidate_token_buffer is None
@@ -687,8 +694,10 @@ def dflash_generate_candidate_solutions(
             candidate_pos_buffer[:num_candidates, :effective_block_size] = block_position_ids[0, :effective_block_size]
             stacked_candidates = candidate_token_buffer[:num_candidates, :effective_block_size]
             stacked_position_ids = candidate_pos_buffer[:num_candidates, :effective_block_size]
-        verify_cache = clone_dynamic_cache(past_key_values_target)
-        if num_candidates > 1:
+            verify_cache = clone_dynamic_cache(
+                past_key_values_target,
+                deep_copy_tensors=(verify_cache_clone_mode == "deep"),
+            )
             verify_cache.batch_repeat_interleave(num_candidates)
 
         if collect_profile:
@@ -793,6 +802,7 @@ def dflash_generate_candidate_solutions(
     candidate_summary = {
         "candidate_mode": str(candidate_mode),
         "candidate_sample_temperature": float(candidate_sample_temperature),
+        "verify_cache_clone_mode": str(verify_cache_clone_mode),
         "fixed_prefix_len": int(fixed_prefix_len),
         "sparse_max_positions": int(sparse_max_positions),
         "adaptive_candidates": bool(adaptive_candidates),
@@ -945,6 +955,17 @@ def main() -> None:
         "--collect-profile",
         action="store_true",
         help="Collect per-cycle profiling stats (target/draft/cycle timings).",
+    )
+    parser.add_argument(
+        "--verify-cache-clone-mode",
+        type=str,
+        choices=["shallow", "deep"],
+        default="shallow",
+        help=(
+            "How to copy target KV cache before multi-candidate verification. "
+            "'shallow' shares prefix tensor storage and is faster; "
+            "'deep' clones tensors and is safer."
+        ),
     )
     parser.add_argument(
         "--detailed-cycle-metadata",
@@ -1135,6 +1156,7 @@ def main() -> None:
                     adaptive_warmup_cycles=args.adaptive_warmup_cycles,
                     adaptive_probe_interval=args.adaptive_probe_interval,
                     detailed_cycle_metadata=args.detailed_cycle_metadata,
+                    verify_cache_clone_mode=args.verify_cache_clone_mode,
                     temperature=args.temperature,
                     collect_profile=collect_profile,
                 )
@@ -1185,6 +1207,7 @@ def main() -> None:
                     "branch_margin_threshold": args.branch_margin_threshold,
                     "candidate_mode": args.candidate_mode,
                     "candidate_sample_temperature": args.candidate_sample_temperature,
+                    "verify_cache_clone_mode": args.verify_cache_clone_mode,
                     "fixed_prefix_len": args.fixed_prefix_len,
                     "sparse_max_positions": args.sparse_max_positions,
                     "adaptive_candidates": args.adaptive_candidates,
@@ -1292,6 +1315,7 @@ def main() -> None:
     print(f"Candidate avg_verify_calls_per_sample: {avg_verify_calls:.1f}")
     print(f"Candidate mode: {args.candidate_mode}")
     print(f"Candidate sample_temperature: {args.candidate_sample_temperature}")
+    print(f"Candidate verify_cache_clone_mode: {args.verify_cache_clone_mode}")
     print(f"Candidate fixed_prefix_len: {args.fixed_prefix_len}")
     print(f"Candidate sparse_max_positions: {args.sparse_max_positions}")
     print(f"Candidate branch_depth: {args.branch_depth}")
