@@ -494,7 +494,7 @@ def resolve_cycle_max_candidates(
     return int(max(1, min(max_candidates, selected)))
 
 
-def verify_candidates_tree(
+def verify_candidates_tree_chain(
     *,
     target: AutoModelForCausalLM,
     candidate_blocks: list[torch.Tensor],
@@ -585,6 +585,39 @@ def verify_candidates_tree(
         "verify_target_calls": int(verify_target_calls),
         "target_hidden_steps": target_hidden_steps,
     }
+
+
+def build_block_diagonal_tree_attention_mask(
+    *,
+    num_candidates: int,
+    block_len: int,
+    past_len: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Build additive mask for packed tree verification.
+
+    Layout:
+    - Queries: concatenated candidate blocks [c0[0..k-1], c1[0..k-1], ...]
+    - Keys:    [past prefix | packed new tokens]
+    - Each query attends:
+      1) all prefix keys,
+      2) only its own candidate block up to current local position.
+    """
+    q_len = num_candidates * block_len
+    k_len = past_len + q_len
+    neg_inf = torch.finfo(dtype).min
+    mask = torch.full((1, 1, q_len, k_len), neg_inf, dtype=dtype, device=device)
+    if past_len > 0:
+        mask[:, :, :, :past_len] = 0.0
+    for cand_idx in range(num_candidates):
+        base = cand_idx * block_len
+        for local_pos in range(block_len):
+            q_idx = base + local_pos
+            k_begin = past_len + base
+            k_end = k_begin + local_pos + 1
+            mask[0, 0, q_idx, k_begin:k_end] = 0.0
+    return mask
 
 
 @torch.inference_mode()
@@ -772,6 +805,7 @@ def dflash_generate_candidate_solutions(
         # Verify candidates: either one batched call or shared-prefix tree rollout.
         num_candidates = len(candidate_blocks)
         verify_target_calls_this_cycle = 0
+        commit_target_calls_this_cycle = 0
         tree_hidden_steps = None
 
         if candidate_verify_mode == "batch":
@@ -827,11 +861,11 @@ def dflash_generate_candidate_solutions(
             posterior_all = sample(verify_output.logits, temperature)
             acceptance_lengths_all = (stacked_candidates[:, 1:] == posterior_all[:, :-1]).cumprod(dim=1).sum(dim=1)
             next_tokens_all = posterior_all.gather(1, acceptance_lengths_all.unsqueeze(1)).squeeze(1)
-        else:
+        elif candidate_verify_mode == "tree_chain":
             if collect_profile:
                 target_events = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
                 target_events[0].record()
-            tree_verify = verify_candidates_tree(
+            tree_verify = verify_candidates_tree_chain(
                 target=target,
                 candidate_blocks=candidate_blocks,
                 block_position_ids=block_position_ids,
@@ -850,6 +884,41 @@ def dflash_generate_candidate_solutions(
             tree_hidden_steps = tree_verify["target_hidden_steps"]
             verify_target_calls_this_cycle = int(tree_verify["verify_target_calls"])
             candidate_verify_calls += verify_target_calls_this_cycle
+        else:
+            # Attention-tree verification: pack candidates in one sequence and
+            # constrain attention with block-diagonal causal mask.
+            stacked_candidates = torch.stack(
+                [candidate[0, :effective_block_size] for candidate in candidate_blocks], dim=0
+            )
+            packed_candidates = stacked_candidates.reshape(1, num_candidates * effective_block_size)
+            packed_position_ids = block_position_ids.repeat(1, num_candidates)
+
+            tree_attn_mask = build_block_diagonal_tree_attention_mask(
+                num_candidates=num_candidates,
+                block_len=effective_block_size,
+                past_len=past_key_values_target.get_seq_length(),
+                device=packed_candidates.device,
+                dtype=target.dtype,
+            )
+
+            if collect_profile:
+                target_events = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+                target_events[0].record()
+
+            verify_output = target(
+                packed_candidates,
+                position_ids=packed_position_ids,
+                past_key_values=past_key_values_target,
+                use_cache=False,
+                output_hidden_states=False,
+                attention_mask=tree_attn_mask,
+            )
+            verify_target_calls_this_cycle = 1
+            candidate_verify_calls += 1
+
+            packed_posterior = sample(verify_output.logits, temperature).reshape(num_candidates, effective_block_size)
+            acceptance_lengths_all = (stacked_candidates[:, 1:] == packed_posterior[:, :-1]).cumprod(dim=1).sum(dim=1)
+            next_tokens_all = packed_posterior.gather(1, acceptance_lengths_all.unsqueeze(1)).squeeze(1)
 
         tau_all = acceptance_lengths_all + 1
         draft_scores = torch.tensor(
@@ -872,7 +941,22 @@ def dflash_generate_candidate_solutions(
             verify_cache.batch_select_indices(
                 torch.tensor([chosen_candidate_idx], dtype=torch.long, device=stacked_candidates.device)
             )
-        past_key_values_target = verify_cache
+            past_key_values_target = verify_cache
+        elif candidate_verify_mode == "tree_chain":
+            past_key_values_target = verify_cache
+        else:
+            # Commit only accepted tokens for the chosen branch into live cache.
+            chosen_commit_tokens = chosen_candidate_block[:, :tau]
+            chosen_commit_pos = block_position_ids[:, :tau]
+            commit_output = target(
+                chosen_commit_tokens,
+                position_ids=chosen_commit_pos,
+                past_key_values=past_key_values_target,
+                use_cache=True,
+                output_hidden_states=True if effective_block_size > 1 else False,
+            )
+            candidate_verify_calls += 1
+            commit_target_calls_this_cycle = 1
 
         output_ids[:, start : start + tau] = chosen_candidate_block[:, :tau]
         output_ids[:, start + tau] = chosen_next_token.reshape(1)
@@ -890,6 +974,7 @@ def dflash_generate_candidate_solutions(
             "selected_positions": [int(x) for x in selected_positions],
             "chosen_candidate_idx": int(chosen_candidate_idx),
             "verify_target_calls": int(verify_target_calls_this_cycle),
+            "commit_target_calls": int(commit_target_calls_this_cycle),
         }
         if detailed_cycle_metadata:
             cycle_row["candidate_taus"] = [int(x) for x in tau_all.tolist()]
@@ -911,8 +996,14 @@ def dflash_generate_candidate_solutions(
             if candidate_verify_mode == "batch":
                 chosen_hidden_states = [h[chosen_candidate_idx : chosen_candidate_idx + 1] for h in verify_output.hidden_states]
                 target_hidden = extract_context_feature(chosen_hidden_states, model.target_layer_ids)[:, :tau, :]
-            else:
+            elif candidate_verify_mode == "tree_chain":
                 target_hidden = torch.cat(tree_hidden_steps[:tau], dim=1)
+            else:
+                target_hidden = extract_context_feature(commit_output.hidden_states, model.target_layer_ids)[:, :tau, :]
+
+        if collect_profile and candidate_verify_mode == "tree":
+            # close profile span after explicit commit call
+            target_events[1].record()
 
         if stop_token_ids is not None and any(
             stop_token_id in output_ids[:, num_input_tokens:] for stop_token_id in stop_token_ids
@@ -1118,12 +1209,13 @@ def main() -> None:
     parser.add_argument(
         "--candidate-verify-mode",
         type=str,
-        choices=["batch", "tree"],
+        choices=["batch", "tree", "tree_chain"],
         default="batch",
         help=(
             "Candidate verification mode. "
             "'batch' verifies all candidates in one expanded target call; "
-            "'tree' rolls out a shared-prefix verify chain and scores all candidates."
+            "'tree' uses packed attention-tree verification with a block-diagonal mask; "
+            "'tree_chain' uses shared-prefix sequential rollout (debug/fallback)."
         ),
     )
     parser.add_argument(
@@ -1226,6 +1318,9 @@ def main() -> None:
             return False
 
     installed_flash_attn = has_flash_attn()
+    if args.candidate_verify_mode == "tree" and installed_flash_attn:
+        setup_log("forcing sdpa backend for candidate_verify_mode=tree (custom 4D attention mask)")
+        installed_flash_attn = False
     setup_log(f"attention backend={'flash_attention_2' if installed_flash_attn else 'sdpa'}")
 
     setup_log("loading target model...")
