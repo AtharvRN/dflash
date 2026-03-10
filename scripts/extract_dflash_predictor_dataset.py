@@ -238,8 +238,7 @@ def _iter_position_rows(cycle_row: dict[str, Any]) -> Iterable[dict[str, Any]]:
         }
 
 
-def _load_rows(path: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
+def _iter_rows(path: Path) -> Iterable[dict[str, Any]]:
     with path.open() as handle:
         for line_no, raw_line in enumerate(handle, start=1):
             line = raw_line.strip()
@@ -260,17 +259,7 @@ def _load_rows(path: Path) -> list[dict[str, Any]]:
             merged["spec_cycle_trace"] = _normalize_cycle_trace(
                 _first_present(merged, ["spec_cycle_trace"])
             )
-            rows.append(merged)
-    return rows
-
-
-def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> int:
-    count = 0
-    with path.open("w") as handle:
-        for row in rows:
-            handle.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
-            count += 1
-    return count
+            yield merged
 
 
 def main() -> None:
@@ -302,22 +291,9 @@ def main() -> None:
     input_paths = _iter_input_paths(args.input)
     resolved_paths = [_resolve_calls_path(path) for path in input_paths]
 
-    cycle_rows: list[dict[str, Any]] = []
-    position_rows: list[dict[str, Any]] = []
     request_count = 0
-
-    for path in resolved_paths:
-        rows = _load_rows(path)
-        for row in rows:
-            request_count += 1
-            for cycle in row.get("spec_cycle_trace") or []:
-                cycle_row = _flatten_cycle_row(
-                    source_path=path,
-                    row=row,
-                    cycle=cycle,
-                )
-                cycle_rows.append(cycle_row)
-                position_rows.extend(_iter_position_rows(cycle_row))
+    cycle_count = 0
+    position_count = 0
 
     output_prefix = Path(args.output_prefix)
     output_prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -325,8 +301,28 @@ def main() -> None:
     positions_path = output_prefix.with_name(output_prefix.name + "_positions.jsonl")
     manifest_path = output_prefix.with_name(output_prefix.name + "_manifest.json")
 
-    cycle_count = _write_jsonl(cycles_path, cycle_rows)
-    position_count = _write_jsonl(positions_path, position_rows)
+    with cycles_path.open("w") as cycle_fp, positions_path.open("w") as pos_fp:
+        for path in resolved_paths:
+            for row in _iter_rows(path):
+                request_count += 1
+                for cycle in row.get("spec_cycle_trace") or []:
+                    cycle_row = _flatten_cycle_row(
+                        source_path=path,
+                        row=row,
+                        cycle=cycle,
+                    )
+                    cycle_fp.write(
+                        json.dumps(cycle_row, ensure_ascii=False, default=str) + "\n"
+                    )
+                    cycle_count += 1
+                    for position_row in _iter_position_rows(cycle_row):
+                        pos_fp.write(
+                            json.dumps(
+                                position_row, ensure_ascii=False, default=str
+                            )
+                            + "\n"
+                        )
+                        position_count += 1
 
     manifest = {
         "inputs": [str(path) for path in resolved_paths],
