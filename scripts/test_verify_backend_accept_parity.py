@@ -311,7 +311,7 @@ def _run_benchmark_case(
     sample_temperature: float,
     random_seed: int,
     enable_stage_timing: bool,
-    small_cuda_graph: bool,
+    disable_cuda_graph_for_speed: bool,
     extra_server_args: str,
 ) -> Path:
     run_dir = output_root / label
@@ -340,8 +340,8 @@ def _run_benchmark_case(
                 verify_backend_override,
             ]
         )
-    if small_cuda_graph:
-        server_extra_parts.extend(["--cuda-graph-bs", "1", "--cuda-graph-max-bs", "1"])
+    if disable_cuda_graph_for_speed:
+        server_extra_parts.append("--disable-cuda-graph")
     if extra_server_args.strip():
         server_extra_parts.extend(shlex.split(extra_server_args))
 
@@ -436,9 +436,12 @@ def main() -> None:
     parser.add_argument("--random-seed", type=int, default=123)
     parser.add_argument("--enable-stage-timing", action="store_true")
     parser.add_argument(
-        "--small-cuda-graph",
+        "--disable-cuda-graph-for-speed",
         action="store_true",
-        help="Override server args to capture only bs=1 graph for faster tiny parity runs.",
+        help=(
+            "Disable CUDA graph for faster tiny parity runs. "
+            "Use this only for faster debugging; keep default for production-parity checks."
+        ),
     )
     parser.add_argument(
         "--extra-server-args",
@@ -486,7 +489,7 @@ def main() -> None:
             sample_temperature=args.sample_temperature,
             random_seed=args.random_seed,
             enable_stage_timing=args.enable_stage_timing,
-            small_cuda_graph=args.small_cuda_graph,
+            disable_cuda_graph_for_speed=args.disable_cuda_graph_for_speed,
             extra_server_args=args.extra_server_args,
         )
         trace_b_path = _run_benchmark_case(
@@ -512,7 +515,7 @@ def main() -> None:
             sample_temperature=args.sample_temperature,
             random_seed=args.random_seed,
             enable_stage_timing=args.enable_stage_timing,
-            small_cuda_graph=args.small_cuda_graph,
+            disable_cuda_graph_for_speed=args.disable_cuda_graph_for_speed,
             extra_server_args=args.extra_server_args,
         )
         a_name = "default"
