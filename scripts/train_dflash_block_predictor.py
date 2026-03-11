@@ -18,9 +18,9 @@ from torch.utils.data import IterableDataset
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Train a first offline DFLASH block predictor baseline from the "
+            "Train a SpecDec++-style offline DFLASH accept predictor from the "
             "existing predictor feature shards. This baseline predicts token-level "
-            "acceptance and is the first step toward deriving verify length."
+            "acceptance from hidden states only and derives verify length later."
         )
     )
     parser.add_argument("--feature-dir", required=True)
@@ -121,26 +121,12 @@ class PredictorShardDataset(IterableDataset):
                 row_indices = row_indices[: self.max_rows_per_shard]
 
             draft_hidden = payload["draft_hidden"].index_select(0, row_indices).to(torch.float32)
-            draft_pos = payload["draft_pos"].index_select(0, row_indices).to(torch.float32)
-            runtime_block_size = payload["runtime_block_size"].index_select(0, row_indices).to(
-                torch.float32
-            )
             token_accepted = payload["token_accepted"].index_select(0, row_indices).to(
                 torch.float32
             )
 
-            # Keep the first baseline simple: hidden state plus position features.
-            pos_norm = draft_pos / runtime_block_size.clamp_min(1.0)
-            bs_norm = runtime_block_size / runtime_block_size.clamp_min(1.0).amax().clamp_min(1.0)
-            features = torch.cat(
-                [
-                    draft_hidden,
-                    draft_pos.unsqueeze(1) / 16.0,
-                    pos_norm.unsqueeze(1),
-                    bs_norm.unsqueeze(1),
-                ],
-                dim=1,
-            )
+            # SpecDec++ conditions only on the hidden state for the current draft token.
+            features = draft_hidden
             labels = token_accepted.unsqueeze(1)
 
             permutation = torch.randperm(features.shape[0])
