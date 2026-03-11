@@ -270,7 +270,7 @@ def main() -> None:
     device = _resolve_device(str(args.device))
 
     first_payload = torch.load(feature_dir / shard_names[0], map_location="cpu")
-    input_dim = int(first_payload["draft_hidden"].shape[1]) + 3
+    input_dim = int(first_payload["draft_hidden"].shape[1])
     model = AcceptPredictorMLP(
         input_dim=input_dim,
         hidden_dim=int(args.hidden_dim),
