@@ -22,8 +22,8 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Evaluate a trained DFLASH accept predictor on task-specific feature "
-            "shards and report both token-classification quality and verify-length "
-            "decision quality."
+            "shards and report both token-classification quality and SpecDec++-style "
+            "verify-length decision quality."
         )
     )
     parser.add_argument("--feature-dir", required=True)
@@ -33,7 +33,11 @@ def _parse_args() -> argparse.Namespace:
         "--thresholds",
         type=str,
         default="0.05,0.10,0.15,0.20,0.25,0.30,0.35,0.40,0.50,0.60,0.70,0.80",
-        help="Comma-separated probability thresholds used for verify-length sweeps.",
+        help=(
+            "Comma-separated cumulative rejection thresholds used for verify-length "
+            "sweeps. A verify prefix stops at the first drafted position where "
+            "1 - prod_j p_accept(j) exceeds the threshold."
+        ),
     )
     parser.add_argument("--batch-size", type=int, default=8192)
     parser.add_argument("--device", default="auto")
@@ -115,21 +119,7 @@ class ThresholdMetrics:
 
 
 def _build_features(payload: dict[str, torch.Tensor]) -> torch.Tensor:
-    draft_hidden = payload["draft_hidden"].to(torch.float32)
-    draft_pos = payload["draft_pos"].to(torch.float32)
-    runtime_block_size = payload["runtime_block_size"].to(torch.float32)
-
-    pos_norm = draft_pos / runtime_block_size.clamp_min(1.0)
-    bs_norm = runtime_block_size / runtime_block_size.clamp_min(1.0).amax().clamp_min(1.0)
-    return torch.cat(
-        [
-            draft_hidden,
-            draft_pos.unsqueeze(1) / 16.0,
-            pos_norm.unsqueeze(1),
-            bs_norm.unsqueeze(1),
-        ],
-        dim=1,
-    )
+    return payload["draft_hidden"].to(torch.float32)
 
 
 def _score_tokens(
@@ -315,8 +305,11 @@ def _compute_threshold_metrics(
             probs = list(rec["probs"])
 
             pred_verify = int(runtime_bs)
+            prefix_accept_prob = 1.0
             for idx, prob in enumerate(probs, start=1):
-                if float(prob) < float(thr):
+                prefix_accept_prob *= float(prob)
+                prefix_reject_prob = 1.0 - prefix_accept_prob
+                if prefix_reject_prob > float(thr):
                     pred_verify = int(idx)
                     break
 
@@ -408,8 +401,9 @@ def _write_markdown(
     lines.append(
         "Token accuracy alone is not enough for deployment. The real question is whether "
         "a thresholded predictor preserves accepted draft tokens (`tau`) while shrinking "
-        "the verify prefix. So this report includes both token-level metrics and a "
-        "cycle-level threshold sweep."
+        "the verify prefix. Here the threshold sweep follows the SpecDec++ rule: "
+        "stop at the first drafted position whose cumulative rejection probability "
+        "`1 - prod_j p_accept(j)` exceeds the threshold."
     )
     lines.append("")
     lines.append("## Token-Level Metrics")
