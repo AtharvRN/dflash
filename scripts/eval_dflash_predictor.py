@@ -100,9 +100,9 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default="0.05,0.10,0.15,0.20,0.25,0.30,0.35,0.40,0.50,0.60,0.70,0.80",
         help=(
-            "Comma-separated cumulative rejection thresholds used for verify-length "
-            "sweeps. A verify prefix stops at the first drafted position where "
-            "1 - prod_j p_accept(j) exceeds the threshold."
+            "Comma-separated direct prefix-survival thresholds used for verify-length "
+            "sweeps. A verify prefix stops at the first drafted position where the "
+            "predicted probability P(tau >= i) falls below the threshold."
         ),
     )
     parser.add_argument("--batch-size", type=int, default=8192)
@@ -371,11 +371,8 @@ def _compute_threshold_metrics(
             probs = list(rec["probs"])
 
             pred_verify = int(runtime_bs)
-            prefix_accept_prob = 1.0
             for idx, prob in enumerate(probs, start=1):
-                prefix_accept_prob *= float(prob)
-                prefix_reject_prob = 1.0 - prefix_accept_prob
-                if prefix_reject_prob > float(thr):
+                if float(prob) < float(thr):
                     pred_verify = int(idx)
                     break
 
@@ -467,9 +464,10 @@ def _write_markdown(
     lines.append(
         "Token accuracy alone is not enough for deployment. The real question is whether "
         "a thresholded predictor preserves accepted draft tokens (`tau`) while shrinking "
-        "the verify prefix. Here the threshold sweep follows the SpecDec++ rule: "
-        "stop at the first drafted position whose cumulative rejection probability "
-        "`1 - prod_j p_accept(j)` exceeds the threshold."
+        "the verify prefix. Here the threshold sweep treats the existing head output at "
+        "draft position `i` as a direct estimate of prefix survival `P(tau >= i)` and "
+        "stops at the first drafted position whose predicted prefix survival falls below "
+        "the threshold."
     )
     lines.append("")
     lines.append("## Token-Level Metrics")
