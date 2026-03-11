@@ -4,18 +4,84 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import sys
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
 
+from torch import nn
 import torch
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT / "third_party/sglang/python"))
+class AcceptPredictorMLP(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, dropout: float) -> None:
+        super().__init__()
+        hidden_dim = int(hidden_dim)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1),
+        )
 
-from sglang.srt.speculative.dflash_predictor import load_dflash_accept_predictor
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+@dataclass
+class LoadedPredictor:
+    model: AcceptPredictorMLP
+    checkpoint_path: str
+    input_dim: int
+    hidden_dim: int
+    dropout: float
+
+
+def _get_nested(mapping: dict, *keys: str):
+    cur = mapping
+    for key in keys:
+        if not isinstance(cur, dict) or key not in cur:
+            return None
+        cur = cur[key]
+    return cur
+
+
+def load_dflash_accept_predictor(
+    *, checkpoint_path: str, device: torch.device | str
+) -> LoadedPredictor:
+    payload = torch.load(str(checkpoint_path), map_location="cpu")
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected dict checkpoint payload, got {type(payload)!r}.")
+    state = payload.get("model_state_dict")
+    if not isinstance(state, dict) or not state:
+        raise ValueError("Checkpoint missing model_state_dict.")
+    first_weight = state.get("net.0.weight")
+    if first_weight is None or not hasattr(first_weight, "shape"):
+        raise ValueError("Checkpoint missing net.0.weight.")
+
+    metrics = payload.get("metrics")
+    metrics = metrics if isinstance(metrics, dict) else {}
+    input_dim = int(metrics.get("input_dim") or int(first_weight.shape[1]))
+    hidden_dim = int(_get_nested(metrics, "args", "hidden_dim") or int(first_weight.shape[0]))
+    dropout = float(_get_nested(metrics, "args", "dropout") or 0.0)
+
+    model = AcceptPredictorMLP(
+        input_dim=input_dim,
+        hidden_dim=hidden_dim,
+        dropout=dropout,
+    )
+    model.load_state_dict(state)
+    model = model.to(device)
+    model.eval()
+    return LoadedPredictor(
+        model=model,
+        checkpoint_path=str(checkpoint_path),
+        input_dim=input_dim,
+        hidden_dim=hidden_dim,
+        dropout=dropout,
+    )
 
 
 def _parse_args() -> argparse.Namespace:
