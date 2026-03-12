@@ -37,6 +37,7 @@ class LoadedPredictor:
     input_dim: int
     hidden_dim: int
     dropout: float
+    output_mode: str
 
 
 def _get_nested(mapping: dict, *keys: str):
@@ -66,6 +67,15 @@ def load_dflash_accept_predictor(
     input_dim = int(metrics.get("input_dim") or int(first_weight.shape[1]))
     hidden_dim = int(_get_nested(metrics, "args", "hidden_dim") or int(first_weight.shape[0]))
     dropout = float(_get_nested(metrics, "args", "dropout") or 0.0)
+    output_mode = str(
+        payload.get("output_mode")
+        or metrics.get("output_mode")
+        or (
+            "hazard"
+            if str(_get_nested(metrics, "args", "objective") or "") == "hazard"
+            else "prefix_survival"
+        )
+    )
 
     model = AcceptPredictorMLP(
         input_dim=input_dim,
@@ -81,6 +91,7 @@ def load_dflash_accept_predictor(
         input_dim=input_dim,
         hidden_dim=hidden_dim,
         dropout=dropout,
+        output_mode=output_mode,
     )
 
 
@@ -172,6 +183,7 @@ class ThresholdMetrics:
     cycles: int
     mean_predicted_verify_tokens: float
     mean_runtime_block_size: float
+    mean_true_boundary_tokens: float
     mean_true_accept_tokens: float
     mean_retained_accept_tokens: float
     tau_retention: float
@@ -179,13 +191,52 @@ class ThresholdMetrics:
     verify_reduction_vs_full: float
     accept_ratio_proxy: float
     boundary_exact_rate: float
+    boundary_within_1_rate: float
     boundary_mae: float
+    boundary_signed_error: float
     boundary_under_rate: float
     boundary_over_rate: float
+    boundary_under_mae: float
+    boundary_over_mae: float
 
 
 def _build_features(payload: dict[str, torch.Tensor]) -> torch.Tensor:
     return payload["draft_hidden"].to(torch.float32)
+
+
+def _convert_hazard_rows_to_survival(rows: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    request_ids = rows["request_id"].to(torch.int64)
+    cycle_indices = rows["cycle_idx"].to(torch.int64)
+    draft_positions = rows["draft_pos"].to(torch.int64)
+    hazards = rows["probs"].to(torch.float32)
+    survival = torch.empty_like(hazards)
+
+    grouped: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for idx, (req_id, cycle_idx) in enumerate(
+        zip(request_ids.tolist(), cycle_indices.tolist(), strict=True)
+    ):
+        grouped[(int(req_id), int(cycle_idx))].append(int(idx))
+
+    for key, idxs in grouped.items():
+        idx_tensor = torch.tensor(idxs, dtype=torch.int64)
+        pos = draft_positions.index_select(0, idx_tensor)
+        hazard_vals = hazards.index_select(0, idx_tensor)
+        order = torch.argsort(pos)
+        sorted_pos = pos.index_select(0, order)
+        expected = torch.arange(1, 1 + int(sorted_pos.numel()), dtype=torch.int64)
+        if not torch.equal(sorted_pos.cpu(), expected):
+            raise RuntimeError(
+                "Hazard evaluation expects contiguous draft positions within a cycle. "
+                f"cycle={key} positions={sorted_pos.tolist()}"
+            )
+        sorted_hazard = hazard_vals.index_select(0, order).clamp(1e-6, 1.0 - 1e-6)
+        sorted_survival = torch.cumprod(1.0 - sorted_hazard, dim=0)
+        target_idxs = idx_tensor.index_select(0, order)
+        survival.index_copy_(0, target_idxs, sorted_survival)
+
+    out = dict(rows)
+    out["probs"] = survival
+    return out
 
 
 def _score_tokens(
@@ -195,7 +246,7 @@ def _score_tokens(
     checkpoint: Path,
     batch_size: int,
     device: torch.device,
-) -> tuple[dict, torch.Tensor]:
+) -> tuple[dict, torch.Tensor, str]:
     loaded = load_dflash_accept_predictor(
         checkpoint_path=str(checkpoint),
         device=device,
@@ -218,7 +269,7 @@ def _score_tokens(
             shard_probs: list[torch.Tensor] = []
             for batch in _iterate_batches(features, batch_size=batch_size):
                 logits = loaded.model(batch.to(device=device, dtype=torch.float32))
-                shard_probs.append(torch.sigmoid(logits).squeeze(1).cpu())
+                shard_probs.append(torch.sigmoid(logits).squeeze(1).to(torch.float32).cpu())
 
             merged["probs"].append(torch.cat(shard_probs, dim=0))
             for key in (
@@ -233,8 +284,12 @@ def _score_tokens(
                 merged[key].append(payload[key].cpu())
 
     concatenated = {key: torch.cat(parts, dim=0) for key, parts in merged.items()}
-    return concatenated, torch.tensor(
-        [loaded.input_dim, loaded.hidden_dim], dtype=torch.int64
+    if str(loaded.output_mode) == "hazard":
+        concatenated = _convert_hazard_rows_to_survival(concatenated)
+    return (
+        concatenated,
+        torch.tensor([loaded.input_dim, loaded.hidden_dim], dtype=torch.int64),
+        str(loaded.output_mode),
     )
 
 
@@ -356,12 +411,25 @@ def _compute_threshold_metrics(
 
     mean_runtime_block_size = sum(int(rec["runtime_block_size"]) for rec in cycles) / len(cycles)
     mean_true_accept = sum(int(rec["accepted_draft_tokens"]) for rec in cycles) / len(cycles)
+    mean_true_boundary = (
+        sum(
+            int(rec["runtime_block_size"])
+            if int(rec["accepted_draft_tokens"]) >= len(list(rec["probs"]))
+            else int(rec["accepted_draft_tokens"]) + 1
+            for rec in cycles
+        )
+        / len(cycles)
+    )
 
     for thr in thresholds:
         total_pred_verify = 0.0
         total_retained_accept = 0.0
         total_boundary_abs_err = 0.0
+        total_boundary_signed_err = 0.0
+        total_under_amount = 0.0
+        total_over_amount = 0.0
         exact = 0
+        within_1 = 0
         under = 0
         over = 0
 
@@ -378,11 +446,16 @@ def _compute_threshold_metrics(
 
             true_boundary = int(runtime_bs) if accepted >= len(probs) else int(accepted + 1)
             retained_accept = int(min(accepted, pred_verify))
+            boundary_err = float(pred_verify) - float(true_boundary)
 
             total_pred_verify += float(pred_verify)
             total_retained_accept += float(retained_accept)
-            total_boundary_abs_err += abs(float(pred_verify) - float(true_boundary))
+            total_boundary_abs_err += abs(boundary_err)
+            total_boundary_signed_err += boundary_err
+            total_under_amount += max(float(true_boundary) - float(pred_verify), 0.0)
+            total_over_amount += max(float(pred_verify) - float(true_boundary), 0.0)
             exact += int(pred_verify == true_boundary)
+            within_1 += int(abs(boundary_err) <= 1.0)
             under += int(pred_verify < true_boundary)
             over += int(pred_verify > true_boundary)
 
@@ -398,6 +471,7 @@ def _compute_threshold_metrics(
                 cycles=cycles_n,
                 mean_predicted_verify_tokens=mean_pred_verify,
                 mean_runtime_block_size=mean_runtime_block_size,
+                mean_true_boundary_tokens=mean_true_boundary,
                 mean_true_accept_tokens=mean_true_accept,
                 mean_retained_accept_tokens=mean_retained_accept,
                 tau_retention=tau_retention,
@@ -405,9 +479,13 @@ def _compute_threshold_metrics(
                 verify_reduction_vs_full=1.0 - verify_fraction,
                 accept_ratio_proxy=accept_ratio_proxy,
                 boundary_exact_rate=float(exact) / cycles_n,
+                boundary_within_1_rate=float(within_1) / cycles_n,
                 boundary_mae=total_boundary_abs_err / cycles_n,
+                boundary_signed_error=total_boundary_signed_err / cycles_n,
                 boundary_under_rate=float(under) / cycles_n,
                 boundary_over_rate=float(over) / cycles_n,
+                boundary_under_mae=total_under_amount / cycles_n,
+                boundary_over_mae=total_over_amount / cycles_n,
             )
         )
     return out
@@ -484,25 +562,30 @@ def _write_markdown(
     lines.append("## Threshold Sweep")
     lines.append("")
     lines.append(
-        "| threshold | mean verify k | verify/full | verify reduction | retained tau | tau retention | accept-ratio proxy | boundary exact | boundary MAE | under | over |"
+        "| threshold | mean verify k | mean true boundary | verify/full | verify reduction | retained tau | tau retention | accept-ratio proxy | exact | within-1 | MAE | signed err | under rate | over rate | under amt | over amt |"
     )
     lines.append(
-        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
     )
     for row in threshold_metrics:
         lines.append(
             "| "
             f"{row.threshold:.2f} | "
             f"{row.mean_predicted_verify_tokens:.3f} | "
+            f"{row.mean_true_boundary_tokens:.3f} | "
             f"{row.verify_fraction_of_full:.3f} | "
             f"{row.verify_reduction_vs_full:.3f} | "
             f"{row.mean_retained_accept_tokens:.3f} | "
             f"{row.tau_retention:.3f} | "
             f"{row.accept_ratio_proxy:.3f} | "
             f"{row.boundary_exact_rate:.3f} | "
+            f"{row.boundary_within_1_rate:.3f} | "
             f"{row.boundary_mae:.3f} | "
+            f"{row.boundary_signed_error:.3f} | "
             f"{row.boundary_under_rate:.3f} | "
-            f"{row.boundary_over_rate:.3f} |"
+            f"{row.boundary_over_rate:.3f} | "
+            f"{row.boundary_under_mae:.3f} | "
+            f"{row.boundary_over_mae:.3f} |"
         )
     lines.append("")
     lines.append("## Recommended Operating Points")
@@ -547,7 +630,7 @@ def main() -> None:
     thresholds = _parse_thresholds(args.thresholds)
     device = _resolve_device(str(args.device))
 
-    rows, dims = _score_tokens(
+    rows, dims, output_mode = _score_tokens(
         feature_dir=feature_dir,
         shard_names=shard_names,
         checkpoint=checkpoint,
@@ -569,6 +652,7 @@ def main() -> None:
         "num_shards_used": len(shard_names),
         "input_dim": int(dims[0].item()),
         "hidden_dim": int(dims[1].item()),
+        "output_mode": str(output_mode),
         "device": str(device),
         "request_count": len(index_payload.get("request_id_to_rid", [])),
         "cycle_count": len(cycles),
