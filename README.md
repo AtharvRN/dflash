@@ -1,157 +1,145 @@
-# DFlash: Block Diffusion for Flash Speculative Decoding
-[**Paper**](https://arxiv.org/abs/2602.06036) | [**Blog**](https://z-lab.ai/projects/dflash/) | [**Models**](https://huggingface.co/collections/z-lab/dflash)
+# DFlash Submission Branch (Reproducible Experiments)
 
-**DFlash** is a lightweight **block diffusion** model designed for speculative decoding. It enables efficient and high-quality parallel drafting.
-<br>
+This branch is a submission-focused snapshot with the minimum code needed to run the experiments used in the report.
 
-<div align="center">
-  <img src="assets/dflash_system.png" alt="DFlash Architecture" width="100%">
-</div>
+## Branch Contents
 
-https://github.com/user-attachments/assets/5b29cabb-eb95-44c9-8ffe-367c0758de8c
+- Core Transformers benchmarks:
+  - `benchmark.py`
+  - `benchmark_candidate_solutions.py`
+  - `benchmark_sample_multi_tree.py`
+  - `benchmark_dynamic_schedule.py`
+- Core SGLang benchmark:
+  - `benchmark_sglang.py`
+- Experiment launchers:
+  - `run_sglang_tp1_sweep.sh`
+  - `run_sglang_dynamic_c16.sh`
+  - `run_sglang_c16_policy_matrix.sh`
+  - `run_sglang_static_ds_conc_sweep.sh`
+  - `run_benchmark.sh`
+- Predictor-head pipeline:
+  - `scripts/extract_dflash_predictor_dataset.py`
+  - `scripts/train_dflash_block_predictor.py`
+  - `scripts/eval_dflash_predictor.py`
+  - `scripts/profile_dflash_predictor_by_index.py`
+  - `scripts/collect_predictor_dataset_sglang.py`
+  - `scripts/build_predictor_training_mix.py`
+- SGLang integration code via submodule:
+  - `third_party/sglang` (DFLASH PR code included)
 
-<br>
+## Environment Setup (atharv-rwx-pod)
 
-## 📦 Model Support Plan
-
-### ✅ Supported
-- **Qwen3-4B**: https://huggingface.co/z-lab/Qwen3-4B-DFlash-b16  
-- **Qwen3-8B**: https://huggingface.co/z-lab/Qwen3-8B-DFlash-b16  
-- **Qwen3-Coder-30B-A3B**: https://huggingface.co/z-lab/Qwen3-Coder-30B-A3B-DFlash
-- **Llama-3.1-8B-Instruct**: https://huggingface.co/z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat
-
-### 🚧 Coming Soon
-- **openai/gpt-oss-20b**  
-- **openai/gpt-oss-120b**  
-- **zai-org/GLM-4.7**
-- **zai-org/GLM-4.7-Flash**
-- **Qwen/Qwen3-Coder-Next**
-
-> 💡 Feel free to open a GitHub issue if you’d like to request support for additional models!  
-> We will also open-source the training recipe soon, so you can train your own DFlash draft model to accelerate any LLM.
-
-<br>
-
-## 🚀 Quick Start
-
-### Installation
 ```bash
-conda create -n dflash python=3.11
+kubectl -n wenglab-interpretable-ai exec -it atharv-rwx-pod -- bash
+source ~/.bashrc
+cd /workspace/DSC291/dflash
+
+conda create -n dflash python=3.12 -y
 conda activate dflash
 
-git clone https://github.com/z-lab/dflash.git
-cd dflash
+python -m pip install -U pip setuptools wheel
+python -m pip install -r requirements.txt
 
-pip install uv
-uv pip install -r requirements.txt
-
-# Optionally install flash-attn.
-# If unavailable, evaluation falls back to torch.sdpa in the Transformers backend.
-# The measured speedup will be slower, but the acceptance length remains comparable.
-
-# uv pip install flash-attn --no-build-isolation
+# Ensure local SGLang (submodule) is used.
+python -m pip install -e ./third_party/sglang/python --no-deps
 ```
 
-### SGLang
+Sanity check:
 
 ```bash
-export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
-
-python -m sglang.launch_server \
-    --model-path Qwen/Qwen3-Coder-30B-A3B-Instruct \
-    --speculative-algorithm DFLASH \
-    --speculative-draft-model-path z-lab/Qwen3-Coder-30B-A3B-DFlash \
-    --tp-size 1 \
-    --dtype bfloat16 \
-    --attention-backend fa3 \
-    --mem-fraction-static 0.75 \
-    --trust-remote-code
+python -c "import torch; print(torch.__version__)"
+sglang serve --help | grep speculative-dflash || true
 ```
 
-### Transformers
+## Quick Repro Commands
 
-```python
-from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+### 1) Transformers baseline DFlash
 
-model = AutoModel.from_pretrained(
-    "z-lab/Qwen3-8B-DFlash-b16", 
-    trust_remote_code=True, 
-    dtype="auto", 
-    device_map="cuda:0"
-).eval()
-
-target = AutoModelForCausalLM.from_pretrained(
-    "Qwen/Qwen3-8B", 
-    dtype="auto", 
-    device_map="cuda:0"
-).eval()
-
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
-prompt = "How many positive whole-number divisors does 196 have?"
-messages = [
-    {"role": "user", "content": prompt}
-]
-# Note: this draft model is used for thinking mode disabled
-text = tokenizer.apply_chat_template(
-    messages,
-    tokenize=False,
-    add_generation_prompt=True,
-    enable_thinking=False
-)
-model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
-
-generate_ids = model.spec_generate(
-    input_ids=model_inputs["input_ids"], 
-    max_new_tokens=2048, 
-    temperature=0.0, 
-    target=target, 
-    stop_token_ids=[tokenizer.eos_token_id]
-)
-
-print(tokenizer.decode(generate_ids[0], skip_special_tokens=True))
-```
-
-## 📊 Evaluation
-We provide scripts to reproduce the speedup and acceptance length metrics in the paper. The reported results were tested on NVIDIA H200 or B200 GPUs.
-
-To run benchmark on Transformers backend:
 ```bash
-bash run_benchmark.sh
+python benchmark.py \
+  --target-model Qwen/Qwen3-4B \
+  --draft-model z-lab/Qwen3-4B-DFlash-b16 \
+  --dataset-name aime25 \
+  --max-samples 30 \
+  --block-size 16 \
+  --max-new-tokens 512
 ```
 
-To run benchmark on SGLang:
+### 2) Transformers multi-candidate (tree / batch)
+
+```bash
+python benchmark_candidate_solutions.py \
+  --target-model Qwen/Qwen3-4B \
+  --draft-model z-lab/Qwen3-4B-DFlash-b16 \
+  --dataset-name aime25 \
+  --max-samples 30 \
+  --block-size 16 \
+  --max-new-tokens 512 \
+  --candidate-mode sample_multi \
+  --verify-mode tree \
+  --max-candidates 16
+```
+
+```bash
+python benchmark_sample_multi_tree.py \
+  --target-model Qwen/Qwen3-4B \
+  --draft-model z-lab/Qwen3-4B-DFlash-b16 \
+  --dataset-name aime25 \
+  --max-samples 30 \
+  --block-size 16 \
+  --max-new-tokens 512 \
+  --verify-mode batch \
+  --max-candidates 12
+```
+
+### 3) SGLang baseline vs multi-candidate
+
 ```bash
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 
 python benchmark_sglang.py \
-  --target-model Qwen/Qwen3-8B \
-  --draft-model z-lab/Qwen3-8B-DFlash-b16 \
-  --concurrencies 1,4,8,16,32 \
-  --dataset-name math500 \
-  --attention-backends fa3,flashinfer \
-  --tp-size 1 \
-  --output-md sglang_results.md
+  --target-model Qwen/Qwen3-4B \
+  --draft-model z-lab/Qwen3-4B-DFlash-b16 \
+  --dataset-name gsm8k \
+  --concurrencies 1 \
+  --max-samples 30 \
+  --speculative-algorithm dflash
 ```
 
-<div align="center">
-  <img src="assets/dflash_results.png" width="100%">
-</div>
+### 4) Dynamic scheduling / confidence gating
 
-## **Acknowledgement**
-
-Huge thanks to [@dcw02](https://github.com/dcw02), [@gongy](https://github.com/gongy), and the other folks at [@modal-labs](https://github.com/modal-labs) for the fast, high-quality support in bringing DFlash into SGLang—making it possible to truly accelerate LLM serving in real-world deployments.
-
-## **Citation**
-If you find DFlash useful for your research or applications, please cite our project.
-
-```bibtex
-@misc{chen2026dflash,
-  title         = {DFlash: Block Diffusion for Flash Speculative Decoding},
-  author        = {Chen, Jian and Liang, Yesheng and Liu, Zhijian},
-  year          = {2026},
-  eprint        = {2602.06036},
-  archivePrefix = {arXiv},
-  primaryClass  = {cs.CL},
-  url           = {https://arxiv.org/abs/2602.06036}
-}
+```bash
+python benchmark_dynamic_schedule.py \
+  --target-model Qwen/Qwen3-4B \
+  --draft-model z-lab/Qwen3-4B-DFlash-b16 \
+  --dataset-name aime25 \
+  --max-samples 30 \
+  --block-size 16 \
+  --accept-confidence-threshold 0.2
 ```
+
+### 5) Predictor-head pipeline
+
+```bash
+python scripts/extract_dflash_predictor_dataset.py --help
+python scripts/train_dflash_block_predictor.py --help
+python scripts/eval_dflash_predictor.py --help
+```
+
+## Marquee Results (from report run archives)
+
+- Transformers backend (AIME25, c=1):
+  - Vanilla DFlash (bs=16): **129.25 tok/s**
+  - Multi-candidate tree best (mc=16): **146.60 tok/s**
+  - Multi-candidate batch best: throughput improvement vs vanilla, but below tree best.
+- SGLang backend (GSM8K, c=1, fixed mc=4):
+  - Vanilla DFlash: **453.08 tok/s**
+  - MC-tree (mc=4): **376.57 tok/s**
+  - MC-batch (mc=4): **229.90 tok/s**
+
+Interpretation: multi-candidate verification is beneficial in the Transformers backend low-concurrency regime, while in SGLang it requires additional systems-level optimization to preserve the verify-path cost model.
+
+## Notes
+
+- Most experiment families in this project were executed as single runs per setting; compare trends primarily within the same run family.
+- Keep fixed question windows (`--fixed-question-count`, `--fixed-question-offset`) for apples-to-apples policy comparisons.
