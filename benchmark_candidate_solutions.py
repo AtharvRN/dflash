@@ -494,99 +494,6 @@ def resolve_cycle_max_candidates(
     return int(max(1, min(max_candidates, selected)))
 
 
-def verify_candidates_tree_chain(
-    *,
-    target: AutoModelForCausalLM,
-    candidate_blocks: list[torch.Tensor],
-    block_position_ids: torch.Tensor,
-    past_key_values_target: DynamicCache,
-    verify_cache_clone_mode: str,
-    temperature: float,
-    collect_hidden_states: bool,
-    target_layer_ids: list[int],
-) -> dict:
-    """Verify candidates via shared-prefix rollout.
-
-    We generate one posterior chain p_0..p_{k-1} and score each candidate by
-    longest-prefix match against that chain. This computes identical tau
-    semantics to the batched verifier while avoiding N-way target batching.
-    """
-    num_candidates = len(candidate_blocks)
-    effective_block_size = int(candidate_blocks[0].shape[1])
-    device = candidate_blocks[0].device
-
-    if verify_cache_clone_mode == "inplace":
-        verify_cache = past_key_values_target
-    else:
-        verify_cache = clone_dynamic_cache(
-            past_key_values_target,
-            deep_copy_tensors=(verify_cache_clone_mode == "deep"),
-        )
-
-    root_token = candidate_blocks[0][:, :1]
-    for candidate in candidate_blocks[1:]:
-        if int(candidate[0, 0].item()) != int(root_token[0, 0].item()):
-            raise ValueError("Tree verification requires all candidates to share the same first token.")
-
-    if effective_block_size > 1:
-        candidate_suffix_tokens = torch.stack([candidate[0, 1:effective_block_size] for candidate in candidate_blocks], dim=0)
-        acceptance_lengths = torch.full((num_candidates,), -1, dtype=torch.long, device=device)
-        alive = torch.ones((num_candidates,), dtype=torch.bool, device=device)
-    else:
-        candidate_suffix_tokens = None
-        acceptance_lengths = torch.zeros((num_candidates,), dtype=torch.long, device=device)
-        alive = None
-
-    posterior_steps: list[torch.Tensor] = []
-    target_hidden_steps: list[torch.Tensor] = []
-    verify_target_calls = 0
-
-    for step in range(effective_block_size):
-        step_token = root_token if step == 0 else posterior_steps[-1].reshape(1, 1)
-        step_position_ids = block_position_ids[:, step : step + 1]
-        verify_output = target(
-            step_token,
-            position_ids=step_position_ids,
-            past_key_values=verify_cache,
-            use_cache=True,
-            output_hidden_states=collect_hidden_states,
-        )
-        verify_target_calls += 1
-
-        step_posterior = sample(verify_output.logits, temperature)[:, 0]
-        posterior_steps.append(step_posterior)
-
-        if collect_hidden_states:
-            target_hidden_steps.append(extract_context_feature(verify_output.hidden_states, target_layer_ids))
-
-        if effective_block_size <= 1 or step >= effective_block_size - 1:
-            continue
-
-        matches = candidate_suffix_tokens[:, step].eq(step_posterior[0])
-        dead = alive & (~matches)
-        if bool(dead.any()):
-            acceptance_lengths[dead] = step
-        alive = alive & matches
-        if not bool(alive.any()):
-            break
-
-    if effective_block_size > 1:
-        unresolved = acceptance_lengths.lt(0)
-        if bool(unresolved.any()):
-            acceptance_lengths[unresolved] = effective_block_size - 1
-
-    posterior_steps_tensor = torch.cat(posterior_steps, dim=0)
-    next_tokens = posterior_steps_tensor.index_select(0, acceptance_lengths)
-
-    return {
-        "acceptance_lengths": acceptance_lengths,
-        "next_tokens": next_tokens,
-        "verify_cache": verify_cache,
-        "verify_target_calls": int(verify_target_calls),
-        "target_hidden_steps": target_hidden_steps,
-    }
-
-
 def build_block_diagonal_tree_attention_mask(
     *,
     num_candidates: int,
@@ -826,8 +733,6 @@ def dflash_generate_candidate_solutions(
         num_candidates = len(candidate_blocks)
         verify_target_calls_this_cycle = 0
         commit_target_calls_this_cycle = 0
-        tree_hidden_steps = None
-
         if candidate_verify_mode == "batch":
             if num_candidates == 1:
                 stacked_candidates = candidate_blocks[0]
@@ -881,29 +786,6 @@ def dflash_generate_candidate_solutions(
             posterior_all = sample(verify_output.logits, temperature)
             acceptance_lengths_all = (stacked_candidates[:, 1:] == posterior_all[:, :-1]).cumprod(dim=1).sum(dim=1)
             next_tokens_all = posterior_all.gather(1, acceptance_lengths_all.unsqueeze(1)).squeeze(1)
-        elif candidate_verify_mode == "tree_chain":
-            if collect_profile:
-                target_events = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
-                target_events[0].record()
-            tree_verify = verify_candidates_tree_chain(
-                target=target,
-                candidate_blocks=candidate_blocks,
-                block_position_ids=block_position_ids,
-                past_key_values_target=past_key_values_target,
-                verify_cache_clone_mode=verify_cache_clone_mode,
-                temperature=temperature,
-                collect_hidden_states=(effective_block_size > 1),
-                target_layer_ids=model.target_layer_ids,
-            )
-            if collect_profile:
-                target_events[1].record()
-
-            verify_cache = tree_verify["verify_cache"]
-            acceptance_lengths_all = tree_verify["acceptance_lengths"]
-            next_tokens_all = tree_verify["next_tokens"]
-            tree_hidden_steps = tree_verify["target_hidden_steps"]
-            verify_target_calls_this_cycle = int(tree_verify["verify_target_calls"])
-            candidate_verify_calls += verify_target_calls_this_cycle
         else:
             # Attention-tree verification: pack candidates in one sequence and
             # constrain attention with block-diagonal causal mask.
@@ -974,8 +856,6 @@ def dflash_generate_candidate_solutions(
                     torch.tensor([chosen_candidate_idx], dtype=torch.long, device=stacked_candidates.device)
                 )
             past_key_values_target = verify_cache
-        elif candidate_verify_mode == "tree_chain":
-            past_key_values_target = verify_cache
         else:
             past_key_values_target = select_tree_branch_cache_from_packed(
                 cache=verify_cache,
@@ -1023,8 +903,6 @@ def dflash_generate_candidate_solutions(
             if candidate_verify_mode == "batch":
                 chosen_hidden_states = [h[chosen_candidate_idx : chosen_candidate_idx + 1] for h in verify_output.hidden_states]
                 target_hidden = extract_context_feature(chosen_hidden_states, model.target_layer_ids)[:, :tau, :]
-            elif candidate_verify_mode == "tree_chain":
-                target_hidden = torch.cat(tree_hidden_steps[:tau], dim=1)
             else:
                 packed_offset = chosen_candidate_idx * effective_block_size
                 chosen_hidden_states = [
@@ -1236,13 +1114,12 @@ def main() -> None:
     parser.add_argument(
         "--candidate-verify-mode",
         type=str,
-        choices=["batch", "tree", "tree_chain"],
+        choices=["batch", "tree"],
         default="batch",
         help=(
             "Candidate verification mode. "
             "'batch' verifies all candidates in one expanded target call; "
-            "'tree' uses packed attention-tree verification with a block-diagonal mask; "
-            "'tree_chain' uses shared-prefix sequential rollout (debug/fallback)."
+            "'tree' uses packed attention-tree verification with a block-diagonal mask."
         ),
     )
     parser.add_argument(

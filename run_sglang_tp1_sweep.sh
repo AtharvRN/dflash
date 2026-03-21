@@ -94,6 +94,18 @@ done
 
 mkdir -p "${LOG_DIR}"
 
+CURRENT_GPU_MONITOR_PID=""
+
+cleanup_gpu_monitor() {
+  if [[ -n "${CURRENT_GPU_MONITOR_PID}" ]]; then
+    kill "${CURRENT_GPU_MONITOR_PID}" >/dev/null 2>&1 || true
+    wait "${CURRENT_GPU_MONITOR_PID}" 2>/dev/null || true
+    CURRENT_GPU_MONITOR_PID=""
+  fi
+}
+
+trap cleanup_gpu_monitor EXIT INT TERM
+
 echo "block_size,concurrency,status,baseline_toks_per_s,spec_toks_per_s,speedup,tau,accept_rate,verify_calls_total,verify_per_s,draft_tok_per_s,accepted_tok_per_s,wall_per_verify_s,spec_e2e_avg_s,spec_e2e_p95_s,baseline_e2e_avg_s,draft_time_avg_s,verify_time_avg_s,call_rows,non_null_draft_time_rows,non_null_verify_time_rows,md_path,call_trace_jsonl,log_path,gpu_metrics_csv,gpu_metrics_summary_md,gpu_metrics_summary_json" > "${SUMMARY_CSV}"
 
 echo "Running SGLang TP=1 sweep (with block-size sweep support)"
@@ -184,14 +196,14 @@ for bs in "${BS_LIST[@]}"; do
     } | tee "${log_path}"
 
     set +e
-    gpu_monitor_pid=""
+    CURRENT_GPU_MONITOR_PID=""
     if [[ "${ENABLE_GPU_MONITOR}" == "1" ]]; then
       if command -v nvidia-smi >/dev/null 2>&1; then
         bash "${SCRIPT_DIR}/scripts/record_gpu_metrics.sh" \
           "${gpu_metrics_path}" \
           "${GPU_MONITOR_INTERVAL_S}" >> "${log_path}" 2>&1 &
-        gpu_monitor_pid=$!
-        echo "[gpu-monitor] started pid=${gpu_monitor_pid}, csv=${gpu_metrics_path}, interval_s=${GPU_MONITOR_INTERVAL_S}" | tee -a "${log_path}"
+        CURRENT_GPU_MONITOR_PID=$!
+        echo "[gpu-monitor] started pid=${CURRENT_GPU_MONITOR_PID}, csv=${gpu_metrics_path}, interval_s=${GPU_MONITOR_INTERVAL_S}" | tee -a "${log_path}"
       else
         echo "[gpu-monitor] nvidia-smi not found; skipping GPU metrics capture." | tee -a "${log_path}"
       fi
@@ -200,10 +212,11 @@ for bs in "${BS_LIST[@]}"; do
     "${cmd[@]}" 2>&1 | tee -a "${log_path}"
     status=${PIPESTATUS[0]}
 
-    if [[ -n "${gpu_monitor_pid}" ]]; then
-      kill "${gpu_monitor_pid}" >/dev/null 2>&1 || true
-      wait "${gpu_monitor_pid}" 2>/dev/null || true
-      echo "[gpu-monitor] stopped pid=${gpu_monitor_pid}" | tee -a "${log_path}"
+    if [[ -n "${CURRENT_GPU_MONITOR_PID}" ]]; then
+      kill "${CURRENT_GPU_MONITOR_PID}" >/dev/null 2>&1 || true
+      wait "${CURRENT_GPU_MONITOR_PID}" 2>/dev/null || true
+      echo "[gpu-monitor] stopped pid=${CURRENT_GPU_MONITOR_PID}" | tee -a "${log_path}"
+      CURRENT_GPU_MONITOR_PID=""
     fi
 
     if [[ -s "${gpu_metrics_path}" ]]; then

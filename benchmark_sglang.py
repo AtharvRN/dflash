@@ -273,6 +273,7 @@ def _run_bench_requests(
     def _consume_meta(
         meta: dict,
         *,
+        prompt_local_idx: Optional[int] = None,
         prompt_text: Optional[str] = None,
         client_request_wall_s: Optional[float] = None,
         client_batch_wall_s: Optional[float] = None,
@@ -283,7 +284,12 @@ def _run_bench_requests(
         nonlocal spec_verify_ct_sum
         nonlocal spec_accept_token_sum
         nonlocal spec_draft_token_sum
-        request_local_idx = request_count
+        request_completion_idx = request_count
+        request_local_idx = (
+            int(prompt_local_idx)
+            if prompt_local_idx is not None
+            else int(request_completion_idx)
+        )
         request_count += 1
         total_tokens += int(meta.get("completion_tokens", 0))
         spec_verify_ct_sum += int(meta.get("spec_verify_ct", 0))
@@ -328,6 +334,7 @@ def _run_bench_requests(
             row.update(
                 {
                     "request_local_idx": int(request_local_idx),
+                    "request_completion_idx": int(request_completion_idx),
                     "timestamp_unix_s": float(time.time()),
                     "completion_tokens": int(meta.get("completion_tokens", 0)),
                     "e2e_latency_s": _extract_float(meta, ["e2e_latency"]),
@@ -386,6 +393,7 @@ def _run_bench_requests(
                 meta = out.get("meta_info", {}) or {}
                 _consume_meta(
                     meta,
+                    prompt_local_idx=int(start_idx + idx),
                     prompt_text=chunk_prompts[idx],
                     client_batch_wall_s=float(batch_wall_s),
                     client_batch_size=int(len(chunk_prompts)),
@@ -414,6 +422,7 @@ def _run_bench_requests(
                 meta = out.get("meta_info", {}) or {}
                 _consume_meta(
                     meta,
+                    prompt_local_idx=int(_prompt_idx),
                     prompt_text=prompt_text,
                     client_request_wall_s=float(req_wall_s),
                 )
@@ -1891,7 +1900,7 @@ def main() -> None:
                             batch_requests=bool(args.batch_requests),
                             stop=[],
                             timeout_s=int(args.timeout_s),
-                            expect_dflash=True,
+                            expect_dflash=(spec_algo == "DFLASH"),
                             sampling_custom_params=request_custom_params,
                             trace_fp=call_trace_fp,
                             trace_common={
