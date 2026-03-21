@@ -1,6 +1,6 @@
-# DFlash Submission Branch (Reproducible Experiments)
+# DFlash Experiment Reproduction
 
-This branch is a submission-focused snapshot with the minimum code needed to run the experiments used in the report.
+This repository snapshot contains the core code paths needed to reproduce the experiments used in the report.
 
 ## Branch Contents
 
