@@ -1,0 +1,67 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dflash-runtime-alpha-sweep
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 7200
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: sweep
+          image: ghcr.io/atharvrn/savlgcbm-cbm:pt222-cu121
+          imagePullPolicy: Always
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euxo pipefail
+              export HF_HOME=/workspace/.cache/huggingface
+              export TRANSFORMERS_CACHE=/workspace/.cache/huggingface
+              export PYTHONDONTWRITEBYTECODE=1
+              export TRANSFORMERS_NO_TF=1
+              export TRANSFORMERS_NO_FLAX=1
+              export TRANSFORMERS_NO_TORCHVISION=1
+              export DISABLE_TELEMETRY=1
+              cd /workspace/dflash-fresh-zlab-main
+              find dflash scripts -type d -name __pycache__ -prune -exec rm -rf {} +
+              python -m pip install -q \
+                "transformers==4.57.1" \
+                "huggingface-hub==0.36.2" \
+                "datasets==5.0.0" \
+                loguru rich tqdm requests
+              python scripts/benchmark_dynamic_survival_sweep.py \
+                --model Qwen/Qwen3-4B \
+                --draft-model z-lab/Qwen3-4B-DFlash-b16 \
+                --policy-checkpoint /workspace/dflash-fresh-zlab-main/runs/survival_policy/internal_w16d128/internal_window_gru16_survival_full/best.pt \
+                --dataset gsm8k \
+                --max-samples 100 \
+                --max-new-tokens 128 \
+                --alphas=0.80,0.85,0.90,0.95 \
+                --attn-implementation sdpa \
+                --output-json runs/survival_policy/internal_w16d128/runtime_dynamic_alpha_sweep_100x128.json \
+                2>&1 | tee runs/survival_policy/internal_w16d128/runtime_dynamic_alpha_sweep_100x128.log
+          resources:
+            limits:
+              cpu: "8"
+              memory: 32Gi
+              ephemeral-storage: 100Gi
+              nvidia.com/a100: "1"
+            requests:
+              cpu: "8"
+              memory: 32Gi
+              ephemeral-storage: 100Gi
+              nvidia.com/a100: "1"
+          volumeMounts:
+            - name: atharv-rwx-storage-1ti
+              mountPath: /workspace
+            - name: dev-shm
+              mountPath: /dev/shm
+      volumes:
+        - name: atharv-rwx-storage-1ti
+          persistentVolumeClaim:
+            claimName: atharv-rwx-storage-1ti
+        - name: dev-shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi

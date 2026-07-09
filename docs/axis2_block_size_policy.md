@@ -421,3 +421,43 @@ the policy arms are forced to `{16}`, which verifies the cache mechanics of the
 new runtime path. Exact token equality between fixed B16 and variable block
 sizes is not stable under bf16/SDPA for longer generations because target
 verification chunk sizes differ.
+
+Runtime alpha sweep on 100 GSM8K prompts, 128 generated tokens per prompt:
+
+```text
+fixed B16:
+  mean accepted draft length = 4.430
+  mean acceptance ratio      = 0.295
+  mean draft budget          = 15.000
+
+dynamic survival policy:
+  alpha=0.80:
+    mean accepted draft length = 3.681
+    mean acceptance ratio      = 0.467
+    mean draft budget          = 7.455
+    block histogram            = B4: 379, B8: 1792, B12: 564, B16: 67
+
+  alpha=0.85:
+    mean accepted draft length = 3.829
+    mean acceptance ratio      = 0.438
+    mean draft budget          = 8.239
+    block histogram            = B4: 163, B8: 1695, B12: 717, B16: 144
+
+  alpha=0.90:
+    mean accepted draft length = 3.966
+    mean acceptance ratio      = 0.409
+    mean draft budget          = 9.112
+    block histogram            = B4: 31, B8: 1456, B12: 899, B16: 266
+
+  alpha=0.95:
+    mean accepted draft length = 4.089
+    mean acceptance ratio      = 0.368
+    mean draft budget          = 10.484
+    block histogram            = B4: 1, B8: 884, B12: 1144, B16: 553
+```
+
+The best current tradeoff depends on how much accepted-length retention we want.
+`alpha=0.90` is the balanced point from this runtime sweep: it improves
+acceptance ratio from 0.295 to 0.409 while retaining about 89.5% of fixed-B16
+accepted draft length. `alpha=0.95` is safer if the next experiments prioritize
+accepted length over draft efficiency.
