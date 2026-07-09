@@ -1,0 +1,321 @@
+# Axis 2: Pre-Draft Block-Size Policy
+
+## Goal
+
+Choose a DFlash block size before each drafting cycle:
+
+```text
+B_t in {4, 8, 12, 16}
+```
+
+The baseline fixed setting is `B=16`, which means `15` drafted tokens. On the GSM8K test trace:
+
+```text
+mean accepted draft length = 5.060
+mean acceptance ratio      = 5.060 / 15 = 0.337
+```
+
+The policy goal is not raw throughput at batch size 1. The useful proxy is:
+
+```text
+increase mean acceptance ratio
+while maintaining mean accepted draft length
+```
+
+For a chosen block size `B`:
+
+```text
+draft_budget(B) = B - 1
+accepted_B      = min(accepted_len_from_b16_trace, draft_budget(B))
+acceptance_ratio_B = accepted_B / draft_budget(B)
+```
+
+## Oracle Frontier
+
+Using the existing fixed `B=16` GSM8K test trace and choosing the smallest sufficient block per cycle:
+
+```text
+fixed B=16:
+  mean accepted draft length = 5.060
+  mean acceptance ratio      = 0.337
+  mean draft budget          = 15.000
+  mean waste                 = 9.940
+
+oracle smallest sufficient block:
+  mean accepted draft length = 5.060
+  mean acceptance ratio      = 0.649
+  mean draft budget          = 6.609
+  mean waste                 = 1.549
+```
+
+This confirms that the proxy target has real headroom.
+
+## Reward
+
+For each trace row and candidate block size:
+
+```text
+A = accepted_draft_len from the max-block trace
+accepted_B = min(A, B - 1)
+lost_acceptance_B = A - accepted_B
+acceptance_ratio_B = accepted_B / (B - 1)
+```
+
+The first ratio-preserving reward is:
+
+```text
+reward(B) = acceptance_ratio_B - lambda * lost_acceptance_B
+```
+
+`lambda` controls the retention/ratio tradeoff:
+
+```text
+lambda too low  -> high ratio, poor accepted-length retention
+lambda too high -> collapses back toward B=16
+```
+
+Initial sweep:
+
+```text
+lambda in {0.25, 0.5, 1.0, 2.0}
+```
+
+## Metrics
+
+Primary metrics:
+
+```text
+mean_accepted_draft_len
+mean_acceptance_ratio
+accepted_len_retention_vs_fixed_B16
+```
+
+Secondary metrics:
+
+```text
+mean_draft_budget
+mean_wasted_drafts
+under_arm_rate
+over_arm_rate
+arm_hist
+```
+
+Success criterion:
+
+```text
+mean_acceptance_ratio > 0.337
+accepted_len_retention >= 0.90 initially, then >= 0.95
+```
+
+## Internal Features
+
+The preferred input is DFlash's own pre-draft fused context representation, not handcrafted entropy features.
+
+The fused context is:
+
+```python
+target_hidden = extract_context_feature(
+    target.hidden_states,
+    draft_model.target_layer_ids,
+)
+
+fused_context = draft_model.hidden_norm(
+    draft_model.fc(target_hidden)
+)
+```
+
+This is the context representation consumed by the DFlash drafter. It is causal before drafting.
+
+## Trace Fields
+
+When collecting with:
+
+```bash
+--log-internal-features --internal-feature-window 16 --internal-feature-dim 128
+```
+
+each row stores:
+
+```text
+inputs.dflash_context
+  Latest projected fused context vector.
+  Shape: [128]
+
+inputs.dflash_context_window
+  Padded sequence of recent projected fused context vectors.
+  Shape: [16, 128]
+
+inputs.dflash_context_window_mask
+  Padding mask for the context window.
+  Shape: [16]
+```
+
+The projection is a fixed random Gaussian projection, seeded by `--internal-feature-seed`.
+
+## Data Collection Plan
+
+Use `a100-gpu-test` with two shards, one per A100. Active trace IO should go under the pod home directory because `/workspace` is network-backed and has shown high IO wait on large JSONL files.
+
+```text
+active output:
+  ~/dflash_axis2_runs/traces/
+
+active logs:
+  ~/dflash_axis2_runs/logs/
+
+archive/copy destination after completion:
+  /workspace/dflash-fresh-zlab-main/runs/traces/internal/
+```
+
+Launch train split as two shards:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/workspace/dflash-fresh-zlab-main \
+/opt/conda/envs/cbm/bin/python /workspace/dflash-fresh-zlab-main/scripts/collect_dflash_traces.py \
+  --split train \
+  --output ~/dflash_axis2_runs/traces/gsm8k_train_internal_w16d128_shard0of2.jsonl \
+  --block-size 16 \
+  --max-new-tokens 256 \
+  --log-internal-features \
+  --internal-feature-window 16 \
+  --internal-feature-dim 128 \
+  --num-shards 2 \
+  --shard-index 0
+
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=/workspace/dflash-fresh-zlab-main \
+/opt/conda/envs/cbm/bin/python /workspace/dflash-fresh-zlab-main/scripts/collect_dflash_traces.py \
+  --split train \
+  --output ~/dflash_axis2_runs/traces/gsm8k_train_internal_w16d128_shard1of2.jsonl \
+  --block-size 16 \
+  --max-new-tokens 256 \
+  --log-internal-features \
+  --internal-feature-window 16 \
+  --internal-feature-dim 128 \
+  --num-shards 2 \
+  --shard-index 1
+```
+
+After both shards finish:
+
+```bash
+cat ~/dflash_axis2_runs/traces/gsm8k_train_internal_w16d128_shard0of2.jsonl \
+    ~/dflash_axis2_runs/traces/gsm8k_train_internal_w16d128_shard1of2.jsonl \
+  > ~/dflash_axis2_runs/traces/gsm8k_train_internal_w16d128.jsonl
+
+mkdir -p /workspace/dflash-fresh-zlab-main/runs/traces/internal
+cp ~/dflash_axis2_runs/traces/gsm8k_train_internal_w16d128*.jsonl \
+   /workspace/dflash-fresh-zlab-main/runs/traces/internal/
+```
+
+## Ablations
+
+Run these in order:
+
+```text
+A. internal_last_mlp
+   input: dflash_context
+   architecture: MLP
+
+B. internal_window_gru_8
+   input: last 8 rows of dflash_context_window
+   architecture: GRU
+
+C. internal_window_gru_16
+   input: full dflash_context_window
+   architecture: GRU
+
+D. internal_window_pool_mlp
+   input: concat(last, mean, std) over dflash_context_window
+   architecture: MLP
+
+E. internal_plus_uncertainty
+   input: dflash_context plus latest verifier entropy/pmax/margin/logprob
+   architecture: MLP
+```
+
+Start with A and C:
+
+```text
+internal_last_mlp gives the cleanest low-overhead baseline.
+internal_window_gru_16 tests whether local context trajectory improves block-size prediction.
+```
+
+## Survival-Curve Policy
+
+The next policy family predicts the accepted-length survival curve before drafting:
+
+```text
+input:  pre-draft DFlash context or DFlash context window
+output: P(A >= 1), P(A >= 2), ..., P(A >= 15)
+```
+
+This keeps the decision pre-draft, unlike post-draft confidence heads, but gives the model a structured target instead of a direct block label.
+
+For a candidate block size `B`:
+
+```text
+predicted_accepted(B) = sum_{k=1}^{B-1} P(A >= k)
+```
+
+Then choose the smallest block satisfying:
+
+```text
+predicted_accepted(B) >= alpha * predicted_accepted(16)
+```
+
+`alpha` controls the retention/ratio tradeoff. Larger `alpha` picks larger blocks and preserves more accepted length.
+
+Initial validation results on the prompt-held-out GSM8K train split:
+
+```text
+fixed B=16:
+  mean accepted draft length = 5.052
+  mean acceptance ratio      = 0.337
+
+oracle smallest sufficient:
+  mean accepted draft length = 5.052
+  mean acceptance ratio      = 0.648
+  mean draft budget          = 6.609
+
+internal_window_gru16_survival:
+  alpha=0.85:
+    mean accepted draft length = 4.679
+    retention                  = 0.926
+    mean acceptance ratio      = 0.502
+    mean draft budget          = 8.803
+
+  alpha=0.90:
+    mean accepted draft length = 4.827
+    retention                  = 0.956
+    mean acceptance ratio      = 0.468
+    mean draft budget          = 9.710
+
+internal_last_mlp_survival:
+  alpha=0.85:
+    mean accepted draft length = 4.680
+    retention                  = 0.926
+    mean acceptance ratio      = 0.479
+    mean draft budget          = 9.330
+
+  alpha=0.90:
+    mean accepted draft length = 4.858
+    retention                  = 0.962
+    mean acceptance ratio      = 0.442
+    mean draft budget          = 10.472
+```
+
+The GRU window survival model is the best current operating point. It reaches the target retention regime while still improving acceptance ratio substantially over fixed `B=16`.
+
+## Literature Anchors
+
+DISCO frames static speculation length as suboptimal and trains a lightweight classifier for dynamic speculation length.
+
+SmartSpec uses estimated accepted length/rate and execution cost to choose speculation length under serving load.
+
+PEARL also adapts draft length, motivated by fixed-length speculation waste and draft/verify waiting.
+
+Our DFlash-specific version is:
+
+```text
+pre-draft fused DFlash context -> policy head -> block size
+```

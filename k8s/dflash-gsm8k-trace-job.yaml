@@ -1,0 +1,89 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dflash-gsm8k-traces-full
+  namespace: wenglab-interpretable-ai
+  labels:
+    app: dflash
+    task: gsm8k-trace-collection
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 43200
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: dflash
+        task: gsm8k-trace-collection
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: trace-collector
+          image: ghcr.io/atharvrn/savlgcbm-cbm:pt222-cu121
+          imagePullPolicy: Always
+          command:
+            - /bin/bash
+            - -lc
+          args:
+            - |
+              set -euxo pipefail
+
+              cd /workspace/dflash-fresh-zlab-main
+              export HF_HOME=/workspace/.cache/huggingface
+              export PYTHONUNBUFFERED=1
+
+              python -m pip install --quiet uv
+              rm -rf /tmp/dflash-trace-venv
+              uv venv --python /opt/conda/envs/cbm/bin/python --system-site-packages /tmp/dflash-trace-venv
+              source /tmp/dflash-trace-venv/bin/activate
+
+              UV_LINK_MODE=symlink uv pip install --no-deps -e . \
+                transformers==4.57.1 accelerate datasets huggingface-hub==0.36.2 \
+                tokenizers==0.22.2 safetensors hf-xet \
+                "numpy<2" pyarrow dill multiprocess xxhash aiohttp httpx httpcore h11 \
+                anyio aiosignal aiohappyeyeballs async-timeout attrs frozenlist multidict \
+                propcache yarl psutil rich loguru tqdm requests typing-extensions
+
+              mkdir -p runs/traces runs/logs
+
+              python scripts/collect_dflash_traces.py \
+                --split train \
+                --max-new-tokens 256 \
+                --output runs/traces/gsm8k_train_trace_full_job.jsonl \
+                --model Qwen/Qwen3-4B \
+                --draft-model z-lab/Qwen3-4B-DFlash-b16 \
+                --block-size 16 \
+                --attn-implementation sdpa
+
+              python scripts/collect_dflash_traces.py \
+                --split test \
+                --max-new-tokens 256 \
+                --output runs/traces/gsm8k_test_trace_full_job.jsonl \
+                --model Qwen/Qwen3-4B \
+                --draft-model z-lab/Qwen3-4B-DFlash-b16 \
+                --block-size 16 \
+                --attn-implementation sdpa
+          resources:
+            requests:
+              cpu: "12"
+              memory: 32Gi
+              ephemeral-storage: 200Gi
+              nvidia.com/a100: "1"
+            limits:
+              cpu: "12"
+              memory: 32Gi
+              ephemeral-storage: 200Gi
+              nvidia.com/a100: "1"
+          volumeMounts:
+            - name: atharv-rwx-storage-1ti
+              mountPath: /workspace
+            - name: dev-shm
+              mountPath: /dev/shm
+      volumes:
+        - name: atharv-rwx-storage-1ti
+          persistentVolumeClaim:
+            claimName: atharv-rwx-storage-1ti
+        - name: dev-shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 100Gi
