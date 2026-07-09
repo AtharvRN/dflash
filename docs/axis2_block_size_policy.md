@@ -368,3 +368,56 @@ Our DFlash-specific version is:
 ```text
 pre-draft fused DFlash context -> policy head -> block size
 ```
+
+## Runtime Decoder Integration
+
+The offline survival policy can now run inside DFlash decoding before each draft
+cycle:
+
+- `dflash.policy.DFlashSurvivalBlockPolicy` loads a trained `best.pt` survival
+  checkpoint, maintains the last 16 projected DFlash fused-context vectors, and
+  selects the smallest block in `{4, 8, 12, 16}` whose expected accepted draft
+  length reaches `alpha * E[accepted length at B16]`.
+- `dflash.dynamic.dflash_generate_dynamic` mirrors the original Transformers
+  decode loop but calls the policy at the start of each cycle and runs the draft
+  model with that cycle's selected block size.
+- `scripts/benchmark_dynamic_survival_policy.py` compares fixed B16 against the
+  dynamic policy during actual generation and reports mean accepted draft length,
+  mean acceptance ratio, mean block size, block histogram, and token latency.
+
+Initial runtime smoke command:
+
+```bash
+/workspace/dflash-axis2-train-uv/bin/python scripts/benchmark_dynamic_survival_policy.py \
+  --model Qwen/Qwen3-4B \
+  --draft-model z-lab/Qwen3-4B-DFlash-b16 \
+  --policy-checkpoint /workspace/dflash-fresh-zlab-main/runs/survival_policy/internal_w16d128/internal_window_gru16_survival_full/best.pt \
+  --dataset gsm8k \
+  --max-samples 8 \
+  --max-new-tokens 128 \
+  --alpha 0.90 \
+  --compare-output-ids \
+  --output-json runs/survival_policy/internal_w16d128/runtime_dynamic_smoke_alpha090.json
+```
+
+Runtime smoke on `a100-gpu-test-v2` with `alpha=0.90`, 8 GSM8K prompts, and
+128 generated tokens per prompt:
+
+```text
+fixed B16:
+  mean accepted draft length = 4.768
+  mean acceptance ratio      = 0.318
+  mean draft budget          = 15.000
+
+dynamic survival policy:
+  mean accepted draft length = 4.521
+  mean acceptance ratio      = 0.446
+  mean draft budget          = 9.625
+  block histogram            = B8: 90, B12: 78, B16: 24
+```
+
+The dynamic decoder also matches the original fixed-B16 decoder exactly when
+the policy arms are forced to `{16}`, which verifies the cache mechanics of the
+new runtime path. Exact token equality between fixed B16 and variable block
+sizes is not stable under bf16/SDPA for longer generations because target
+verification chunk sizes differ.

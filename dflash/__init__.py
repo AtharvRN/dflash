@@ -1,5 +1,7 @@
 __all__ = [
     "DFlashDraftModel",
+    "DFlashSurvivalBlockPolicy",
+    "dflash_generate_dynamic",
     "extract_context_feature",
     "load_and_process_dataset",
     "sample",
@@ -20,5 +22,15 @@ def __getattr__(name):
             "extract_context_feature": extract_context_feature,
             "sample": sample,
         }[name]
+
+    if name == "DFlashSurvivalBlockPolicy":
+        from .policy import DFlashSurvivalBlockPolicy
+
+        return DFlashSurvivalBlockPolicy
+
+    if name == "dflash_generate_dynamic":
+        from .dynamic import dflash_generate_dynamic
+
+        return dflash_generate_dynamic
 
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
