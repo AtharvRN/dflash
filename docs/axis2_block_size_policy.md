@@ -306,6 +306,55 @@ internal_last_mlp_survival:
 
 The GRU window survival model is the best current operating point. It reaches the target retention regime while still improving acceptance ratio substantially over fixed `B=16`.
 
+Held-out GSM8K test results:
+
+```text
+fixed B=16:
+  mean accepted draft length = 5.060
+  mean acceptance ratio      = 0.337
+
+oracle smallest sufficient:
+  mean accepted draft length = 5.060
+  mean acceptance ratio      = 0.649
+  mean draft budget          = 6.609
+
+internal_window_gru16_survival:
+  alpha=0.85:
+    mean accepted draft length = 4.686
+    retention                  = 0.926
+    mean acceptance ratio      = 0.502
+    mean draft budget          = 8.802
+
+  alpha=0.90:
+    mean accepted draft length = 4.837
+    retention                  = 0.956
+    mean acceptance ratio      = 0.468
+    mean draft budget          = 9.718
+
+internal_last_mlp_survival:
+  alpha=0.85:
+    mean accepted draft length = 4.690
+    retention                  = 0.927
+    mean acceptance ratio      = 0.479
+    mean draft budget          = 9.350
+
+  alpha=0.90:
+    mean accepted draft length = 4.871
+    retention                  = 0.963
+    mean acceptance ratio      = 0.442
+    mean draft budget          = 10.501
+```
+
+The held-out test curve closely matches validation. The recommended operating points are:
+
+```text
+alpha=0.85 for better ratio:
+  retention ~0.926, acceptance ratio ~0.502
+
+alpha=0.90 for safer retention:
+  retention ~0.956, acceptance ratio ~0.468
+```
+
 ## Literature Anchors
 
 DISCO frames static speculation length as suboptimal and trains a lightweight classifier for dynamic speculation length.
