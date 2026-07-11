@@ -85,7 +85,7 @@ def parse_args() -> argparse.Namespace:
 @torch.inference_mode()
 def main() -> None:
     args = parse_args()
-    checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config: dict[str, Any] = checkpoint["config"]
     feature_set = str(config.get("feature_set", "all"))
 

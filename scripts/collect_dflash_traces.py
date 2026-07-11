@@ -152,6 +152,60 @@ def _load_gsm8k_prompts(
     return indexed
 
 
+def _load_jsonl_prompts(
+    path: Path,
+    max_samples: int | None,
+    seed: int,
+    *,
+    num_shards: int = 1,
+    shard_index: int = 0,
+) -> list[dict[str, Any]]:
+    indexed: list[dict[str, Any]] = []
+    with path.open() as f:
+        for i, line in enumerate(f):
+            row = json.loads(line)
+            if "conversations" in row:
+                prompt = row["conversations"][0]["value"]
+            elif "turns" in row:
+                prompt = row["turns"][0]
+            elif "prompt" in row:
+                prompt = row["prompt"]
+            else:
+                raise ValueError(
+                    f"{path} row {i} must contain conversations[0].value, turns[0], or prompt"
+                )
+            indexed.append(
+                {
+                    "dataset_index": i,
+                    "turns": [prompt],
+                    "source_id": row.get("id", str(i)),
+                    "metadata": row.get("metadata", {}),
+                }
+            )
+    if num_shards < 1:
+        raise ValueError(f"num_shards must be >= 1, got {num_shards}")
+    if shard_index < 0 or shard_index >= num_shards:
+        raise ValueError(f"shard_index must be in [0, {num_shards}), got {shard_index}")
+    indexed = [item for pos, item in enumerate(indexed) if pos % num_shards == shard_index]
+    if max_samples is not None and len(indexed) > max_samples:
+        rng = random.Random(seed)
+        rng.shuffle(indexed)
+        indexed = indexed[:max_samples]
+    return indexed
+
+
+def _make_input_text(tokenizer: Any, prompt: str, *, enable_thinking: bool, input_is_chat_template: bool) -> str:
+    if input_is_chat_template:
+        return prompt
+    messages = [{"role": "user", "content": prompt}]
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=enable_thinking,
+    )
+
+
 def _make_pre_features(
     *,
     latest_target_stats: dict[str, float | int | None],
@@ -192,17 +246,17 @@ def collect_one_prompt(
     temperature: float,
     history_window: int,
     enable_thinking: bool,
+    input_is_chat_template: bool,
     log_internal_features: bool,
     internal_projector: torch.Tensor | None,
     internal_feature_window: int,
     internal_feature_dim: int,
 ) -> list[dict[str, Any]]:
-    messages = [{"role": "user", "content": prompt}]
-    input_text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
+    input_text = _make_input_text(
+        tokenizer,
+        prompt,
         enable_thinking=enable_thinking,
+        input_is_chat_template=input_is_chat_template,
     )
     input_ids = tokenizer.encode(input_text, return_tensors="pt").to(target.device)
     num_input_tokens = input_ids.shape[1]
@@ -432,6 +486,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="Qwen/Qwen3-4B")
     parser.add_argument("--draft-model", default="z-lab/Qwen3-4B-DFlash-b16")
     parser.add_argument("--dataset", choices=["gsm8k"], default="gsm8k")
+    parser.add_argument("--dataset-jsonl", type=Path, default=None)
+    parser.add_argument("--dataset-name", default=None)
+    parser.add_argument("--input-is-chat-template", action="store_true")
     parser.add_argument("--split", choices=["train", "test"], required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--max-samples", type=int, default=None)
@@ -469,25 +526,36 @@ def main() -> None:
     }
     dtype = dtype_map[args.dtype]
 
-    prompts = _load_gsm8k_prompts(
-        args.split,
-        args.max_samples,
-        args.seed,
-        num_shards=args.num_shards,
-        shard_index=args.shard_index,
-    )
+    dataset_name = args.dataset_name or args.dataset
+    if args.dataset_jsonl is not None:
+        prompts = _load_jsonl_prompts(
+            args.dataset_jsonl,
+            args.max_samples,
+            args.seed,
+            num_shards=args.num_shards,
+            shard_index=args.shard_index,
+        )
+        dataset_name = args.dataset_name or args.dataset_jsonl.stem
+    else:
+        prompts = _load_gsm8k_prompts(
+            args.split,
+            args.max_samples,
+            args.seed,
+            num_shards=args.num_shards,
+            shard_index=args.shard_index,
+        )
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     target = AutoModelForCausalLM.from_pretrained(
         args.model,
         attn_implementation=args.attn_implementation,
-        dtype=dtype,
+        torch_dtype=dtype,
     ).to("cuda").eval()
     draft_model = DFlashDraftModel.from_pretrained(
         args.draft_model,
         attn_implementation=args.attn_implementation,
-        dtype=dtype,
+        torch_dtype=dtype,
     ).to("cuda").eval()
     internal_projector = None
     if args.log_internal_features and args.internal_feature_dim > 0:
@@ -502,14 +570,14 @@ def main() -> None:
 
     num_rows = 0
     with args.output.open("w") as f:
-        for local_idx, item in enumerate(tqdm(prompts, desc=f"{args.dataset}:{args.split}")):
+        for local_idx, item in enumerate(tqdm(prompts, desc=f"{dataset_name}:{args.split}")):
             rows = collect_one_prompt(
                 draft_model=draft_model,
                 target=target,
                 tokenizer=tokenizer,
                 prompt=item["turns"][0],
-                prompt_id=f"{args.dataset}-{args.split}-{item['dataset_index']}",
-                dataset_name=args.dataset,
+                prompt_id=f"{dataset_name}-{args.split}-{item['dataset_index']}",
+                dataset_name=dataset_name,
                 split=args.split,
                 dataset_index=item["dataset_index"],
                 max_new_tokens=args.max_new_tokens,
@@ -517,6 +585,7 @@ def main() -> None:
                 temperature=args.temperature,
                 history_window=args.history_window,
                 enable_thinking=args.enable_thinking,
+                input_is_chat_template=args.input_is_chat_template,
                 log_internal_features=args.log_internal_features,
                 internal_projector=internal_projector,
                 internal_feature_window=args.internal_feature_window,
