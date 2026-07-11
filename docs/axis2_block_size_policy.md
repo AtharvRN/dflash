@@ -240,6 +240,92 @@ internal_last_mlp gives the cleanest low-overhead baseline.
 internal_window_gru_16 tests whether local context trajectory improves block-size prediction.
 ```
 
+## Qwen3-8B Math500 Fixed-Block Baseline
+
+Corrected high-concurrency run:
+
+```text
+run_dir=/workspace/dflash-axis2-runs/math500_qwen3_8b_fixed_highc/run_20260711_190558
+model=Qwen/Qwen3-8B
+draft=z-lab/Qwen3-8B-DFlash-b16
+dataset=Math500
+num_prompts=128
+max_new_tokens=512
+enable_thinking=false
+concurrency={32,48,64}
+block={8,12,16}
+```
+
+Important measurement detail: `num_prompts` must be at least the requested
+concurrency. An earlier partial run used `num_prompts=32`, so its `C=64` point
+only had 32 active requests and should not be used.
+
+Throughput summary:
+
+```text
+C=32:
+  B8   1569.24 tok/s, accept_len=5.62
+  B12  1979.35 tok/s, accept_len=6.87
+  B16  1436.70 tok/s, accept_len=7.84
+
+C=48:
+  B8   1797.25 tok/s, accept_len=5.59
+  B12  1999.88 tok/s, accept_len=6.82
+  B16  1647.32 tok/s, accept_len=7.81
+
+C=64:
+  B8   1751.33 tok/s, accept_len=5.64
+  B12  2252.11 tok/s, accept_len=6.91
+  B16  1914.90 tok/s, accept_len=7.87
+```
+
+For Qwen3-8B on Math500 in this setup, fixed `B=12` is the winner at all three
+high-concurrency points. `B=16` accepts more tokens per cycle, but the larger
+draft/verify block is expensive enough that throughput drops.
+
+Timing-profile run:
+
+```text
+run_dir=/workspace/dflash-axis2-runs/math500_qwen3_8b_fixed_highc_profile/run_20260711_192808
+concurrency=64
+num_prompts=128
+max_new_tokens=512
+```
+
+The timing run enables CUDA-synchronizing per-cycle profiling, so its throughput
+is not comparable to the baseline run. Use it only for component timing:
+
+```text
+C=64 timing, mean profiled cycles only:
+  B8:
+    cycle_total_ms=88.12
+    draft_forward_ms=9.13
+    target_verify_forward_ms=68.14
+    accept_verify_ms=4.77
+    draft_sample_ms=2.86
+    cycle_mean_commit_len=5.45
+
+  B12:
+    cycle_total_ms=113.38
+    draft_forward_ms=11.31
+    target_verify_forward_ms=89.76
+    accept_verify_ms=4.91
+    draft_sample_ms=4.11
+    cycle_mean_commit_len=6.54
+
+  B16:
+    cycle_total_ms=140.41
+    draft_forward_ms=13.79
+    target_verify_forward_ms=112.25
+    accept_verify_ms=5.50
+    draft_sample_ms=5.43
+    cycle_mean_commit_len=7.37
+```
+
+This supports the dynamic-block motivation: reducing block size materially
+reduces runtime at high concurrency, mostly through target verify time. The
+hard part is preserving enough accepted length while choosing the smaller arm.
+
 ## Survival-Curve Policy
 
 The next policy family predicts the accepted-length survival curve before drafting:
