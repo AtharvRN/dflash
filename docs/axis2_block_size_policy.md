@@ -126,6 +126,339 @@ fused_context = draft_model.hidden_norm(
 
 This is the context representation consumed by the DFlash drafter. It is causal before drafting.
 
+## DFlashv2 Horizon Predictor
+
+The model-level objective should be phrased as horizon prediction, not direct
+throughput optimization:
+
+```text
+Given the current decoded prefix and model state, predict the local
+predictability horizon H_t: how many future draft tokens are likely to survive
+target verification.
+```
+
+For a max DFlash block `B_max = 16`, the label is:
+
+```text
+H_t = accepted_draft_len_t,  H_t in {0, 1, ..., 15}
+```
+
+This label is measured from normal fixed-`B=16` DFlash traces. It is a property
+of the current prefix, target model, and DFlash drafter, not a property of the
+serving hardware.
+
+### Output Parameterization
+
+Use a survival/hazard parameterization rather than direct block classification:
+
+```text
+survival output:
+  s_k = P(H_t >= k | state_t),  k = 1..15
+
+or hazard output:
+  q_k = P(token k accepted | tokens 1..k-1 accepted, state_t)
+  s_k = product_{j=1..k} q_j
+```
+
+The hazard form is attractive because it enforces monotonic survival by
+construction. The direct survival form is simpler and can be monotonicized with:
+
+```python
+s = torch.cummin(torch.sigmoid(logits), dim=-1).values
+```
+
+The block-size decision is kept outside the learned model:
+
+```text
+expected_accept(B) = sum_{k=1}^{B-1} s_k
+B* = decision_rule(expected_accept, runtime_cost_or_budget)
+```
+
+This keeps the predictor reusable across hardware, concurrency, and serving
+frameworks.
+
+### Inputs
+
+The primary input should be the DFlash fused context window:
+
+```text
+X_t = [c_{t-W+1}, ..., c_t],  c_i = hidden_norm(fc(target_hidden_i))
+```
+
+This is the same representation consumed by the DFlash drafter before drafting,
+so it is causal and architecture-aligned. Recommended starting dimensions:
+
+```text
+window W: 16 or 32 committed tokens
+input dim: full DFlash fused-context hidden size, e.g. 4096
+learned bottleneck: Linear(input_dim -> 256/512/1024)
+```
+
+Optional uncertainty channels can be appended per token:
+
+```text
+verifier entropy
+verifier pmax
+verifier top1-top2 margin
+token logprob
+```
+
+These should be treated as an ablation rather than the default, because the
+cleanest DFlashv2 claim is that the drafter's fused target context already
+contains the horizon signal.
+
+Previous accepted length should not be a primary feature. It is an outcome proxy,
+not a causal model-state signal. It can remain as a diagnostic baseline.
+
+### Architecture
+
+Start with a lightweight temporal encoder:
+
+```text
+input:  [batch, W, d]
+encoder: 2-layer GRU or small causal Transformer encoder
+pool:   final valid token or attention pooling
+head:   MLP -> 15 logits
+output: survival or hazard probabilities
+```
+
+Recommended first model:
+
+```text
+TemporalSurvivalHead
+  GRU hidden size: 192 or 256
+  MLP: hidden -> hidden/2 -> 15
+  dropout: 0.05-0.10
+```
+
+Then run these ablations:
+
+```text
+A. entropy_latest
+   current verifier entropy/pmax/margin only
+
+B. entropy_window
+   last W verifier uncertainty values
+
+C. fused_last_mlp
+   latest fused context vector only
+
+D. fused_window_gru
+   last W fused context vectors
+
+E. fused_window_transformer
+   small temporal Transformer over fused context
+
+F. fused_window_plus_entropy
+   fused context plus verifier uncertainty channels
+```
+
+### Training Loss
+
+For each trace row with label `H_t`, construct binary survival labels:
+
+```text
+y_k = 1[H_t >= k],  k = 1..15
+```
+
+Use binary cross entropy over all horizons:
+
+```text
+L_survival = mean_k BCE(logit_k, y_k)
+```
+
+Recommended additions:
+
+```text
+monotonic regularizer:
+  mean ReLU(s_{k+1} - s_k)
+
+calibration loss or temperature scaling:
+  fit on validation split after training
+
+class/horizon weighting:
+  slightly upweight larger k because long accepted horizons are rarer
+```
+
+Do not train directly on measured runtime cost. Cost belongs to the inference
+decision layer, not the horizon predictor.
+
+### Inference
+
+At each DFlash cycle:
+
+```text
+1. target verifies/produces the latest committed token(s)
+2. extract fused context for committed token(s)
+3. update the horizon predictor's rolling context window
+4. predict s_k = P(H_t >= k)
+5. convert survival curve into a draft block size
+6. run DFlash drafting with the selected block size
+```
+
+Simple cost-free decision rules for model research:
+
+```text
+threshold rule:
+  choose largest B such that s_{B-1} >= tau
+
+retention rule:
+  choose smallest B such that E[min(H, B-1)] >= alpha * E[min(H, 15)]
+
+budgeted rule:
+  choose B that maximizes E[min(H, B-1)] - lambda * (B-1)
+```
+
+Deployment can replace these with a measured cost adapter:
+
+```text
+B* = argmax_B E[min(H, B-1)] / C_runtime(B)
+```
+
+but the learned horizon model stays unchanged.
+
+### Evaluation
+
+Evaluate the predictor before evaluating throughput:
+
+```text
+survival AUROC for H >= 4, 8, 12
+survival calibration error
+horizon MAE / ordinal error
+expected accepted-token retention
+chosen block histogram
+oracle gap against true H_t
+```
+
+The key research question is:
+
+```text
+Is the DFlash predictable horizon recoverable from pre-draft model state?
+```
+
+Throughput and serving integration should come after this question is answered.
+
+### Training Data Choice
+
+For DFlashv2 horizon-predictor training, use the same source mixture reported by
+the DFlash paper for its main draft models:
+
+```text
+source prompts:
+  NVIDIA Nemotron Post-Training Dataset V2
+  CodeAlpaca
+
+scale:
+  DFlash reports around 800K source samples
+
+alignment:
+  DFlash does not train directly on original dataset responses; it constructs
+  target-model-generated responses for better target alignment.
+```
+
+For the horizon predictor, the equivalent procedure is:
+
+```text
+1. sample prompts/instructions from the same source mixture
+2. decode with the frozen target + DFlash drafter using fixed B=16
+3. store pre-draft state features for each cycle
+4. label each cycle with the observed accepted draft length H_t
+```
+
+Do not train on final evaluation benchmark prompts. Math500, HumanEval, MBPP,
+LCB, GSM8K, and MT-Bench-style reported test prompts should remain evaluation
+only unless explicitly used as a separate ablation.
+
+Start with a smaller DFlashv2 trace subset before scaling:
+
+```text
+smoke:      5K-10K cycles
+pilot:      50K cycles
+main:       200K-300K cycles
+full scale: 500K+ cycles if the pilot shows signal
+```
+
+The split should be by source prompt, not by cycle, so all cycles from a prompt
+belong to exactly one of train/validation/test.
+
+### DFlashv2 Pipeline Commands
+
+Build prompt manifests from the downloaded DFlash source datasets:
+
+```bash
+cd /workspace/dflash-fresh-zlab-main
+
+python scripts/build_dflashv2_prompt_manifest.py \
+  --nemotron-root /workspace/dflashv2_data/datasets/nemotron_v2 \
+  --codealpaca-json /workspace/dflashv2_data/datasets/codealpaca/code_alpaca_20k.json \
+  --output-dir /workspace/dflashv2_data/manifests \
+  --prefix nemotron_codealpaca \
+  --val-fraction 0.02 \
+  --seed 0
+```
+
+Collect a small full-fused-context trace smoke test:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/collect_dflashv2_horizon_traces.py \
+  --manifest /workspace/dflashv2_data/manifests/nemotron_codealpaca_train.jsonl \
+  --output-dir /workspace/dflashv2_data/traces/qwen3_8b_b16_fullctx_smoke_train \
+  --model Qwen/Qwen3-8B \
+  --draft-model z-lab/Qwen3-8B-DFlash-b16 \
+  --max-cycles 10000 \
+  --max-new-tokens 256 \
+  --block-size 16 \
+  --context-window 16 \
+  --rows-per-shard 2048 \
+  --temperature 0.0
+```
+
+Collect validation traces from the held-out prompt manifest:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/collect_dflashv2_horizon_traces.py \
+  --manifest /workspace/dflashv2_data/manifests/nemotron_codealpaca_val.jsonl \
+  --output-dir /workspace/dflashv2_data/traces/qwen3_8b_b16_fullctx_smoke_val \
+  --model Qwen/Qwen3-8B \
+  --draft-model z-lab/Qwen3-8B-DFlash-b16 \
+  --max-cycles 2000 \
+  --max-new-tokens 256 \
+  --block-size 16 \
+  --context-window 16 \
+  --rows-per-shard 2048 \
+  --temperature 0.0
+```
+
+Train the first full-fused-context horizon predictor:
+
+```bash
+python scripts/train_dflashv2_horizon_predictor.py \
+  --train-dir /workspace/dflashv2_data/traces/qwen3_8b_b16_fullctx_smoke_train \
+  --val-dir /workspace/dflashv2_data/traces/qwen3_8b_b16_fullctx_smoke_val \
+  --output-dir /workspace/dflashv2_data/runs/horizon_gru_fullctx_smoke \
+  --architecture gru \
+  --proj-dim 512 \
+  --hidden-size 256 \
+  --epochs 8 \
+  --batch-size 256 \
+  --monotonicize-eval
+```
+
+Evaluate a saved checkpoint:
+
+```bash
+python scripts/train_dflashv2_horizon_predictor.py \
+  --eval-only \
+  --checkpoint /workspace/dflashv2_data/runs/horizon_gru_fullctx_smoke/best.pt \
+  --val-dir /workspace/dflashv2_data/traces/qwen3_8b_b16_fullctx_smoke_val \
+  --output-dir /workspace/dflashv2_data/runs/horizon_gru_fullctx_smoke_eval \
+  --architecture gru \
+  --proj-dim 512 \
+  --hidden-size 256 \
+  --batch-size 256 \
+  --monotonicize-eval
+```
+
 ## Trace Fields
 
 When collecting with:
@@ -325,6 +658,60 @@ C=64 timing, mean profiled cycles only:
 This supports the dynamic-block motivation: reducing block size materially
 reduces runtime at high concurrency, mostly through target verify time. The
 hard part is preserving enough accepted length while choosing the smaller arm.
+
+### Verification-Time Reduction Target
+
+For the profiled `Qwen3-8B` / Math500 / `C=64` run, target verification is the
+dominant part of each DFlash cycle:
+
+```text
+B8:   target_verify_forward_ms =  68.14 /  88.12 total = 77.3%
+B12:  target_verify_forward_ms =  89.76 / 113.38 total = 79.2%
+B16:  target_verify_forward_ms = 112.25 / 140.41 total = 79.9%
+```
+
+Growth from `B=8` to `B=16`:
+
+```text
+cycle_total_ms:            +52.29 ms, +59.3%
+draft_forward_ms:           +4.66 ms, +51.0%
+target_verify_forward_ms:  +44.11 ms, +64.7%
+accept_verify_ms:           +0.73 ms, +15.3%
+```
+
+Growth from `B=12` to `B=16`:
+
+```text
+cycle_total_ms:            +27.03 ms, +23.8%
+draft_forward_ms:           +2.48 ms, +21.9%
+target_verify_forward_ms:  +22.49 ms, +25.1%
+accept_verify_ms:           +0.59 ms, +12.0%
+```
+
+The practical implication is that block-size optimization is mostly a
+verification-length optimization. If we can draft a full-length block but verify
+only the useful prefix for each request, we should capture most of the runtime
+benefit of smaller blocks while keeping the ability to accept longer prefixes
+when the policy predicts they are worthwhile.
+
+This creates a different implementation problem from choosing one uniform
+runtime block size for the whole batch:
+
+```text
+draft block length:      fixed/full, e.g. 16
+verification length:     per request, e.g. 8/12/16
+target forward shape:    ragged or bucketed by verification length
+batch decision target:   minimize target verification work without truncating
+                         requests that would have accepted longer prefixes
+```
+
+The easiest implementation is bucketed verification: group requests by predicted
+verification length and run one target verify forward per bucket. The risk is
+that sequential bucket forwards can erase the savings. The more ambitious
+implementation is ragged verification in one batched target forward, where each
+request contributes only its selected verification prefix length. That is the
+right direction if SGLang's batching and attention metadata can represent the
+ragged verify sequences cleanly.
 
 ## Survival-Curve Policy
 
