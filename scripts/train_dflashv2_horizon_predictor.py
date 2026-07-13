@@ -386,7 +386,7 @@ def main() -> None:
     )
 
     if args.checkpoint is not None:
-        checkpoint = torch.load(args.checkpoint, map_location="cpu")
+        checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["model_state_dict"])
 
     val_loader = _make_loader(

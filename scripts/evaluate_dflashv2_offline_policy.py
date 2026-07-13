@@ -85,7 +85,7 @@ def main() -> None:
     alphas = _parse_csv_floats(args.alphas)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
-    checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config = checkpoint["config"]
     model = HorizonPredictor(
         input_dim=int(config["input_dim"]),
