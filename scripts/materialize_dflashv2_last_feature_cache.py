@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import argparse
-import bisect
 import json
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -38,6 +38,8 @@ def _materialize_split(
     indices: np.ndarray,
     output_dir: Path,
     progress_every: int,
+    max_read_rows: int,
+    max_output_rows: int,
 ) -> dict[str, Any]:
     split_dir = output_dir / name
     split_dir.mkdir(parents=True, exist_ok=True)
@@ -86,18 +88,40 @@ def _materialize_split(
         local_indices = order[left:right] - shard_start
         if cursor != left:
             raise RuntimeError(f"internal cursor mismatch for split={name}: cursor={cursor}, left={left}")
-        for rel_idx, local_idx64 in enumerate(local_indices):
-            out_idx = left + rel_idx
-            local_idx = int(local_idx64)
-            raw_mask = np.asarray(shard.mask[local_idx], dtype=np.float32)
-            valid = np.flatnonzero(raw_mask > 0.5)
-            feature_idx = int(valid[-1]) if valid.size else int(raw_mask.shape[0] - 1)
-            features[out_idx, 0] = np.asarray(shard.features[local_idx, feature_idx], dtype=np.float16)
-            mask[out_idx, 0] = 1.0 if valid.size else 0.0
-            survival[out_idx] = np.asarray(shard.survival[local_idx], dtype=np.float32)
-            accepted[out_idx] = float(shard.accepted_len[local_idx])
+        rel_idx = 0
+        while rel_idx < int(local_indices.shape[0]):
+            chunk_start = rel_idx
+            first_local = int(local_indices[chunk_start])
+            rel_idx += 1
+            while rel_idx < int(local_indices.shape[0]):
+                next_local = int(local_indices[rel_idx])
+                if rel_idx - chunk_start >= max_output_rows:
+                    break
+                if next_local - first_local >= max_read_rows:
+                    break
+                rel_idx += 1
 
-            processed = rel_idx + 1
+            chunk = local_indices[chunk_start:rel_idx].astype(np.int64, copy=False)
+            read_start = int(chunk[0])
+            read_end = int(chunk[-1]) + 1
+            positions = chunk - read_start
+            out_start = left + chunk_start
+            out_end = left + rel_idx
+
+            raw_mask = np.asarray(shard.mask[read_start:read_end], dtype=np.float32)
+            valid_mask = raw_mask > 0.5
+            has_valid = valid_mask.any(axis=1)
+            last_valid = valid_mask.shape[1] - 1 - np.argmax(valid_mask[:, ::-1], axis=1)
+            last_valid = np.where(has_valid, last_valid, valid_mask.shape[1] - 1)
+            selected_last = last_valid[positions]
+
+            feature_block = np.asarray(shard.features[read_start:read_end], dtype=np.float16)
+            features[out_start:out_end, 0] = feature_block[positions, selected_last]
+            mask[out_start:out_end, 0] = has_valid[positions].astype(np.float32)
+            survival[out_start:out_end] = np.asarray(shard.survival[chunk], dtype=np.float32)
+            accepted[out_start:out_end] = np.asarray(shard.accepted_len[chunk], dtype=np.float32)
+
+            processed = rel_idx
             if progress_every > 0 and processed % progress_every == 0:
                 print(
                     json.dumps(
@@ -153,6 +177,109 @@ def _materialize_split(
     return meta
 
 
+def _copy_compact_subset(
+    *,
+    name: str,
+    source_dir: Path,
+    output_dir: Path,
+    positions: np.ndarray,
+    copy_rows: int,
+) -> dict[str, Any]:
+    split_dir = output_dir / name
+    split_dir.mkdir(parents=True, exist_ok=True)
+    positions = np.asarray(positions, dtype=np.int64)
+    src_features = np.load(source_dir / "features.npy", mmap_mode="r")
+    src_mask = np.load(source_dir / "mask.npy", mmap_mode="r")
+    src_survival = np.load(source_dir / "survival.npy", mmap_mode="r")
+    src_accepted = np.load(source_dir / "accepted_len.npy", mmap_mode="r")
+
+    features = np.lib.format.open_memmap(
+        split_dir / "features.npy",
+        mode="w+",
+        dtype=np.float16,
+        shape=(positions.shape[0], src_features.shape[1], src_features.shape[2]),
+    )
+    mask = np.lib.format.open_memmap(
+        split_dir / "mask.npy",
+        mode="w+",
+        dtype=np.float32,
+        shape=(positions.shape[0], src_mask.shape[1]),
+    )
+    survival = np.lib.format.open_memmap(
+        split_dir / "survival.npy",
+        mode="w+",
+        dtype=np.float32,
+        shape=(positions.shape[0], src_survival.shape[1]),
+    )
+    accepted = np.lib.format.open_memmap(
+        split_dir / "accepted_len.npy",
+        mode="w+",
+        dtype=np.float32,
+        shape=(positions.shape[0],),
+    )
+
+    started = time.time()
+    for start in range(0, int(positions.shape[0]), copy_rows):
+        end = min(start + copy_rows, int(positions.shape[0]))
+        chunk = positions[start:end]
+        features[start:end] = src_features[chunk]
+        mask[start:end] = src_mask[chunk]
+        survival[start:end] = src_survival[chunk]
+        accepted[start:end] = src_accepted[chunk]
+        print(
+            json.dumps(
+                {
+                    "event": "copy_split_progress",
+                    "split": name,
+                    "rows_done": end,
+                    "rows_total": int(positions.shape[0]),
+                    "elapsed_s": round(time.time() - started, 3),
+                }
+            ),
+            flush=True,
+        )
+
+    features.flush()
+    mask.flush()
+    survival.flush()
+    accepted.flush()
+    meta = {
+        "split": name,
+        "rows": int(positions.shape[0]),
+        "elapsed_s": round(time.time() - started, 3),
+        "source_dir": str(source_dir),
+    }
+    _write_json(split_dir / "meta.json", meta)
+    print(json.dumps({"event": "copy_split_done", **meta}), flush=True)
+    return meta
+
+
+def _make_materializer_splits(
+    *,
+    total_rows: int,
+    max_total_rows: int | None,
+    calibration_rows: int,
+    seed: int,
+    selection_mode: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    if selection_mode == "random":
+        return _make_splits(
+            total_rows=total_rows,
+            max_total_rows=max_total_rows,
+            calibration_rows=calibration_rows,
+            seed=seed,
+        )
+    if selection_mode != "prefix":
+        raise ValueError(f"unsupported selection_mode={selection_mode!r}")
+    use_rows = total_rows if max_total_rows is None else min(total_rows, max_total_rows)
+    if calibration_rows >= use_rows:
+        raise ValueError(f"calibration_rows={calibration_rows} must be smaller than selected rows={use_rows}")
+    selected = np.arange(use_rows, dtype=np.int64)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(selected)
+    return selected[calibration_rows:], selected[:calibration_rows]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -167,6 +294,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calibration-rows", type=int, default=50000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--progress-every", type=int, default=25000)
+    parser.add_argument("--max-read-rows", type=int, default=1024)
+    parser.add_argument("--max-output-rows", type=int, default=1024)
+    parser.add_argument("--copy-rows", type=int, default=65536)
+    parser.add_argument("--selection-mode", choices=("random", "prefix"), default="random")
+    parser.add_argument("--keep-all-cache", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -204,11 +336,12 @@ def main() -> None:
         flush=True,
     )
 
-    train_indices, val_indices = _make_splits(
+    train_indices, val_indices = _make_materializer_splits(
         total_rows=total_rows,
         max_total_rows=args.max_total_rows,
         calibration_rows=args.calibration_rows,
         seed=args.seed,
+        selection_mode=args.selection_mode,
     )
     run_meta: dict[str, Any] = {
         "trace_dirs": [str(path) for path in args.trace_dir],
@@ -220,30 +353,50 @@ def main() -> None:
         "max_total_rows": args.max_total_rows,
         "calibration_rows": args.calibration_rows,
         "seed": args.seed,
+        "selection_mode": args.selection_mode,
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
     _write_json(args.output_dir / "meta.json", run_meta)
     print(json.dumps({"event": "materialize_start", **run_meta}), flush=True)
 
-    train_meta = _materialize_split(
-        name="train",
+    combined_indices = np.sort(np.concatenate([train_indices, val_indices]).astype(np.int64, copy=False))
+    all_dir = args.output_dir / "_all"
+    all_meta = _materialize_split(
+        name="_all",
         shards=shards,
         offsets=offsets,
-        indices=train_indices,
+        indices=combined_indices,
         output_dir=args.output_dir,
         progress_every=args.progress_every,
+        max_read_rows=args.max_read_rows,
+        max_output_rows=args.max_output_rows,
     )
-    val_meta = _materialize_split(
-        name="val",
-        shards=shards,
-        offsets=offsets,
-        indices=val_indices,
+
+    rank = np.empty((total_rows,), dtype=np.int64)
+    rank[combined_indices] = np.arange(combined_indices.shape[0], dtype=np.int64)
+    train_positions = rank[np.sort(train_indices)]
+    val_positions = rank[np.sort(val_indices)]
+    train_meta = _copy_compact_subset(
+        name="train",
+        source_dir=all_dir,
         output_dir=args.output_dir,
-        progress_every=max(args.progress_every, 0),
+        positions=train_positions,
+        copy_rows=args.copy_rows,
     )
+    val_meta = _copy_compact_subset(
+        name="val",
+        source_dir=all_dir,
+        output_dir=args.output_dir,
+        positions=val_positions,
+        copy_rows=args.copy_rows,
+    )
+    if not args.keep_all_cache:
+        shutil.rmtree(all_dir)
+        print(json.dumps({"event": "removed_temporary_all_cache", "path": str(all_dir)}), flush=True)
     run_meta.update(
         {
             "completed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "all": all_meta,
             "train": train_meta,
             "val": val_meta,
         }
