@@ -85,6 +85,133 @@ class HorizonTraceDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor
         return features, mask, survival, accepted_len
 
 
+class HorizonIndexedDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]):
+    def __init__(
+        self,
+        shards: list[Shard],
+        indices: np.ndarray,
+        *,
+        last_only: bool = False,
+    ) -> None:
+        self.shards = shards
+        self.indices = np.asarray(indices, dtype=np.int64)
+        self.last_only = last_only
+        self.offsets: list[int] = []
+        total = 0
+        for shard in self.shards:
+            self.offsets.append(total)
+            total += shard.rows
+        self.total_rows = total
+        first = self.shards[0]
+        self.context_window = 1 if last_only else int(first.features.shape[1])
+        self.hidden_size = int(first.features.shape[2])
+        self.num_slots = int(first.survival.shape[1])
+
+    def __len__(self) -> int:
+        return int(self.indices.shape[0])
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        global_idx = int(self.indices[idx])
+        shard_idx = bisect.bisect_right(self.offsets, global_idx) - 1
+        local_idx = global_idx - self.offsets[shard_idx]
+        shard = self.shards[shard_idx]
+        if self.last_only:
+            raw_mask = np.asarray(shard.mask[local_idx], dtype=np.float32)
+            valid = np.flatnonzero(raw_mask > 0.5)
+            feature_idx = int(valid[-1]) if valid.size else int(raw_mask.shape[0] - 1)
+            features = torch.from_numpy(
+                np.asarray(shard.features[local_idx, feature_idx : feature_idx + 1], dtype=np.float16)
+            )
+            mask = torch.ones((1,), dtype=torch.float32) if valid.size else torch.zeros((1,), dtype=torch.float32)
+        else:
+            features = torch.from_numpy(np.asarray(shard.features[local_idx], dtype=np.float16))
+            mask = torch.from_numpy(np.asarray(shard.mask[local_idx], dtype=np.float32))
+        survival = torch.from_numpy(np.asarray(shard.survival[local_idx], dtype=np.float32))
+        accepted_len = torch.tensor(float(shard.accepted_len[local_idx]), dtype=torch.float32)
+        return features, mask, survival, accepted_len
+
+
+class CompactHorizonDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]):
+    def __init__(
+        self,
+        features: np.ndarray,
+        mask: np.ndarray,
+        survival: np.ndarray,
+        accepted_len: np.ndarray,
+    ) -> None:
+        self.features = features
+        self.mask = mask
+        self.survival = survival
+        self.accepted_len = accepted_len
+        self.context_window = int(features.shape[1])
+        self.hidden_size = int(features.shape[2])
+        self.num_slots = int(survival.shape[1])
+
+    def __len__(self) -> int:
+        return int(self.accepted_len.shape[0])
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            torch.from_numpy(self.features[idx]),
+            torch.from_numpy(self.mask[idx]),
+            torch.from_numpy(self.survival[idx]),
+            torch.tensor(float(self.accepted_len[idx]), dtype=torch.float32),
+        )
+
+
+def _make_splits(
+    *,
+    total_rows: int,
+    max_total_rows: int | None,
+    calibration_rows: int,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    use_rows = total_rows if max_total_rows is None else min(total_rows, max_total_rows)
+    selected = rng.choice(total_rows, size=use_rows, replace=False)
+    rng.shuffle(selected)
+    if calibration_rows >= use_rows:
+        raise ValueError(f"calibration_rows={calibration_rows} must be smaller than selected rows={use_rows}")
+    return selected[calibration_rows:], selected[:calibration_rows]
+
+
+def _load_shards_multi(trace_dirs: list[Path]) -> list[Shard]:
+    shards: list[Shard] = []
+    for trace_dir in trace_dirs:
+        loaded, _ = _load_shards(trace_dir)
+        shards.extend(loaded)
+    if not shards:
+        raise ValueError(f"no non-empty shards found in {trace_dirs}")
+    return shards
+
+
+def _materialize_last_feature_dataset(shards: list[Shard], indices: np.ndarray) -> CompactHorizonDataset:
+    offsets: list[int] = []
+    total = 0
+    for shard in shards:
+        offsets.append(total)
+        total += shard.rows
+    input_dim = int(shards[0].features.shape[2])
+    num_slots = int(shards[0].survival.shape[1])
+    order = np.sort(np.asarray(indices, dtype=np.int64))
+    features = np.empty((order.shape[0], 1, input_dim), dtype=np.float16)
+    mask = np.empty((order.shape[0], 1), dtype=np.float32)
+    survival = np.empty((order.shape[0], num_slots), dtype=np.float32)
+    accepted = np.empty((order.shape[0],), dtype=np.float32)
+    for out_idx, global_idx in enumerate(order):
+        shard_idx = bisect.bisect_right(offsets, int(global_idx)) - 1
+        local_idx = int(global_idx) - offsets[shard_idx]
+        shard = shards[shard_idx]
+        raw_mask = np.asarray(shard.mask[local_idx], dtype=np.float32)
+        valid = np.flatnonzero(raw_mask > 0.5)
+        feature_idx = int(valid[-1]) if valid.size else int(raw_mask.shape[0] - 1)
+        features[out_idx, 0] = np.asarray(shard.features[local_idx, feature_idx], dtype=np.float16)
+        mask[out_idx, 0] = 1.0 if valid.size else 0.0
+        survival[out_idx] = np.asarray(shard.survival[local_idx], dtype=np.float32)
+        accepted[out_idx] = float(shard.accepted_len[local_idx])
+    return CompactHorizonDataset(features, mask, survival, accepted)
+
+
 class HorizonPredictor(nn.Module):
     def __init__(
         self,
@@ -106,7 +233,10 @@ class HorizonPredictor(nn.Module):
             nn.LayerNorm(proj_dim),
             nn.Dropout(dropout),
         )
-        if architecture == "gru":
+        if architecture == "last_mlp":
+            self.encoder = None
+            pooled_dim = proj_dim
+        elif architecture == "gru":
             self.encoder = nn.GRU(
                 input_size=proj_dim,
                 hidden_size=hidden_size,
@@ -144,6 +274,13 @@ class HorizonPredictor(nn.Module):
         )
 
     def forward(self, features: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        positions = torch.arange(mask.shape[1], device=mask.device).view(1, -1)
+        last_valid = (positions * (mask > 0.5)).max(dim=1).values.long()
+        if self.architecture == "last_mlp":
+            gather_idx = last_valid.view(-1, 1, 1).expand(-1, 1, features.shape[-1])
+            pooled = self.input_proj(features.float().gather(dim=1, index=gather_idx).squeeze(1))
+            return self.head(pooled)
+
         x = self.input_proj(features.float())
         x = x * mask.unsqueeze(-1)
         if self.architecture == "gru":
@@ -153,8 +290,6 @@ class HorizonPredictor(nn.Module):
                 x + self.pos_embed[:, : x.shape[1], :],
                 src_key_padding_mask=mask < 0.5,
             )
-        positions = torch.arange(mask.shape[1], device=mask.device).view(1, -1)
-        last_valid = (positions * (mask > 0.5)).max(dim=1).values.long()
         gather_idx = last_valid.view(-1, 1, 1).expand(-1, 1, encoded.shape[-1])
         pooled = encoded.gather(dim=1, index=gather_idx).squeeze(1)
         return self.head(pooled)
@@ -315,12 +450,13 @@ def _make_loader(dataset: Dataset, *, batch_size: int, shuffle: bool, num_worker
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train/evaluate a DFlashv2 horizon survival predictor.")
+    parser.add_argument("--trace-dir", type=Path, action="append", default=None)
     parser.add_argument("--train-dir", type=Path, default=None)
-    parser.add_argument("--val-dir", type=Path, required=True)
+    parser.add_argument("--val-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--eval-only", action="store_true")
-    parser.add_argument("--architecture", choices=["gru", "transformer"], default="gru")
+    parser.add_argument("--architecture", choices=["last_mlp", "gru", "transformer"], default="gru")
     parser.add_argument("--proj-dim", type=int, default=512)
     parser.add_argument("--hidden-size", type=int, default=256)
     parser.add_argument("--num-layers", type=int, default=1)
@@ -331,6 +467,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--length-loss-weight", type=float, default=0.05)
     parser.add_argument("--monotonic-weight", type=float, default=0.02)
+    parser.add_argument("--max-total-rows", type=int, default=None)
+    parser.add_argument("--calibration-rows", type=int, default=50000)
     parser.add_argument("--max-train-rows", type=int, default=None)
     parser.add_argument("--max-val-rows", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=2)
@@ -340,8 +478,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--arms", default="4,8,12,16")
     parser.add_argument("--alphas", default="0.85,0.90,0.95")
     args = parser.parse_args()
-    if not args.eval_only and args.train_dir is None:
-        parser.error("--train-dir is required unless --eval-only is set")
+    if args.trace_dir is None and args.val_dir is None:
+        parser.error("either --trace-dir or --val-dir is required")
+    if not args.eval_only and args.trace_dir is None and args.train_dir is None:
+        parser.error("--train-dir is required unless --eval-only is set when --trace-dir is not used")
     if args.eval_only and args.checkpoint is None:
         parser.error("--checkpoint is required with --eval-only")
     return args
@@ -354,8 +494,42 @@ def main() -> None:
     torch.manual_seed(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    val_ds = HorizonTraceDataset(args.val_dir, max_rows=args.max_val_rows)
-    train_ds = None if args.eval_only else HorizonTraceDataset(args.train_dir, max_rows=args.max_train_rows)
+    last_only = args.architecture == "last_mlp"
+    if args.trace_dir is not None:
+        shards = _load_shards_multi(args.trace_dir)
+        total_rows = sum(shard.rows for shard in shards)
+        if args.eval_only:
+            indices = np.arange(total_rows, dtype=np.int64)
+            val_ds = HorizonIndexedDataset(shards, indices, last_only=last_only)
+            train_ds = None
+        else:
+            train_indices, val_indices = _make_splits(
+                total_rows=total_rows,
+                max_total_rows=args.max_total_rows,
+                calibration_rows=args.calibration_rows,
+                seed=args.seed,
+            )
+            if last_only:
+                print(
+                    json.dumps(
+                        {
+                            "event": "materialize_last_features",
+                            "train_rows": int(train_indices.shape[0]),
+                            "val_rows": int(val_indices.shape[0]),
+                        }
+                    ),
+                    flush=True,
+                )
+                train_ds = _materialize_last_feature_dataset(shards, train_indices)
+                val_ds = _materialize_last_feature_dataset(shards, val_indices)
+                print(json.dumps({"event": "materialize_last_features_done"}), flush=True)
+            else:
+                train_ds = HorizonIndexedDataset(shards, train_indices, last_only=False)
+                val_ds = HorizonIndexedDataset(shards, val_indices, last_only=False)
+    else:
+        assert args.val_dir is not None
+        val_ds = HorizonTraceDataset(args.val_dir, max_rows=args.max_val_rows)
+        train_ds = None if args.eval_only else HorizonTraceDataset(args.train_dir, max_rows=args.max_train_rows)
     reference_ds = train_ds or val_ds
     arms = tuple(int(x) for x in args.arms.split(",") if x)
     alphas = tuple(float(x) for x in args.alphas.split(",") if x)
@@ -380,6 +554,7 @@ def main() -> None:
             "num_slots": reference_ds.num_slots,
             "train_rows": len(train_ds) if train_ds is not None else None,
             "val_rows": len(val_ds),
+            "last_only": last_only,
             "arms": arms,
             "alphas": alphas,
         }
