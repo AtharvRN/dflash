@@ -59,11 +59,19 @@ def _load_shards(trace_dirs: list[Path]) -> list[Shard]:
 
 
 class DFlashV2ArmDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]):
-    def __init__(self, shards: list[Shard], indices: np.ndarray, *, arms: tuple[int, ...]) -> None:
+    def __init__(
+        self,
+        shards: list[Shard],
+        indices: np.ndarray,
+        *,
+        arms: tuple[int, ...],
+        last_only: bool = False,
+    ) -> None:
         self.shards = shards
         self.indices = np.asarray(indices, dtype=np.int64)
         self.arms = tuple(sorted(arms))
         self.budgets = np.asarray([arm - 1 for arm in self.arms], dtype=np.float32)
+        self.last_only = last_only
         self.offsets: list[int] = []
         total = 0
         for shard in self.shards:
@@ -71,7 +79,7 @@ class DFlashV2ArmDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor,
             total += shard.rows
         self.total_rows = total
         first = self.shards[0]
-        self.context_window = int(first.features.shape[1])
+        self.context_window = 1 if last_only else int(first.features.shape[1])
         self.input_dim = int(first.features.shape[2])
 
     def __len__(self) -> int:
@@ -91,11 +99,87 @@ class DFlashV2ArmDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor,
         global_idx = int(self.indices[idx])
         shard, local_idx = self._locate(global_idx)
         accepted_len = float(shard.accepted_len[local_idx])
-        features = torch.from_numpy(np.asarray(shard.features[local_idx], dtype=np.float16))
-        mask = torch.from_numpy(np.asarray(shard.mask[local_idx], dtype=np.float32))
+        if self.last_only:
+            raw_mask = np.asarray(shard.mask[local_idx], dtype=np.float32)
+            valid = np.flatnonzero(raw_mask > 0.5)
+            feature_idx = int(valid[-1]) if valid.size else int(raw_mask.shape[0] - 1)
+            features = torch.from_numpy(
+                np.asarray(shard.features[local_idx, feature_idx : feature_idx + 1], dtype=np.float16)
+            )
+            mask = torch.ones((1,), dtype=torch.float32) if valid.size else torch.zeros((1,), dtype=torch.float32)
+        else:
+            features = torch.from_numpy(np.asarray(shard.features[local_idx], dtype=np.float16))
+            mask = torch.from_numpy(np.asarray(shard.mask[local_idx], dtype=np.float32))
         target_idx = torch.tensor(self._target_idx(accepted_len), dtype=torch.long)
         accepted = torch.tensor(accepted_len, dtype=torch.float32)
         return features, mask, target_idx, accepted
+
+
+class CompactArmDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]):
+    def __init__(
+        self,
+        features: np.ndarray,
+        mask: np.ndarray,
+        target_idx: np.ndarray,
+        accepted_len: np.ndarray,
+    ) -> None:
+        self.features = features
+        self.mask = mask
+        self.target_idx = target_idx
+        self.accepted_len = accepted_len
+        self.context_window = int(features.shape[1])
+        self.input_dim = int(features.shape[2])
+
+    def __len__(self) -> int:
+        return int(self.target_idx.shape[0])
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            torch.from_numpy(self.features[idx]),
+            torch.from_numpy(self.mask[idx]),
+            torch.tensor(int(self.target_idx[idx]), dtype=torch.long),
+            torch.tensor(float(self.accepted_len[idx]), dtype=torch.float32),
+        )
+
+
+def _target_idx_from_accepted(accepted_len: float, budgets: np.ndarray) -> int:
+    ok = budgets >= float(accepted_len)
+    if ok.any():
+        return int(ok.argmax())
+    return int(len(budgets) - 1)
+
+
+def _materialize_last_feature_dataset(
+    shards: list[Shard],
+    indices: np.ndarray,
+    *,
+    arms: tuple[int, ...],
+) -> CompactArmDataset:
+    offsets: list[int] = []
+    total = 0
+    for shard in shards:
+        offsets.append(total)
+        total += shard.rows
+    input_dim = int(shards[0].features.shape[2])
+    budgets = np.asarray([arm - 1 for arm in sorted(arms)], dtype=np.float32)
+    order = np.sort(np.asarray(indices, dtype=np.int64))
+    features = np.empty((order.shape[0], 1, input_dim), dtype=np.float16)
+    mask = np.empty((order.shape[0], 1), dtype=np.float32)
+    target_idx = np.empty((order.shape[0],), dtype=np.int64)
+    accepted = np.empty((order.shape[0],), dtype=np.float32)
+    for out_idx, global_idx in enumerate(order):
+        shard_idx = bisect.bisect_right(offsets, int(global_idx)) - 1
+        local_idx = int(global_idx) - offsets[shard_idx]
+        shard = shards[shard_idx]
+        raw_mask = np.asarray(shard.mask[local_idx], dtype=np.float32)
+        valid = np.flatnonzero(raw_mask > 0.5)
+        feature_idx = int(valid[-1]) if valid.size else int(raw_mask.shape[0] - 1)
+        features[out_idx, 0] = np.asarray(shard.features[local_idx, feature_idx], dtype=np.float16)
+        mask[out_idx, 0] = 1.0 if valid.size else 0.0
+        accepted_len = float(shard.accepted_len[local_idx])
+        accepted[out_idx] = accepted_len
+        target_idx[out_idx] = _target_idx_from_accepted(accepted_len, budgets)
+    return CompactArmDataset(features, mask, target_idx, accepted)
 
 
 class ArmClassifier(nn.Module):
@@ -119,7 +203,10 @@ class ArmClassifier(nn.Module):
             nn.LayerNorm(proj_dim),
             nn.Dropout(dropout),
         )
-        if architecture == "gru":
+        if architecture == "last_mlp":
+            self.encoder = None
+            pooled_dim = proj_dim
+        elif architecture == "gru":
             self.encoder = nn.GRU(
                 input_size=proj_dim,
                 hidden_size=hidden_size,
@@ -157,6 +244,13 @@ class ArmClassifier(nn.Module):
         )
 
     def forward(self, features: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        positions = torch.arange(mask.shape[1], device=mask.device).view(1, -1)
+        last_valid = (positions * (mask > 0.5)).max(dim=1).values.long()
+        if self.architecture == "last_mlp":
+            gather_idx = last_valid.view(-1, 1, 1).expand(-1, 1, features.shape[-1])
+            pooled = self.input_proj(features.float().gather(dim=1, index=gather_idx).squeeze(1))
+            return self.head(pooled)
+
         x = self.input_proj(features.float())
         x = x * mask.unsqueeze(-1)
         if self.architecture == "gru":
@@ -166,8 +260,6 @@ class ArmClassifier(nn.Module):
                 x + self.pos_embed[:, : x.shape[1], :],
                 src_key_padding_mask=mask < 0.5,
             )
-        positions = torch.arange(mask.shape[1], device=mask.device).view(1, -1)
-        last_valid = (positions * (mask > 0.5)).max(dim=1).values.long()
         gather_idx = last_valid.view(-1, 1, 1).expand(-1, 1, encoded.shape[-1])
         pooled = encoded.gather(dim=1, index=gather_idx).squeeze(1)
         return self.head(pooled)
@@ -385,7 +477,7 @@ def _make_loader(dataset: Dataset, *, batch_size: int, shuffle: bool, num_worker
     )
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def _collect_logits(
     model: nn.Module,
     loader: DataLoader,
@@ -396,8 +488,8 @@ def _collect_logits(
     logits_chunks: list[torch.Tensor] = []
     target_chunks: list[torch.Tensor] = []
     for features, mask, target_idx, _ in loader:
-        logits_chunks.append(model(features.to(device), mask.to(device)).detach().cpu())
-        target_chunks.append(target_idx)
+        logits_chunks.append(model(features.to(device), mask.to(device)).detach().cpu().clone())
+        target_chunks.append(target_idx.detach().cpu().clone())
     return torch.cat(logits_chunks), torch.cat(target_chunks)
 
 
@@ -426,7 +518,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--arms", type=_parse_ints, default=(4, 8, 12, 16))
     parser.add_argument("--max-total-rows", type=int, default=None)
     parser.add_argument("--calibration-rows", type=int, default=50000)
-    parser.add_argument("--architecture", choices=["gru", "transformer"], default="gru")
+    parser.add_argument("--architecture", choices=["last_mlp", "gru", "transformer"], default="gru")
     parser.add_argument("--proj-dim", type=int, default=512)
     parser.add_argument("--hidden-size", type=int, default=256)
     parser.add_argument("--num-layers", type=int, default=1)
@@ -463,16 +555,35 @@ def main() -> None:
         calibration_rows=args.calibration_rows,
         seed=args.seed,
     )
-    train_ds = DFlashV2ArmDataset(shards, train_indices, arms=arms)
-    cal_ds = DFlashV2ArmDataset(shards, cal_indices, arms=arms)
+    last_only = args.architecture == "last_mlp"
+    if last_only:
+        print(
+            json.dumps(
+                {
+                    "event": "materialize_last_features",
+                    "train_rows": int(train_indices.shape[0]),
+                    "calibration_rows": int(cal_indices.shape[0]),
+                }
+            ),
+            flush=True,
+        )
+        train_ds = _materialize_last_feature_dataset(shards, train_indices, arms=arms)
+        cal_ds = _materialize_last_feature_dataset(shards, cal_indices, arms=arms)
+        print(json.dumps({"event": "materialize_last_features_done"}), flush=True)
+    else:
+        train_ds = DFlashV2ArmDataset(shards, train_indices, arms=arms, last_only=False)
+        cal_ds = DFlashV2ArmDataset(shards, cal_indices, arms=arms, last_only=False)
     train_loader = _make_loader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     cal_loader = _make_loader(cal_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     class_weights = None
-    target_hist = np.zeros(len(arms), dtype=np.int64)
-    for _, _, target_idx, _ in _make_loader(cal_ds, batch_size=args.batch_size, shuffle=False, num_workers=0):
-        target_hist += np.bincount(target_idx.numpy(), minlength=len(arms))
+    if isinstance(cal_ds, CompactArmDataset):
+        target_hist = np.bincount(cal_ds.target_idx, minlength=len(arms)).astype(np.int64)
+    else:
+        target_hist = np.zeros(len(arms), dtype=np.int64)
+        for _, _, target_idx, _ in _make_loader(cal_ds, batch_size=args.batch_size, shuffle=False, num_workers=0):
+            target_hist += np.bincount(target_idx.numpy(), minlength=len(arms))
     if args.class_weight_power > 0:
         freq = torch.tensor(target_hist, dtype=torch.float32).clamp_min(1.0)
         class_weights = (freq.sum() / freq).pow(args.class_weight_power)
@@ -498,6 +609,7 @@ def main() -> None:
             "calibration_rows": len(cal_ds),
             "input_dim": train_ds.input_dim,
             "context_window": train_ds.context_window,
+            "last_only": last_only,
             "arms": arms,
             "budgets": [arm - 1 for arm in arms],
             "calibration_target_hist": target_hist.tolist(),
