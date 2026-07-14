@@ -87,6 +87,9 @@ def main() -> None:
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config = checkpoint["config"]
+    has_aux_arm_head = any(
+        key.startswith("aux_arm_head.") for key in checkpoint["model_state_dict"]
+    )
     model = HorizonPredictor(
         input_dim=int(config["input_dim"]),
         proj_dim=int(config["proj_dim"]),
@@ -96,6 +99,7 @@ def main() -> None:
         num_layers=int(config["num_layers"]),
         dropout=float(config["dropout"]),
         context_window=reference.context_window,
+        num_arms=len(arms) if has_aux_arm_head else 0,
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
 

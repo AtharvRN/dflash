@@ -212,6 +212,21 @@ def _materialize_last_feature_dataset(shards: list[Shard], indices: np.ndarray) 
     return CompactHorizonDataset(features, mask, survival, accepted)
 
 
+def _oracle_arm_idx(accepted_len: torch.Tensor, *, arms: tuple[int, ...]) -> torch.Tensor:
+    budgets = torch.tensor([arm - 1 for arm in arms], dtype=torch.float32, device=accepted_len.device)
+    ok = budgets.view(1, -1) >= accepted_len.view(-1, 1)
+    fallback = torch.full((accepted_len.shape[0],), len(arms) - 1, dtype=torch.long, device=accepted_len.device)
+    return torch.where(ok.any(dim=1), ok.float().argmax(dim=1), fallback)
+
+
+def _survival_weights(num_slots: int, *, boundary_ks: tuple[int, ...], boundary_weight: float) -> torch.Tensor:
+    weights = torch.ones((num_slots,), dtype=torch.float32)
+    for k in boundary_ks:
+        if 1 <= k <= num_slots:
+            weights[k - 1] = float(boundary_weight)
+    return weights / weights.mean().clamp_min(1e-6)
+
+
 class HorizonPredictor(nn.Module):
     def __init__(
         self,
@@ -224,6 +239,7 @@ class HorizonPredictor(nn.Module):
         num_layers: int,
         dropout: float,
         context_window: int,
+        num_arms: int = 0,
     ) -> None:
         super().__init__()
         self.architecture = architecture
@@ -272,14 +288,23 @@ class HorizonPredictor(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_size // 2, num_slots),
         )
+        self.aux_arm_head = (
+            nn.Sequential(
+                nn.Linear(pooled_dim, hidden_size),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_size, num_arms),
+            )
+            if num_arms > 0
+            else None
+        )
 
-    def forward(self, features: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def encode(self, features: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         positions = torch.arange(mask.shape[1], device=mask.device).view(1, -1)
         last_valid = (positions * (mask > 0.5)).max(dim=1).values.long()
         if self.architecture == "last_mlp":
             gather_idx = last_valid.view(-1, 1, 1).expand(-1, 1, features.shape[-1])
-            pooled = self.input_proj(features.float().gather(dim=1, index=gather_idx).squeeze(1))
-            return self.head(pooled)
+            return self.input_proj(features.float().gather(dim=1, index=gather_idx).squeeze(1))
 
         x = self.input_proj(features.float())
         x = x * mask.unsqueeze(-1)
@@ -291,8 +316,15 @@ class HorizonPredictor(nn.Module):
                 src_key_padding_mask=mask < 0.5,
             )
         gather_idx = last_valid.view(-1, 1, 1).expand(-1, 1, encoded.shape[-1])
-        pooled = encoded.gather(dim=1, index=gather_idx).squeeze(1)
-        return self.head(pooled)
+        return encoded.gather(dim=1, index=gather_idx).squeeze(1)
+
+    def forward(self, features: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        return self.head(self.encode(features, mask))
+
+    def forward_with_aux(self, features: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        pooled = self.encode(features, mask)
+        aux_logits = None if self.aux_arm_head is None else self.aux_arm_head(pooled)
+        return self.head(pooled), aux_logits
 
 
 def _monotonicize(probs: torch.Tensor) -> torch.Tensor:
@@ -402,6 +434,9 @@ def train_epoch(
     device: torch.device,
     length_loss_weight: float,
     monotonic_weight: float,
+    survival_weights: torch.Tensor | None,
+    aux_arm_weight: float,
+    arms: tuple[int, ...],
 ) -> dict[str, float]:
     model.train()
     totals: dict[str, float] = {}
@@ -411,13 +446,28 @@ def train_epoch(
         mask = mask.to(device, non_blocking=True)
         survival = survival.to(device, non_blocking=True)
         accepted_len = accepted_len.to(device, non_blocking=True)
-        logits = model(features, mask)
-        bce = F.binary_cross_entropy_with_logits(logits, survival)
+        logits, aux_logits = model.forward_with_aux(features, mask)
+        if survival_weights is None:
+            bce = F.binary_cross_entropy_with_logits(logits, survival)
+        else:
+            bce_raw = F.binary_cross_entropy_with_logits(logits, survival, reduction="none")
+            bce = (bce_raw * survival_weights.view(1, -1)).mean()
         probs = torch.sigmoid(logits)
         expected_len = probs.sum(dim=1)
         length_loss = F.smooth_l1_loss(expected_len, accepted_len)
         monotonic_loss = F.relu(probs[:, 1:] - probs[:, :-1]).mean()
-        loss = bce + length_loss_weight * length_loss + monotonic_weight * monotonic_loss
+        aux_arm_loss = torch.zeros((), dtype=logits.dtype, device=logits.device)
+        aux_arm_acc = torch.zeros((), dtype=logits.dtype, device=logits.device)
+        if aux_logits is not None and aux_arm_weight > 0:
+            target_arm_idx = _oracle_arm_idx(accepted_len, arms=arms)
+            aux_arm_loss = F.cross_entropy(aux_logits, target_arm_idx)
+            aux_arm_acc = (aux_logits.argmax(dim=-1) == target_arm_idx).float().mean()
+        loss = (
+            bce
+            + length_loss_weight * length_loss
+            + monotonic_weight * monotonic_loss
+            + aux_arm_weight * aux_arm_loss
+        )
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -431,6 +481,8 @@ def train_epoch(
             "bce": bce,
             "length_loss": length_loss,
             "monotonic_loss": monotonic_loss,
+            "aux_arm_loss": aux_arm_loss,
+            "aux_arm_accuracy": aux_arm_acc,
             "expected_len_mae": (expected_len - accepted_len).abs().mean(),
         }.items():
             totals[key] = totals.get(key, 0.0) + float(value.detach().item()) * batch
@@ -467,6 +519,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--length-loss-weight", type=float, default=0.05)
     parser.add_argument("--monotonic-weight", type=float, default=0.02)
+    parser.add_argument("--boundary-weight", type=float, default=1.0)
+    parser.add_argument("--boundary-ks", default="4,8,12,15")
+    parser.add_argument("--aux-arm-weight", type=float, default=0.0)
     parser.add_argument("--max-total-rows", type=int, default=None)
     parser.add_argument("--calibration-rows", type=int, default=50000)
     parser.add_argument("--max-train-rows", type=int, default=None)
@@ -533,6 +588,7 @@ def main() -> None:
     reference_ds = train_ds or val_ds
     arms = tuple(int(x) for x in args.arms.split(",") if x)
     alphas = tuple(float(x) for x in args.alphas.split(",") if x)
+    boundary_ks = tuple(int(x) for x in args.boundary_ks.split(",") if x)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     model = HorizonPredictor(
@@ -544,6 +600,7 @@ def main() -> None:
         num_layers=args.num_layers,
         dropout=args.dropout,
         context_window=reference_ds.context_window,
+        num_arms=len(arms) if args.aux_arm_weight > 0 else 0,
     ).to(device)
 
     config = vars(args).copy()
@@ -557,6 +614,7 @@ def main() -> None:
             "last_only": last_only,
             "arms": arms,
             "alphas": alphas,
+            "boundary_ks": boundary_ks,
         }
     )
 
@@ -593,6 +651,13 @@ def main() -> None:
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     (args.output_dir / "config.json").write_text(json.dumps(config, indent=2, default=str) + "\n")
+    survival_weight_tensor = None
+    if args.boundary_weight != 1.0:
+        survival_weight_tensor = _survival_weights(
+            reference_ds.num_slots,
+            boundary_ks=boundary_ks,
+            boundary_weight=args.boundary_weight,
+        ).to(device)
 
     best = math.inf
     for epoch in range(1, args.epochs + 1):
@@ -603,6 +668,9 @@ def main() -> None:
             device=device,
             length_loss_weight=args.length_loss_weight,
             monotonic_weight=args.monotonic_weight,
+            survival_weights=survival_weight_tensor,
+            aux_arm_weight=args.aux_arm_weight,
+            arms=arms,
         )
         val_metrics = evaluate(
             model,
