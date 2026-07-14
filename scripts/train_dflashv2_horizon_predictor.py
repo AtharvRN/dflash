@@ -212,6 +212,33 @@ def _materialize_last_feature_dataset(shards: list[Shard], indices: np.ndarray) 
     return CompactHorizonDataset(features, mask, survival, accepted)
 
 
+def _compact_cache_ready(cache_dir: Path) -> bool:
+    required = (
+        cache_dir / "features.npy",
+        cache_dir / "mask.npy",
+        cache_dir / "survival.npy",
+        cache_dir / "accepted_len.npy",
+    )
+    return all(path.exists() for path in required)
+
+
+def _save_compact_dataset(dataset: CompactHorizonDataset, cache_dir: Path) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    np.save(cache_dir / "features.npy", dataset.features)
+    np.save(cache_dir / "mask.npy", dataset.mask)
+    np.save(cache_dir / "survival.npy", dataset.survival)
+    np.save(cache_dir / "accepted_len.npy", dataset.accepted_len)
+
+
+def _load_compact_dataset(cache_dir: Path) -> CompactHorizonDataset:
+    return CompactHorizonDataset(
+        np.load(cache_dir / "features.npy", mmap_mode="r"),
+        np.load(cache_dir / "mask.npy", mmap_mode="r"),
+        np.load(cache_dir / "survival.npy", mmap_mode="r"),
+        np.load(cache_dir / "accepted_len.npy", mmap_mode="r"),
+    )
+
+
 def _oracle_arm_idx(accepted_len: torch.Tensor, *, arms: tuple[int, ...]) -> torch.Tensor:
     budgets = torch.tensor([arm - 1 for arm in arms], dtype=torch.float32, device=accepted_len.device)
     ok = budgets.view(1, -1) >= accepted_len.view(-1, 1)
@@ -570,6 +597,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--aux-arm-weight", type=float, default=0.0)
     parser.add_argument("--max-total-rows", type=int, default=None)
     parser.add_argument("--calibration-rows", type=int, default=50000)
+    parser.add_argument("--compact-cache-dir", type=Path, default=None)
     parser.add_argument("--max-train-rows", type=int, default=None)
     parser.add_argument("--max-val-rows", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=2)
@@ -603,13 +631,43 @@ def main() -> None:
 
     last_only = args.architecture == "last_mlp"
     if args.trace_dir is not None:
-        shards = _load_shards_multi(args.trace_dir)
-        total_rows = sum(shard.rows for shard in shards)
+        cache_ready = (
+            last_only
+            and not args.eval_only
+            and args.compact_cache_dir is not None
+            and _compact_cache_ready(args.compact_cache_dir / "train")
+            and _compact_cache_ready(args.compact_cache_dir / "val")
+        )
+        if cache_ready:
+            print(
+                json.dumps(
+                    {
+                        "event": "load_compact_cache",
+                        "cache_dir": str(args.compact_cache_dir),
+                    }
+                ),
+                flush=True,
+            )
+            train_ds = _load_compact_dataset(args.compact_cache_dir / "train")
+            val_ds = _load_compact_dataset(args.compact_cache_dir / "val")
+        else:
+            print(
+                json.dumps(
+                    {
+                        "event": "load_shards_start",
+                        "trace_dirs": [str(path) for path in args.trace_dir],
+                    }
+                ),
+                flush=True,
+            )
+            shards = _load_shards_multi(args.trace_dir)
+            total_rows = sum(shard.rows for shard in shards)
+            print(json.dumps({"event": "load_shards_done", "total_rows": total_rows}), flush=True)
         if args.eval_only:
             indices = np.arange(total_rows, dtype=np.int64)
             val_ds = HorizonIndexedDataset(shards, indices, last_only=last_only)
             train_ds = None
-        else:
+        elif not cache_ready:
             train_indices, val_indices = _make_splits(
                 total_rows=total_rows,
                 max_total_rows=args.max_total_rows,
@@ -617,19 +675,60 @@ def main() -> None:
                 seed=args.seed,
             )
             if last_only:
-                print(
-                    json.dumps(
-                        {
-                            "event": "materialize_last_features",
-                            "train_rows": int(train_indices.shape[0]),
-                            "val_rows": int(val_indices.shape[0]),
-                        }
-                    ),
-                    flush=True,
-                )
-                train_ds = _materialize_last_feature_dataset(shards, train_indices)
-                val_ds = _materialize_last_feature_dataset(shards, val_indices)
-                print(json.dumps({"event": "materialize_last_features_done"}), flush=True)
+                cache_meta = {
+                    "trace_dirs": [str(path) for path in args.trace_dir],
+                    "total_rows": int(total_rows),
+                    "max_total_rows": args.max_total_rows,
+                    "calibration_rows": int(args.calibration_rows),
+                    "seed": int(args.seed),
+                    "train_rows": int(train_indices.shape[0]),
+                    "val_rows": int(val_indices.shape[0]),
+                }
+                if (
+                    args.compact_cache_dir is not None
+                    and _compact_cache_ready(args.compact_cache_dir / "train")
+                    and _compact_cache_ready(args.compact_cache_dir / "val")
+                ):
+                    print(
+                        json.dumps(
+                            {
+                                "event": "load_compact_cache",
+                                "cache_dir": str(args.compact_cache_dir),
+                            }
+                        ),
+                        flush=True,
+                    )
+                    train_ds = _load_compact_dataset(args.compact_cache_dir / "train")
+                    val_ds = _load_compact_dataset(args.compact_cache_dir / "val")
+                else:
+                    print(
+                        json.dumps(
+                            {
+                                "event": "materialize_last_features",
+                                "train_rows": int(train_indices.shape[0]),
+                                "val_rows": int(val_indices.shape[0]),
+                            }
+                        ),
+                        flush=True,
+                    )
+                    train_ds = _materialize_last_feature_dataset(shards, train_indices)
+                    val_ds = _materialize_last_feature_dataset(shards, val_indices)
+                    if args.compact_cache_dir is not None:
+                        print(
+                            json.dumps(
+                                {
+                                    "event": "save_compact_cache",
+                                    "cache_dir": str(args.compact_cache_dir),
+                                }
+                            ),
+                            flush=True,
+                        )
+                        _save_compact_dataset(train_ds, args.compact_cache_dir / "train")
+                        _save_compact_dataset(val_ds, args.compact_cache_dir / "val")
+                        (args.compact_cache_dir / "meta.json").write_text(
+                            json.dumps(cache_meta, indent=2, default=str) + "\n"
+                        )
+                    print(json.dumps({"event": "materialize_last_features_done"}), flush=True)
             else:
                 train_ds = HorizonIndexedDataset(shards, train_indices, last_only=False)
                 val_ds = HorizonIndexedDataset(shards, val_indices, last_only=False)

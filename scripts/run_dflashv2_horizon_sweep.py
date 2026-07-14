@@ -51,6 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--monotonic-weight", type=float, default=0.02)
     parser.add_argument("--max-total-rows", type=int, default=None)
     parser.add_argument("--calibration-rows", type=int, default=50000)
+    parser.add_argument("--compact-cache-dir", type=Path, default=None)
     parser.add_argument("--selection-min-retention", type=float, default=0.95)
     parser.add_argument("--arms", default="4,8,12,16")
     parser.add_argument("--alphas", default=DEFAULT_ALPHAS)
@@ -64,6 +65,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     args.output_root.mkdir(parents=True, exist_ok=True)
+    compact_cache_dir = args.compact_cache_dir or (args.output_root / "_compact_last_features")
     rows: list[dict[str, Any]] = []
 
     for boundary_weight, aux_arm_weight in itertools.product(args.boundary_weights, args.aux_arm_weights):
@@ -105,6 +107,8 @@ def main() -> None:
             str(aux_arm_weight),
             "--calibration-rows",
             str(args.calibration_rows),
+            "--compact-cache-dir",
+            str(compact_cache_dir),
             "--num-workers",
             str(args.num_workers),
             "--seed",
