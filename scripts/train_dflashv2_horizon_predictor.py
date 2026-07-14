@@ -371,6 +371,44 @@ def _policy_metrics(
     }
 
 
+def _select_alpha_metrics(
+    metrics: dict[str, float],
+    *,
+    alphas: tuple[float, ...],
+    min_retention: float,
+) -> dict[str, float]:
+    candidates: list[dict[str, float]] = []
+    for alpha in alphas:
+        prefix = f"alpha{alpha:.2f}"
+        candidates.append(
+            {
+                "alpha": float(alpha),
+                "mean_block": float(metrics[f"{prefix}_mean_block"]),
+                "mean_budget": float(metrics[f"{prefix}_mean_budget"]),
+                "mean_accepted": float(metrics[f"{prefix}_mean_accepted"]),
+                "accept_retention": float(metrics[f"{prefix}_accept_retention"]),
+                "accept_ratio": float(metrics[f"{prefix}_accept_ratio"]),
+            }
+        )
+    feasible = [item for item in candidates if item["accept_retention"] >= min_retention]
+    if feasible:
+        selected = max(feasible, key=lambda item: (item["accept_ratio"], item["mean_accepted"], -item["mean_block"]))
+        feasible_flag = 1.0
+    else:
+        selected = max(candidates, key=lambda item: (item["accept_retention"], item["accept_ratio"]))
+        feasible_flag = 0.0
+    return {
+        "selected_alpha": selected["alpha"],
+        "selected_mean_block": selected["mean_block"],
+        "selected_mean_budget": selected["mean_budget"],
+        "selected_mean_accepted": selected["mean_accepted"],
+        "selected_accept_retention": selected["accept_retention"],
+        "selected_accept_ratio": selected["accept_ratio"],
+        "selected_min_retention": float(min_retention),
+        "selected_feasible": feasible_flag,
+    }
+
+
 @torch.inference_mode()
 def evaluate(
     model: nn.Module,
@@ -380,6 +418,7 @@ def evaluate(
     monotonicize: bool,
     arms: tuple[int, ...],
     alphas: tuple[float, ...],
+    selection_min_retention: float,
 ) -> dict[str, float]:
     model.eval()
     logits_all: list[torch.Tensor] = []
@@ -423,6 +462,13 @@ def evaluate(
             metrics[f"auroc_h_ge_{k}"] = _roc_auc(probs[:, k - 1], survival[:, k - 1])
     for alpha in alphas:
         metrics.update(_policy_metrics(probs, accepted_len, arms=arms, alpha=alpha))
+    metrics.update(
+        _select_alpha_metrics(
+            metrics,
+            alphas=alphas,
+            min_retention=selection_min_retention,
+        )
+    )
     return metrics
 
 
@@ -532,6 +578,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--monotonicize-eval", action="store_true")
     parser.add_argument("--arms", default="4,8,12,16")
     parser.add_argument("--alphas", default="0.85,0.90,0.95")
+    parser.add_argument("--selection-min-retention", type=float, default=0.95)
+    parser.add_argument(
+        "--checkpoint-selection",
+        choices=["expected_len_mae", "selected_accept_ratio"],
+        default="expected_len_mae",
+    )
     args = parser.parse_args()
     if args.trace_dir is None and args.val_dir is None:
         parser.error("either --trace-dir or --val-dir is required")
@@ -637,6 +689,7 @@ def main() -> None:
             monotonicize=args.monotonicize_eval,
             arms=arms,
             alphas=alphas,
+            selection_min_retention=args.selection_min_retention,
         )
         (args.output_dir / "eval_metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
         print(json.dumps(metrics, indent=2), flush=True)
@@ -660,6 +713,7 @@ def main() -> None:
         ).to(device)
 
     best = math.inf
+    best_score = -math.inf
     for epoch in range(1, args.epochs + 1):
         train_metrics = train_epoch(
             model,
@@ -679,19 +733,36 @@ def main() -> None:
             monotonicize=args.monotonicize_eval,
             arms=arms,
             alphas=alphas,
+            selection_min_retention=args.selection_min_retention,
         )
         record = {"epoch": epoch, "train": train_metrics, "val": val_metrics}
         with (args.output_dir / "metrics.jsonl").open("a") as f:
             f.write(json.dumps(record) + "\n")
         print(json.dumps(record, sort_keys=True), flush=True)
-        if val_metrics["expected_len_mae"] < best:
-            best = val_metrics["expected_len_mae"]
+        if args.checkpoint_selection == "expected_len_mae":
+            is_best = val_metrics["expected_len_mae"] < best
+            if is_best:
+                best = val_metrics["expected_len_mae"]
+                best_score = -best
+        else:
+            score = (
+                val_metrics["selected_accept_ratio"]
+                if val_metrics["selected_feasible"] > 0.5
+                else -1.0 + val_metrics["selected_accept_retention"]
+            )
+            is_best = score > best_score
+            if is_best:
+                best_score = score
+                best = val_metrics["expected_len_mae"]
+        if is_best:
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
                     "config": config,
                     "epoch": epoch,
                     "val_metrics": val_metrics,
+                    "checkpoint_selection": args.checkpoint_selection,
+                    "checkpoint_score": best_score,
                 },
                 args.output_dir / "best.pt",
             )

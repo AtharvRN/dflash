@@ -16,7 +16,6 @@ from scripts.train_dflashv2_horizon_predictor import (
     HorizonPredictor,
     HorizonTraceDataset,
     _make_loader,
-    _monotonicize,
     evaluate,
 )
 
@@ -73,6 +72,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--monotonicize-eval", action="store_true")
     parser.add_argument("--arms", default="4,8,12,16")
     parser.add_argument("--alphas", default="0.80,0.85,0.90,0.95")
+    parser.add_argument("--selection-min-retention", type=float, default=0.95)
     return parser.parse_args()
 
 
@@ -116,6 +116,7 @@ def main() -> None:
         monotonicize=args.monotonicize_eval,
         arms=arms,
         alphas=alphas,
+        selection_min_retention=args.selection_min_retention,
     )
 
     oracle_loader = _make_loader(
@@ -130,6 +131,7 @@ def main() -> None:
         "rows": len(dataset),
         "arms": arms,
         "alphas": alphas,
+        "selection_min_retention": args.selection_min_retention,
         "metrics": metrics,
         "oracle": _oracle_metrics(oracle_loader, arms=arms),
     }
