@@ -136,6 +136,8 @@ def _build_sequence_index(
     *,
     seed: int,
     val_fraction: float,
+    max_train_sequences: int | None,
+    max_val_sequences: int | None,
 ) -> tuple[SequenceIndex, SequenceIndex]:
     source_parts: list[np.ndarray] = []
     row_parts: list[np.ndarray] = []
@@ -166,6 +168,10 @@ def _build_sequence_index(
     val_count = max(1, int(round(sequence_ids.shape[0] * val_fraction)))
     val_seq_idx = np.sort(perm[:val_count])
     train_seq_idx = np.sort(perm[val_count:])
+    if max_train_sequences is not None:
+        train_seq_idx = np.sort(train_seq_idx[:max_train_sequences])
+    if max_val_sequences is not None:
+        val_seq_idx = np.sort(val_seq_idx[:max_val_sequences])
 
     def make(seq_idx: np.ndarray) -> SequenceIndex:
         return SequenceIndex(
@@ -402,6 +408,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--boundary-ks", type=_parse_ints, default=(4, 8, 12, 15))
     parser.add_argument("--aux-arm-weight", type=float, default=0.1)
     parser.add_argument("--val-fraction", type=float, default=0.05)
+    parser.add_argument("--max-train-sequences", type=int, default=None)
+    parser.add_argument("--max-val-sequences", type=int, default=None)
     parser.add_argument("--max-seq-len", type=int, default=None)
     parser.add_argument("--arms", type=_parse_ints, default=(4, 8, 12, 16))
     parser.add_argument("--alphas", type=_parse_floats, default=(0.80, 0.82, 0.84, 0.86, 0.88, 0.90, 0.92, 0.94, 0.95, 0.96, 0.98))
@@ -422,7 +430,13 @@ def main() -> None:
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
 
     sources, input_dim, num_slots = _load_compact_sources(args.compact_cache_dir)
-    train_index, val_index = _build_sequence_index(sources, seed=args.seed, val_fraction=args.val_fraction)
+    train_index, val_index = _build_sequence_index(
+        sources,
+        seed=args.seed,
+        val_fraction=args.val_fraction,
+        max_train_sequences=args.max_train_sequences,
+        max_val_sequences=args.max_val_sequences,
+    )
     train_ds = CompactSequenceDataset(sources, train_index, max_seq_len=args.max_seq_len)
     val_ds = CompactSequenceDataset(sources, val_index, max_seq_len=args.max_seq_len)
     train_loader = DataLoader(
