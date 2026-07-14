@@ -130,7 +130,7 @@ def _materialize_split(
                             "split": name,
                             "shard": str(shard.path),
                             "shard_index": shard_idx,
-                            "split_rows_done": int(out_idx + 1),
+                            "split_rows_done": int(left + processed),
                             "split_rows_total": int(order.shape[0]),
                             "shard_rows_done": int(processed),
                             "shard_rows_total": int(local_indices.shape[0]),
