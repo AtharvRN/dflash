@@ -22,7 +22,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from dflash.benchmark import _apply_chat_template, _get_transformers_attn_impl, load_and_process_dataset
 from dflash.dynamic import dflash_generate_dynamic
 from dflash.model import DFlashDraftModel, dflash_generate
-from dflash.policy import DFlashSurvivalBlockPolicy
+from dflash.policy import DFlashSurvivalBlockPolicy, DFlashV2HorizonBlockPolicy
 
 
 def _parse_ints(value: str) -> tuple[int, ...]:
@@ -85,6 +85,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="Qwen/Qwen3-4B")
     parser.add_argument("--draft-model", default="z-lab/Qwen3-4B-DFlash-b16")
     parser.add_argument("--policy-checkpoint", type=Path, required=True)
+    parser.add_argument("--policy-kind", choices=["survival", "horizon_v2"], default="survival")
     parser.add_argument("--dataset", default="gsm8k")
     parser.add_argument("--max-samples", type=int, default=100)
     parser.add_argument("--max-new-tokens", type=int, default=128)
@@ -140,18 +141,24 @@ def main() -> None:
     fixed_responses: list[Any] = []
     dynamic_responses: dict[str, list[Any]] = {str(alpha): [] for alpha in args.alphas}
 
-    policies = {
-        str(alpha): DFlashSurvivalBlockPolicy(
-            checkpoint_path=args.policy_checkpoint,
-            arms=args.arms,
-            alpha=alpha,
-            monotonicize_probs=True,
-            internal_feature_dim=128,
-            internal_feature_window=16,
-            internal_feature_seed=0,
-        )
-        for alpha in args.alphas
-    }
+    policy_cls = DFlashV2HorizonBlockPolicy if args.policy_kind == "horizon_v2" else DFlashSurvivalBlockPolicy
+    policies = {}
+    for alpha in args.alphas:
+        kwargs: dict[str, Any] = {
+            "checkpoint_path": args.policy_checkpoint,
+            "arms": args.arms,
+            "alpha": alpha,
+            "monotonicize_probs": True,
+        }
+        if args.policy_kind == "survival":
+            kwargs.update(
+                {
+                    "internal_feature_dim": 128,
+                    "internal_feature_window": 16,
+                    "internal_feature_seed": 0,
+                }
+            )
+        policies[str(alpha)] = policy_cls(**kwargs)
 
     for instance in tqdm(dataset, desc="runtime alpha sweep"):
         messages = []
@@ -192,6 +199,7 @@ def main() -> None:
         "model": args.model,
         "draft_model": args.draft_model,
         "policy_checkpoint": str(args.policy_checkpoint),
+        "policy_kind": args.policy_kind,
         "dataset": args.dataset,
         "max_samples": args.max_samples,
         "max_new_tokens": args.max_new_tokens,

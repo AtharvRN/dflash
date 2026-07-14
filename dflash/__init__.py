@@ -1,6 +1,7 @@
 __all__ = [
     "DFlashDraftModel",
     "DFlashSurvivalBlockPolicy",
+    "DFlashV2HorizonBlockPolicy",
     "dflash_generate_dynamic",
     "extract_context_feature",
     "load_and_process_dataset",
@@ -27,6 +28,11 @@ def __getattr__(name):
         from .policy import DFlashSurvivalBlockPolicy
 
         return DFlashSurvivalBlockPolicy
+
+    if name == "DFlashV2HorizonBlockPolicy":
+        from .policy import DFlashV2HorizonBlockPolicy
+
+        return DFlashV2HorizonBlockPolicy
 
     if name == "dflash_generate_dynamic":
         from .dynamic import dflash_generate_dynamic

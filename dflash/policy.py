@@ -85,6 +85,173 @@ class FlatSurvivalHead(nn.Module):
         return self.head(torch.cat([seq.flatten(1), static], dim=-1))
 
 
+class HorizonPredictorRuntime(nn.Module):
+    def __init__(
+        self,
+        *,
+        input_dim: int,
+        proj_dim: int,
+        hidden_size: int,
+        num_slots: int,
+        architecture: str,
+        num_layers: int,
+        dropout: float,
+        context_window: int,
+    ) -> None:
+        super().__init__()
+        self.architecture = architecture
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, proj_dim),
+            nn.GELU(),
+            nn.LayerNorm(proj_dim),
+            nn.Dropout(dropout),
+        )
+        if architecture == "gru":
+            self.encoder = nn.GRU(
+                input_size=proj_dim,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                batch_first=True,
+                dropout=dropout if num_layers > 1 else 0.0,
+            )
+            pooled_dim = hidden_size
+        elif architecture == "transformer":
+            nhead = 8
+            if proj_dim % nhead != 0:
+                raise ValueError(f"proj_dim={proj_dim} must be divisible by nhead={nhead}")
+            self.pos_embed = nn.Parameter(torch.zeros(1, context_window, proj_dim))
+            layer = nn.TransformerEncoderLayer(
+                d_model=proj_dim,
+                nhead=nhead,
+                dim_feedforward=hidden_size * 4,
+                dropout=dropout,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
+            pooled_dim = proj_dim
+        else:
+            raise ValueError(f"unsupported horizon architecture {architecture!r}")
+        self.head = nn.Sequential(
+            nn.Linear(pooled_dim, hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size // 2, num_slots),
+        )
+
+    def forward(self, features: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        x = self.input_proj(features.float())
+        x = x * mask.unsqueeze(-1)
+        if self.architecture == "gru":
+            encoded, _ = self.encoder(x)
+        else:
+            encoded = self.encoder(
+                x + self.pos_embed[:, : x.shape[1], :],
+                src_key_padding_mask=mask < 0.5,
+            )
+        positions = torch.arange(mask.shape[1], device=mask.device).view(1, -1)
+        last_valid = (positions * (mask > 0.5)).max(dim=1).values.long()
+        gather_idx = last_valid.view(-1, 1, 1).expand(-1, 1, encoded.shape[-1])
+        pooled = encoded.gather(dim=1, index=gather_idx).squeeze(1)
+        return self.head(pooled)
+
+
+class DFlashV2HorizonBlockPolicy:
+    """Runtime pre-draft block-size policy for full fused-context horizon checkpoints."""
+
+    def __init__(
+        self,
+        *,
+        checkpoint_path: str | Path,
+        arms: Iterable[int] = (4, 8, 12, 16),
+        alpha: float = 0.90,
+        monotonicize_probs: bool = True,
+    ) -> None:
+        self.checkpoint_path = Path(checkpoint_path)
+        checkpoint = torch.load(self.checkpoint_path, map_location="cpu", weights_only=False)
+        self.config: dict[str, Any] = checkpoint["config"]
+        required = ("input_dim", "proj_dim", "hidden_size", "num_slots", "architecture", "num_layers", "context_window")
+        missing = [key for key in required if key not in self.config]
+        if missing:
+            raise ValueError(f"checkpoint is missing DFlashv2 horizon config keys: {missing}")
+
+        self.input_dim = int(self.config["input_dim"])
+        self.context_window = int(self.config["context_window"])
+        self.num_slots = int(self.config["num_slots"])
+        model = HorizonPredictorRuntime(
+            input_dim=self.input_dim,
+            proj_dim=int(self.config["proj_dim"]),
+            hidden_size=int(self.config["hidden_size"]),
+            num_slots=self.num_slots,
+            architecture=str(self.config["architecture"]),
+            num_layers=int(self.config["num_layers"]),
+            dropout=float(self.config.get("dropout", 0.0)),
+            context_window=self.context_window,
+        )
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.eval()
+        self.model = model
+        self.arms = tuple(int(x) for x in arms)
+        if self.arms != tuple(sorted(set(self.arms))):
+            raise ValueError(f"arms must be sorted and unique, got {self.arms}")
+        max_budget = max(self.arms) - 1
+        if max_budget > self.num_slots:
+            raise ValueError(f"arms {self.arms} require {max_budget} survival slots, checkpoint has {self.num_slots}")
+        self.alpha = float(alpha)
+        self.monotonicize_probs = bool(monotonicize_probs)
+        self.device = torch.device("cpu")
+        self.history: deque[torch.Tensor] = deque(maxlen=self.context_window)
+        self.last_probs: torch.Tensor | None = None
+        self.last_expected_by_arm: torch.Tensor | None = None
+
+    def reset(self, draft_model: nn.Module, device: torch.device | str | None = None) -> None:
+        self.device = torch.device(device if device is not None else next(draft_model.parameters()).device)
+        if int(draft_model.config.hidden_size) != self.input_dim:
+            raise ValueError(
+                f"checkpoint input_dim={self.input_dim} does not match draft hidden_size={draft_model.config.hidden_size}"
+            )
+        self.model.to(self.device).eval()
+        self.history.clear()
+        self.last_probs = None
+        self.last_expected_by_arm = None
+
+    @torch.inference_mode()
+    def observe_context(self, draft_model: nn.Module, target_hidden: torch.Tensor) -> None:
+        fused = draft_model.hidden_norm(draft_model.fc(target_hidden))
+        fused = fused[0].detach().float().cpu()
+        for row in fused:
+            self.history.append(row)
+
+    @torch.inference_mode()
+    def select_block_size(self) -> int:
+        features, mask = self._make_features()
+        features = features.to(self.device)
+        mask = mask.to(self.device)
+        probs = torch.sigmoid(self.model(features, mask))[0]
+        if self.monotonicize_probs:
+            probs = torch.cummin(probs, dim=0).values
+        budgets = torch.tensor([arm - 1 for arm in self.arms], device=probs.device, dtype=torch.long)
+        expected_by_arm = torch.stack([probs[: int(budget.item())].sum() for budget in budgets])
+        expected_full = expected_by_arm[-1]
+        ok = expected_by_arm >= self.alpha * expected_full
+        chosen_idx = int(torch.argmax(ok.int()).item()) if bool(ok.any()) else len(self.arms) - 1
+        self.last_probs = probs.detach().cpu()
+        self.last_expected_by_arm = expected_by_arm.detach().cpu()
+        return self.arms[chosen_idx]
+
+    def _make_features(self) -> tuple[torch.Tensor, torch.Tensor]:
+        tail = list(self.history)[-self.context_window :]
+        pad = self.context_window - len(tail)
+        rows = [torch.zeros(self.input_dim, dtype=torch.float32) for _ in range(pad)] + tail
+        mask = torch.tensor([0.0] * pad + [1.0] * len(tail), dtype=torch.float32)
+        features = torch.stack(rows).view(1, self.context_window, self.input_dim)
+        return features, mask.view(1, self.context_window)
+
+
 class DFlashSurvivalBlockPolicy:
     """Runtime pre-draft block-size policy trained from DFlash trace rows."""
 
