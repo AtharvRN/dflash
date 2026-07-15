@@ -934,3 +934,474 @@ The best current tradeoff depends on how much accepted-length retention we want.
 acceptance ratio from 0.295 to 0.409 while retaining about 89.5% of fixed-B16
 accepted draft length. `alpha=0.95` is safer if the next experiments prioritize
 accepted length over draft efficiency.
+
+## 2026-07-14 Qwen3-8B Math500 Horizon-Policy Results
+
+This section records the latest results after switching the main offline
+evaluation target to Qwen3-8B on Math500. These results use fixed `B=16` traces
+as the source of accepted-length labels and evaluate block choices offline.
+
+### Evaluation Setup
+
+```text
+target model:       Qwen/Qwen3-8B
+draft model:        z-lab/Qwen3-8B-DFlash-b16
+held-out eval set:  Math500
+max block trace:    B=16
+policy arms:        {4, 8, 12, 16}
+survival outputs:   P(A >= 1), ..., P(A >= 15)
+selection rule:     choose smallest B whose predicted accepted length reaches
+                    alpha * predicted accepted length at B16
+main constraint:    accepted-length retention >= 0.95
+```
+
+### Fixed Baseline And Oracle
+
+```text
+fixed B16:
+  mean accepted draft length = 6.3657
+  mean acceptance ratio      = 0.4244
+
+oracle smallest sufficient block:
+  mean block                 = 8.7366
+  mean acceptance ratio      = 0.7013
+```
+
+The oracle result shows that the offline decision problem still has substantial
+headroom. If the policy could reliably predict the per-cycle accepted horizon,
+it could keep nearly the same accepted length while using much smaller blocks.
+
+### 1M-Row Last-Fused-Vector MLP
+
+Training data:
+
+```text
+source trace rows: 1,000,002
+train rows:        950,002
+validation rows:    50,000
+input feature:     latest DFlash fused context vector
+feature size:      4096
+model:             MLP -> 15 survival logits
+```
+
+Best Math500 result from the 1M sweep:
+
+```text
+run:                       bw3_aux0p1
+selected alpha:            0.84
+mean block:                11.7478
+mean accepted draft length: 6.0479
+accepted-length retention: 0.9501
+mean acceptance ratio:     0.5281
+```
+
+This remains the strongest current offline policy result. Compared with fixed
+`B=16`, it increases acceptance ratio from `0.4244` to `0.5281` while retaining
+about 95% of the accepted draft length.
+
+The 1M-row result is very close to the earlier 500K-row result, so simply
+scaling the same last-fused-vector MLP dataset did not materially close the
+oracle gap.
+
+### 1M-Row Stateful GRU Experiment
+
+Motivation: test whether maintaining a learned temporal state over previous
+cycles improves the policy beyond the latest fused vector alone.
+
+Architecture:
+
+```text
+input per cycle:    latest DFlash fused context vector, 4096 dims
+projection:         Linear(4096 -> proj_dim), GELU, LayerNorm, Dropout
+temporal encoder:   GRU over cycles from the same request
+head:               MLP -> 15 survival logits
+auxiliary head:      optional arm classifier over {4, 8, 12, 16}
+loss:               survival BCE + length SmoothL1 + monotonic penalty
+                    + auxiliary arm CE
+```
+
+Math500 result from the best checkpoint:
+
+```text
+selected alpha:            0.86
+mean block:                12.0046
+mean accepted draft length: 6.1037
+accepted-length retention: 0.9588
+mean acceptance ratio:     0.5195
+```
+
+Alpha table on Math500:
+
+```text
+alpha=0.80: block=10.9145, accepted=5.8470, retention=0.9185, ratio=0.5538
+alpha=0.82: block=11.2686, accepted=5.9479, retention=0.9344, ratio=0.5426
+alpha=0.84: block=11.6423, accepted=6.0336, retention=0.9478, ratio=0.5308
+alpha=0.86: block=12.0046, accepted=6.1037, retention=0.9588, ratio=0.5195
+alpha=0.88: block=12.3722, accepted=6.1648, retention=0.9684, ratio=0.5082
+alpha=0.90: block=12.7774, accepted=6.2201, retention=0.9771, ratio=0.4965
+alpha=0.92: block=13.2633, accepted=6.2708, retention=0.9851, ratio=0.4830
+alpha=0.94: block=13.7980, accepted=6.3079, retention=0.9909, ratio=0.4687
+alpha=0.95: block=14.0974, accepted=6.3244, retention=0.9935, ratio=0.4612
+alpha=0.96: block=14.4172, accepted=6.3393, retention=0.9959, ratio=0.4536
+alpha=0.98: block=15.1667, accepted=6.3607, retention=0.9992, ratio=0.4375
+```
+
+Interpretation:
+
+```text
+The GRU/stateful policy did not clearly beat the stateless MLP.
+At the selected >=0.95 retention point, it has higher accepted length
+but lower acceptance ratio than the MLP because it chooses larger blocks.
+At alpha=0.84 it reaches ratio 0.5308, but retention is 0.9478, just below
+the 0.95 constraint.
+```
+
+Current conclusion: temporal state may still help, but this simple GRU
+formulation is not yet the missing signal. The best current baseline remains
+the latest-fused-vector MLP with survival outputs.
+
+### Current Best Offline Comparison
+
+```text
+fixed B16:
+  mean accepted = 6.3657
+  ratio         = 0.4244
+
+last-fused MLP, 1M rows:
+  mean block    = 11.7478
+  mean accepted = 6.0479
+  retention     = 0.9501
+  ratio         = 0.5281
+
+stateful GRU, 1M rows:
+  mean block    = 12.0046
+  mean accepted = 6.1037
+  retention     = 0.9588
+  ratio         = 0.5195
+
+oracle:
+  mean block    = 8.7366
+  ratio         = 0.7013
+```
+
+### Next Candidate: Fused Context Plus Confidence Stats
+
+The next model should preserve the deployable stateless structure while adding
+small confidence features:
+
+```text
+input:  latest DFlash fused context vector
+      + verifier latest-token confidence stats
+      + optional previous-cycle summary stats
+
+model:  MLP -> 15 survival logits
+```
+
+Start with a small confidence feature set:
+
+```text
+verifier latest-token entropy
+verifier latest-token top-1 probability
+verifier latest-token top-1/top-2 margin
+previous accepted length
+previous acceptance ratio
+previous chosen block size
+```
+
+Potential ablations:
+
+```text
+A. fused_last_mlp
+   latest fused context only
+
+B. fused_last_plus_verifier_confidence
+   latest fused context plus verifier entropy/top1/margin
+
+C. fused_last_plus_prev_outcome
+   latest fused context plus previous accepted length/ratio/block
+
+D. fused_last_plus_all_small_stats
+   latest fused context plus verifier confidence and previous outcome stats
+```
+
+The key question is whether explicit confidence statistics help close the gap
+between the current MLP ratio `0.5281` and oracle ratio `0.7013` without making
+the policy too handcrafted or hardware-specific.
+
+## Post-Draft Verification-Length Predictor
+
+The next direction is to move the decision point from before drafting to after
+drafting but before target verification.
+
+Instead of asking:
+
+```text
+Before drafting, how many tokens should DFlash draft?
+```
+
+ask:
+
+```text
+After drafting a full B16 block, how many drafted positions are worth verifying
+with the target model?
+```
+
+This is less pure as a pre-draft block-size policy, but it is more directly
+aligned with the profiling result: at high concurrency, target verification is
+around 77-80% of cycle time and grows strongly with block size.
+
+### Allowed Inputs
+
+A verification-length policy may use features available after the drafter has
+produced the candidate block, but before the target model verifies it:
+
+```text
+allowed:
+  latest DFlash fused context vector
+  drafted token ids
+  drafter logits/confidence for each drafted position
+  drafter hidden states for each drafted position
+  drafter entropy / token probability / top1-top2 margin
+
+not allowed:
+  target logits over drafted tokens
+  target entropy over drafted tokens
+  target probability assigned to drafted tokens
+  draft/target agreement
+```
+
+The disallowed features require the expensive full target verification pass and
+therefore cannot be used to decide the verification length.
+
+### Initial Feature Set
+
+The first implemented trace extension stores:
+
+```text
+postdraft_confidence.npy shape: [rows, 15, 4]
+
+columns:
+  draft_entropy
+  draft_token_prob
+  draft_top1_top2_margin
+  draft_token_logprob
+```
+
+The first verification-length model uses:
+
+```text
+input = concat(
+  latest DFlash fused context vector,       # 4096 dims for Qwen3-8B
+  flatten(postdraft_confidence[15, 4])      # 60 dims
+)
+
+model = MLP -> 15 survival logits
+```
+
+The label is unchanged:
+
+```text
+A = accepted_draft_len measured from a full B16 target verification
+y_k = 1[A >= k], k=1..15
+```
+
+At inference, the policy predicts a survival curve after drafting and selects a
+verification length from `{4, 8, 12, 16}` using the same retention-constrained
+decision rule as the pre-draft horizon policy.
+
+### Why This Might Be More Promising
+
+The pre-draft predictor only sees the current prefix state. The post-draft
+verification predictor also sees the actual proposed tokens and how confident
+the drafter was at each proposed position. This should be closer to the true
+acceptance event:
+
+```text
+accepted token k depends on whether target agrees with the already drafted
+token at position k, not only on the prefix before drafting.
+```
+
+This makes the problem less theoretically clean but likely easier
+statistically.
+
+### First Experiment
+
+Collect a small post-draft confidence trace:
+
+```bash
+python scripts/collect_dflashv2_horizon_traces.py \
+  --manifest /workspace/dflashv2_data/manifests/nemotron_codealpaca_train.jsonl \
+  --output-dir /tmp/dflashv2_verify_len_smoke_train \
+  --model Qwen/Qwen3-8B \
+  --draft-model z-lab/Qwen3-8B-DFlash-b16 \
+  --max-cycles 50000 \
+  --max-new-tokens 256 \
+  --block-size 16 \
+  --context-window 1 \
+  --rows-per-shard 4096 \
+  --temperature 0.0 \
+  --log-postdraft-confidence
+```
+
+Train the first verification-length predictor:
+
+```bash
+python scripts/train_dflashv2_verify_length_predictor.py \
+  --trace-dir /tmp/dflashv2_verify_len_smoke_train \
+  --eval-trace-dir /tmp/dflashv2_verify_len_smoke_math500 \
+  --output-dir /workspace/dflashv2_data/runs/verify_len_mlp_smoke \
+  --epochs 8 \
+  --batch-size 4096 \
+  --boundary-weight 2.0 \
+  --aux-arm-weight 0.1 \
+  --monotonicize-eval \
+  --selection-min-retention 0.95
+```
+
+Compare against the current pre-draft best:
+
+```text
+pre-draft last-fused MLP:
+  mean accepted = 6.0479
+  retention     = 0.9501
+  ratio         = 0.5281
+```
+
+The post-draft verification-length idea is promising only if it improves this
+ratio at similar retention. A useful first target is:
+
+```text
+retention >= 0.95
+acceptance ratio > 0.55
+```
+
+If it cannot beat the pre-draft MLP with access to drafted-token confidence,
+then the bottleneck is probably not the model class but the intrinsic
+predictability of target agreement from drafter-side features.
+
+### DSPARK-Style DFlash Confidence Head
+
+A closer analogue to DSPARK is now implemented as a separate path. Instead of
+feeding only scalar entropy/probability summaries into an MLP, this version uses
+the actual DFlash per-position draft hidden states.
+
+Trace collection:
+
+```bash
+python scripts/collect_dflashv2_horizon_traces.py \
+  --manifest /workspace/dflashv2_data/manifests/nemotron_codealpaca_train.jsonl \
+  --output-dir /tmp/dflashv2_dspark_conf_train \
+  --model Qwen/Qwen3-8B \
+  --draft-model z-lab/Qwen3-8B-DFlash-b16 \
+  --max-cycles 50000 \
+  --max-new-tokens 256 \
+  --block-size 16 \
+  --context-window 1 \
+  --rows-per-shard 1024 \
+  --temperature 0.0 \
+  --log-postdraft-hidden \
+  --log-postdraft-confidence
+```
+
+Additional fields:
+
+```text
+postdraft_hidden.npy
+  shape: [rows, 15, hidden_size]
+  DFlash draft hidden state h_k for each drafted position.
+
+postdraft_token_ids.npy
+  shape: [rows, 16]
+  anchor token followed by 15 drafted tokens.
+
+postdraft_confidence.npy
+  shape: [rows, 15, 4]
+  optional scalar drafter confidence stats.
+```
+
+Storage note for Qwen3-8B:
+
+```text
+postdraft_hidden size per row = 15 * 4096 * 2 bytes ~= 120 KB
+50K rows ~= 6 GB
+100K rows ~= 12 GB
+1M rows ~= 120 GB
+```
+
+So start with 50K-100K rows, not 1M.
+
+Model:
+
+```text
+for each drafted position k:
+  h_k       = DFlash draft hidden state at position k
+  x_{k-1}   = previous token, anchor for k=1 and drafted token k-1 otherwise
+  s_k       = optional scalar draft confidence stats
+
+  c_k = sigmoid(MLP([Linear(h_k), Embedding(x_{k-1}), Linear(s_k)]))
+```
+
+Here `c_k` is the conditional confidence:
+
+```text
+c_k = P(position k survives target verification | positions < k survived)
+```
+
+Prefix survival is:
+
+```text
+a_j = product_{k <= j} c_k
+```
+
+The scheduler uses `a_j` exactly like the earlier survival predictors:
+
+```text
+predicted_accepted(B) = sum_{j=1}^{B-1} a_j
+choose smallest B satisfying retention rule
+```
+
+Training script:
+
+```bash
+python scripts/train_dflashv2_dspark_confidence_head.py \
+  --trace-dir /tmp/dflashv2_dspark_conf_train \
+  --eval-trace-dir /tmp/dflashv2_dspark_conf_math500 \
+  --output-dir /workspace/dflashv2_data/runs/dspark_conf_head_smoke \
+  --epochs 8 \
+  --batch-size 512 \
+  --proj-dim 512 \
+  --markov-dim 64 \
+  --head-hidden-size 512 \
+  --use-scalar-confidence \
+  --thresholds 0.05,0.10,0.15,0.20,0.25,0.30,0.40,0.50,0.60,0.70,0.80,0.90 \
+  --selection-min-retention 0.95
+```
+
+Training labels:
+
+```text
+A = accepted_draft_len from full B16 target verification
+survival target y_j = 1[A >= j]
+
+conditional loss:
+  supervise c_k only up to the first rejected position
+
+survival loss:
+  BCE(product_{i <= j} c_i, y_j)
+```
+
+Evaluation reports two decision rules:
+
+```text
+alpha rule:
+  same retention rule used by the earlier pre-draft policies.
+  Useful for apples-to-apples comparison with last-fused MLP.
+
+threshold rule:
+  more DSPARK-like. Keep a prefix based on cumulative survival threshold,
+  then round to the nearest supported arm in {4, 8, 12, 16}.
+```
+
+This is the best current DFlashv2 direction because it uses the same post-draft
+information that DSPARK uses for confidence-scheduled verification, while
+remaining specific to DFlash's context-fused parallel drafter.

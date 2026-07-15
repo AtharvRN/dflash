@@ -83,6 +83,25 @@ def _padded_context_window(
     return features, mask
 
 
+def _draft_confidence_features(logits: torch.Tensor, token_ids: torch.Tensor) -> np.ndarray:
+    log_probs = torch.log_softmax(logits.float(), dim=-1)
+    probs = log_probs.exp()
+    entropy = -(probs * log_probs).sum(dim=-1)
+    top2 = torch.topk(probs, k=2, dim=-1).values
+    token_logprob = log_probs.gather(dim=-1, index=token_ids.unsqueeze(-1)).squeeze(-1)
+    token_prob = token_logprob.exp()
+    features = torch.stack(
+        [
+            entropy,
+            token_prob,
+            top2[:, 0] - top2[:, 1],
+            token_logprob,
+        ],
+        dim=-1,
+    )
+    return features.detach().cpu().numpy().astype(np.float16)
+
+
 class HorizonShardWriter:
     def __init__(
         self,
@@ -92,12 +111,16 @@ class HorizonShardWriter:
         window: int,
         hidden_size: int,
         num_slots: int,
+        log_postdraft_confidence: bool,
+        log_postdraft_hidden: bool,
     ) -> None:
         self.output_dir = output_dir
         self.rows_per_shard = rows_per_shard
         self.window = window
         self.hidden_size = hidden_size
         self.num_slots = num_slots
+        self.log_postdraft_confidence = log_postdraft_confidence
+        self.log_postdraft_hidden = log_postdraft_hidden
         self.shard_idx = -1
         self.row_idx = 0
         self.total_rows = 0
@@ -107,6 +130,9 @@ class HorizonShardWriter:
         self.accepted_len: np.memmap | None = None
         self.prompt_index: np.memmap | None = None
         self.cycle_id: np.memmap | None = None
+        self.postdraft_confidence: np.memmap | None = None
+        self.postdraft_hidden: np.memmap | None = None
+        self.postdraft_token_ids: np.memmap | None = None
         self.meta_file = None
         self.shards: list[dict[str, Any]] = []
 
@@ -152,6 +178,26 @@ class HorizonShardWriter:
             dtype=np.int32,
             shape=(self.rows_per_shard,),
         )
+        if self.log_postdraft_confidence:
+            self.postdraft_confidence = np.lib.format.open_memmap(
+                shard_dir / "postdraft_confidence.npy",
+                mode="w+",
+                dtype=np.float16,
+                shape=(self.rows_per_shard, self.num_slots, 4),
+            )
+        if self.log_postdraft_hidden:
+            self.postdraft_hidden = np.lib.format.open_memmap(
+                shard_dir / "postdraft_hidden.npy",
+                mode="w+",
+                dtype=np.float16,
+                shape=(self.rows_per_shard, self.num_slots, self.hidden_size),
+            )
+            self.postdraft_token_ids = np.lib.format.open_memmap(
+                shard_dir / "postdraft_token_ids.npy",
+                mode="w+",
+                dtype=np.int64,
+                shape=(self.rows_per_shard, self.num_slots + 1),
+            )
         self.meta_file = (shard_dir / "metadata.jsonl").open("w")
         self.shards.append({"path": shard_dir.name, "rows": 0})
 
@@ -164,6 +210,9 @@ class HorizonShardWriter:
         prompt_index: int,
         cycle_id: int,
         metadata: dict[str, Any],
+        postdraft_confidence: np.ndarray | None = None,
+        postdraft_hidden: np.ndarray | None = None,
+        postdraft_token_ids: np.ndarray | None = None,
     ) -> None:
         if self.features is None or self.row_idx >= self.rows_per_shard:
             self._open_next_shard()
@@ -184,6 +233,20 @@ class HorizonShardWriter:
         self.accepted_len[idx] = np.uint8(accepted_len)
         self.prompt_index[idx] = int(prompt_index)
         self.cycle_id[idx] = int(cycle_id)
+        if self.log_postdraft_confidence:
+            assert self.postdraft_confidence is not None
+            if postdraft_confidence is None:
+                raise ValueError("postdraft_confidence is required when log_postdraft_confidence=True")
+            self.postdraft_confidence[idx] = postdraft_confidence
+        if self.log_postdraft_hidden:
+            assert self.postdraft_hidden is not None
+            assert self.postdraft_token_ids is not None
+            if postdraft_hidden is None:
+                raise ValueError("postdraft_hidden is required when log_postdraft_hidden=True")
+            if postdraft_token_ids is None:
+                raise ValueError("postdraft_token_ids is required when log_postdraft_hidden=True")
+            self.postdraft_hidden[idx] = postdraft_hidden
+            self.postdraft_token_ids[idx] = postdraft_token_ids
         self.meta_file.write(json.dumps(metadata, ensure_ascii=False) + "\n")
         self.row_idx += 1
         self.total_rows += 1
@@ -201,6 +264,9 @@ class HorizonShardWriter:
             self.accepted_len,
             self.prompt_index,
             self.cycle_id,
+            self.postdraft_confidence,
+            self.postdraft_hidden,
+            self.postdraft_token_ids,
         ):
             if arr is not None:
                 arr.flush()
@@ -210,6 +276,9 @@ class HorizonShardWriter:
         self.accepted_len = None
         self.prompt_index = None
         self.cycle_id = None
+        self.postdraft_confidence = None
+        self.postdraft_hidden = None
+        self.postdraft_token_ids = None
 
     def close(self) -> None:
         self.close_current()
@@ -301,6 +370,21 @@ def collect_one_prompt(
         draft_logits = target.lm_head(draft_hidden)
         past_key_values_draft.crop(start)
         block_output_ids[:, 1:] = sample(draft_logits, temperature)
+        postdraft_confidence = (
+            _draft_confidence_features(draft_logits[0], block_output_ids[0, 1:])
+            if writer.log_postdraft_confidence
+            else None
+        )
+        postdraft_hidden = (
+            draft_hidden[0].detach().cpu().numpy().astype(np.float16)
+            if writer.log_postdraft_hidden
+            else None
+        )
+        postdraft_token_ids = (
+            block_output_ids[0, :block_size].detach().cpu().numpy().astype(np.int64)
+            if writer.log_postdraft_hidden
+            else None
+        )
 
         output = target(
             block_output_ids,
@@ -337,7 +421,19 @@ def collect_one_prompt(
                 "generated_tokens_before_cycle": int(start - num_input_tokens),
                 "accepted_draft_len": accepted_draft_len,
                 "committed_len": committed_len,
+                "postdraft_confidence_columns": [
+                    "draft_entropy",
+                    "draft_token_prob",
+                    "draft_top1_top2_margin",
+                    "draft_token_logprob",
+                ]
+                if writer.log_postdraft_confidence
+                else None,
+                "postdraft_hidden": writer.log_postdraft_hidden,
             },
+            postdraft_confidence=postdraft_confidence,
+            postdraft_hidden=postdraft_hidden,
+            postdraft_token_ids=postdraft_token_ids,
         )
 
         output_ids[:, start : start + accepted_draft_len + 1] = block_output_ids[
@@ -378,6 +474,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--enable-thinking", action="store_true")
+    parser.add_argument(
+        "--log-postdraft-confidence",
+        action="store_true",
+        help="Store per-drafted-position drafter confidence stats for post-draft verification-length policies.",
+    )
+    parser.add_argument(
+        "--log-postdraft-hidden",
+        action="store_true",
+        help=(
+            "Store per-drafted-position DFlash hidden states and token ids for a "
+            "DSPARK-style confidence head. This is storage-heavy."
+        ),
+    )
     parser.add_argument("--attn-implementation", default="sdpa")
     parser.add_argument("--dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
     return parser.parse_args()
@@ -424,6 +533,8 @@ def main() -> None:
         window=args.context_window,
         hidden_size=hidden_size,
         num_slots=args.block_size - 1,
+        log_postdraft_confidence=args.log_postdraft_confidence,
+        log_postdraft_hidden=args.log_postdraft_hidden,
     )
     stopped_by_cycle_budget = False
     try:
@@ -458,6 +569,20 @@ def main() -> None:
         "context_window": args.context_window,
         "block_size": args.block_size,
         "num_slots": args.block_size - 1,
+        "postdraft_confidence": args.log_postdraft_confidence,
+        "postdraft_confidence_columns": [
+            "draft_entropy",
+            "draft_token_prob",
+            "draft_top1_top2_margin",
+            "draft_token_logprob",
+        ]
+        if args.log_postdraft_confidence
+        else None,
+        "postdraft_hidden": args.log_postdraft_hidden,
+        "postdraft_hidden_shape": [args.block_size - 1, hidden_size]
+        if args.log_postdraft_hidden
+        else None,
+        "postdraft_token_ids_shape": [args.block_size] if args.log_postdraft_hidden else None,
         "rows_per_shard": args.rows_per_shard,
         "shards": writer.shards,
         "stopped_by_cycle_budget": stopped_by_cycle_budget,
