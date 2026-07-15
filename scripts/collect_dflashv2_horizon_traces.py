@@ -376,7 +376,7 @@ def collect_one_prompt(
             else None
         )
         postdraft_hidden = (
-            draft_hidden[0].detach().cpu().numpy().astype(np.float16)
+            draft_hidden[0].detach().float().cpu().numpy().astype(np.float16)
             if writer.log_postdraft_hidden
             else None
         )
