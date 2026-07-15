@@ -47,6 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.15)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--objective", choices=["survival_bce", "hazard"], default="survival_bce")
     parser.add_argument("--length-loss-weight", type=float, default=0.05)
     parser.add_argument("--monotonic-weight", type=float, default=0.02)
     parser.add_argument("--max-total-rows", type=int, default=None)
@@ -95,6 +96,8 @@ def main() -> None:
             str(args.lr),
             "--weight-decay",
             str(args.weight_decay),
+            "--objective",
+            args.objective,
             "--length-loss-weight",
             str(args.length_loss_weight),
             "--monotonic-weight",
@@ -175,6 +178,7 @@ def main() -> None:
         rows.append(
             {
                 "run_dir": str(run_dir),
+                "objective": args.objective,
                 "boundary_weight": boundary_weight,
                 "aux_arm_weight": aux_arm_weight,
                 "train_rows": checkpoint.get("train_rows"),

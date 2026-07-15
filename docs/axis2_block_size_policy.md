@@ -1405,3 +1405,419 @@ threshold rule:
 This is the best current DFlashv2 direction because it uses the same post-draft
 information that DSPARK uses for confidence-scheduled verification, while
 remaining specific to DFlash's context-fused parallel drafter.
+
+## DSPARK Teacher Distillation To Pre-Draft Policy, 2026-07-15
+
+Motivation: use the stronger post-draft DSPARK-style hidden-state head as a
+teacher for a cheap pre-draft policy.
+
+Teacher export:
+
+```text
+teacher:
+  /workspace/dflashv2_data/runs/dspark_conf_head_qwen3_8b_100k_20260715_032434/best.pt
+
+trace:
+  /workspace/dflashv2_data/traces/dflashv2_dspark_qwen3_8b_b16_100k_20260715_002253
+
+export:
+  /workspace/dflashv2_data/teacher/dspark_qwen3_8b_b16_100k_20260715_002253/teacher_survival.npy
+```
+
+The teacher survival curves are exported once as memmapped `.npy` files, so the
+pre-draft student training does not repeatedly run the post-draft head.
+
+Student:
+
+```text
+input:     latest pre-draft DFlash fused context vector, 4096 dims
+model:     last_mlp, Linear(4096 -> 512) + MLP -> 15 survival logits
+target:    DSPARK teacher soft survival curve plus hard survival labels
+split:     same 50K Nemotron validation rows used for post-draft comparison
+loss:      0.7 * teacher BCE
+         + 0.3 * hard-label BCE
+         + 0.05 * teacher length SmoothL1
+         + 0.05 * hard length SmoothL1
+         + 0.02 * monotonic penalty
+```
+
+Run:
+
+```text
+/workspace/dflashv2_data/runs/predraft_distill_dspark_teacher_100k_20260715_230105
+```
+
+Best validation result:
+
+```text
+epoch:                       10
+selected alpha:              0.90
+expected_len_mae:            1.812
+threshold_len_mae:           1.797
+AUROC H>=8:                  0.918
+AUROC H>=12:                 0.945
+mean block:                  8.087
+mean accepted draft length:  2.723
+accepted-length retention:   0.952
+mean acceptance ratio:       0.349
+```
+
+Comparison on the same 50K Nemotron validation split:
+
+```text
+pre-draft hard survival, 1M:
+  accept ratio = 0.390 at retention 0.953
+
+pre-draft hazard, 1M:
+  accept ratio = 0.383 at retention 0.957
+
+pre-draft DSPARK-teacher distillation, 100K:
+  accept ratio = 0.349 at retention 0.952
+
+post-draft DSPARK-style head:
+  accept ratio = 0.450 at retention 0.954
+```
+
+Conclusion: strong teacher distillation did not help the pre-draft policy. The
+post-draft teacher sees drafted hidden states and token-confidence information
+that the pre-draft student cannot access. Forcing the pre-draft student to match
+that teacher appears to blur the decision boundary rather than close the oracle
+gap. A follow-up ablation should treat teacher information as a weak auxiliary
+signal or distill only arm/boundary decisions, while keeping the hard accepted
+horizon as the main target.
+
+Follow-up controls on the same 100K trace:
+
+```text
+strong teacher:
+  run:       predraft_distill_dspark_teacher_100k_20260715_230105
+  weights:   teacher=0.7, hard=0.3
+  best:      epoch 10
+  MAE:       1.812
+  ratio:     0.349
+  retention: 0.952
+
+weak teacher:
+  run:       predraft_distill_dspark_teacher_100k_tw0p2_hw0p8_20260715_230651
+  weights:   teacher=0.2, hard=0.8
+  best:      epoch 6
+  MAE:       1.849
+  ratio:     0.349
+  retention: 0.951
+
+hard-only control:
+  run:       predraft_distill_control_hardonly_100k_20260715_230913
+  weights:   teacher=0.0, hard=1.0
+  best:      epoch 6
+  MAE:       1.851
+  ratio:     0.350
+  retention: 0.951
+```
+
+This means the distillation result is not merely a bad loss weight. With the
+same 100K training trace, teacher supervision is essentially neutral to slightly
+negative compared with hard-label training. The larger 1M hard-label pre-draft
+run is still better on this validation split (`ratio=0.390` at similar
+retention), while the post-draft DSPARK teacher remains much stronger
+(`ratio=0.450`). The current evidence supports using the DSPARK head as an
+analysis/upper-bound teacher, not as a direct soft-label source for the
+pre-draft last-fused-vector MLP.
+
+## Online Pre-Draft MLP Integration, 2026-07-15
+
+Integrated the 4096-d last-fused-context survival checkpoint into the SGLang
+DFlash worker:
+
+```text
+checkpoint:
+  /workspace/dflashv2_data/runs/horizon_sweep_1m_last_cached_qwen3_8b_20260714_183551/bw2_aux0p1/best.pt
+
+architecture:
+  latest fused context c_t in R^4096
+  Linear(4096 -> 512) + GELU + LayerNorm
+  MLP 512 -> 256 -> 128 -> 15 survival logits
+  s = cummin(sigmoid(logits))
+```
+
+Online implementation notes:
+
+```text
+per request:
+  store only the latest fused vector on GPU
+
+per cycle:
+  stack active request vectors into [batch, 4096]
+  run one batched MLP forward
+  compute expected accepted length for arms {4, 8, 12, 16}
+  choose one batch-level block size using alpha retention
+```
+
+This avoids the earlier GRU/history replay path. The deployment used a full
+Python package overlay in the pod because the local ragged-verify branch and the
+base SGLang image had different package layouts.
+
+Math500 online benchmark:
+
+```text
+model: Qwen/Qwen3-8B
+draft: z-lab/Qwen3-8B-DFlash-b16
+dataset: Math500
+concurrency: 64
+max_new_tokens: 512
+enable_thinking: false
+policy: last_mlp, alpha=0.84, arms={4,8,12,16}
+cuda graph: disabled
+
+throughput: 3909 tok/s
+mean accepted length: 7.296
+mean completion tokens: 433.1
+```
+
+High-batch cycle profile, filtering `batch_size >= 48`:
+
+```text
+cycles: 160
+selected blocks: B12=130 cycles, B16=30 cycles
+mean selected verify length: 12.75
+mean accepted drafts: 5.94
+
+predraft policy:        1.34 ms/cycle
+draft forward:         11.03 ms/cycle
+target verify forward: 60.20 ms/cycle
+verify prepare compact: 3.12 ms/cycle
+total profiled:        93.15 ms/cycle
+```
+
+Main takeaway:
+
+```text
+The 4096-d MLP policy is cheap enough online (~1 ms/cycle at C=64).
+The remaining gap is policy quality / batch-level aggregation, not model
+inference overhead.
+```
+
+## Exact-Horizon Hazard Objective, 2026-07-15
+
+The next pre-draft policy objective should predict the exact accepted horizon
+`H` before drafting, with `H in {0, ..., 15}` for a max DFlash block of 16.
+The model can still expose survival probabilities for the block-size policy,
+but training should use an ordinal/hazard formulation rather than independent
+survival BCE.
+
+For threshold `k = 1..15`, predict:
+
+```text
+q_k = P(H >= k | H >= k - 1, x)
+s_k = P(H >= k | x) = product_{j=1..k} q_j
+E[H | x] = sum_k s_k
+```
+
+For a true horizon `H`, only reachable thresholds are trained:
+
+```text
+loss_hazard =
+  - sum_{k=1..H} log q_k
+  - 1[H < 15] log(1 - q_{H+1})
+```
+
+Add a distance-aware term on the expected horizon:
+
+```text
+loss = loss_hazard + lambda * SmoothL1(E[H | x], H)
+```
+
+Primary offline model metric:
+
+```text
+expected_len_mae = mean(abs(E[H | x] - H))
+```
+
+Secondary metrics:
+
+```text
+rounded_expected_len_mae
+rounded_expected_len_exact
+AUROC for H >= {1, 4, 8, 12, 15}
+selected_accept_ratio at a fixed selected_accept_retention target
+```
+
+The final policy metric is still task-level utility: maximize acceptance ratio
+while preserving acceptance retention relative to fixed B16. MAE is the cleanest
+model-quality metric, but it is not sufficient by itself because small horizon
+errors near arm boundaries can matter more than equal-sized errors away from
+boundaries.
+
+Initial run:
+
+```text
+run:
+  /workspace/dflashv2_data/runs/horizon_hazard_1m_last_cached_qwen3_8b_20260715_213716
+
+model:
+  Qwen3-8B DFlash B16, last fused vector in R^4096
+  Linear(4096 -> 512) + GELU + LayerNorm
+  MLP 512 -> 256 -> 128 -> 15 hazard logits
+
+training:
+  objective = hazard
+  distance term = 0.10 * SmoothL1(E[H], H)
+  aux arm CE weight = 0.10
+  rows = 1M cache with 50k validation
+  best checkpoint selection = validation expected_len_mae
+
+best epoch:
+  epoch 3
+  val expected_len_mae = 1.703
+  val rounded_expected_len_mae = 1.686
+  val selected alpha = 0.90
+  val selected retention = 0.955
+  val selected accept ratio = 0.367
+```
+
+Held-out Math500 offline trace evaluation:
+
+```text
+mean target accepted length: 6.366
+
+fixed B16:
+  mean accepted = 6.366
+  accept ratio = 0.424
+
+hazard policy:
+  selected alpha = 0.86
+  mean block = 11.808
+  mean accepted = 6.078
+  retention = 0.955
+  accept ratio = 0.527
+
+oracle:
+  mean block = 8.737
+  mean accepted = 6.366
+  retention = 1.000
+  accept ratio = 0.701
+```
+
+Conclusion: the hazard+distance objective improves the formulation but does not
+materially move the Math500 policy result versus the earlier independent
+survival BCE model (`accept ratio ~0.528` at similar retention). The bottleneck
+is likely not only the loss; we need more predictive signal or a policy that
+optimizes boundary/arm decisions more directly while preserving exact-horizon
+calibration.
+
+## Stateful Augmented Pre-Draft Policy, 2026-07-15
+
+The next pre-draft model uses the latest fused context plus a small causal
+confidence/state vector and trains on full request sequences rather than
+shuffled independent cycles.
+
+Input per cycle:
+
+```text
+fused_context_t in R^4096
+
+predraft_stats_t in R^8:
+  verifier_entropy_latest
+  verifier_token_prob_latest
+  verifier_top1_top2_margin_latest
+  verifier_token_logprob_latest
+  prev_accepted_len_norm
+  prev_accept_ratio
+  prev_budget_norm
+  has_prev_cycle
+```
+
+The verifier confidence entries are measured from the latest target-produced
+token before drafting. This is causal: it is available after the previous
+target verification step and before the next DFlash draft.
+
+Architecture:
+
+```text
+fused_context_t -> Linear(4096 -> 512) + GELU + LayerNorm
+predraft_stats_t -> Linear(8 -> 32) + GELU + LayerNorm
+concat -> GRU over request cycles -> MLP -> 15 hazard/survival logits
+```
+
+At training time, rows are grouped by `(trace_id, prompt_index)` and sorted by
+`cycle_id`, so the GRU hidden state matches the real online update order. At
+inference time, this becomes a cheap per-request recurrent state:
+
+```text
+h_t = GRUCell(project([fused_context_t, predraft_stats_t]), h_{t-1})
+survival_logits_t = MLP(h_t)
+```
+
+Loss:
+
+```text
+hazard loss
++ SmoothL1(E[H], H)
++ arm utility loss over {4, 8, 12, 16}
++ monotonic penalty when using direct survival outputs
+```
+
+The new collection path writes `predraft_stats.npy` into each trace shard. Older
+traces can still train this model, but verifier confidence is zero-filled and
+only the previous-cycle outcome summary is reconstructed from `accepted_len`.
+
+Training command:
+
+```bash
+python scripts/train_dflashv2_stateful_augmented_horizon.py \
+  --trace-dir /workspace/dflashv2_data/traces/dflashv2_1m_qwen3_8b_b16_20260713_183723/gpu0 \
+  --trace-dir /workspace/dflashv2_data/traces/dflashv2_1m_qwen3_8b_b16_20260713_183723/gpu1 \
+  --trace-dir /workspace/dflashv2_data/traces/dflashv2_1m_qwen3_8b_b16_20260713_183723/gpu2 \
+  --trace-dir /workspace/dflashv2_data/traces/dflashv2_1m_qwen3_8b_b16_20260713_183723/gpu3 \
+  --trace-dir /workspace/dflashv2_data/traces/dflashv2_1m_qwen3_8b_b16_20260713_183723/gpu4 \
+  --trace-dir /workspace/dflashv2_data/traces/dflashv2_1m_qwen3_8b_b16_20260713_183723/gpu5 \
+  --output-dir /workspace/dflashv2_data/runs/stateful_augmented_qwen3_8b_1m \
+  --objective hazard \
+  --proj-dim 512 \
+  --stats-proj-dim 32 \
+  --hidden-size 256 \
+  --epochs 8 \
+  --batch-size 64 \
+  --length-loss-weight 0.10 \
+  --arm-utility-weight 0.10 \
+  --arm-utility-lambda 0.02 \
+  --selection-min-retention 0.95 \
+  --checkpoint-selection selected_accept_ratio
+```
+
+Initial result on the existing 100K DSPARK trace:
+
+```text
+trace:
+  /workspace/dflashv2_data/traces/dflashv2_dspark_qwen3_8b_b16_100k_20260715_002253
+
+important limitation:
+  this trace was collected before predraft_stats.npy existed, so verifier
+  confidence features are zero-filled. This run tests the recurrent state plus
+  reconstructed previous-cycle accepted-length summary only.
+
+run:
+  /workspace/dflashv2_data/runs/stateful_augmented_prevonly_qwen3_8b_100k_20260716_002658
+
+best epoch:
+  epoch 8
+
+metrics:
+  expected_len_mae:            1.903
+  threshold_len_mae:           1.872
+  AUROC H>=8:                  0.906
+  AUROC H>=12:                 0.936
+  selected alpha:              0.95
+  mean block:                  7.902
+  mean accepted draft length:  2.676
+  accepted-length retention:   0.952
+  mean acceptance ratio:       0.355
+```
+
+Interpretation:
+
+```text
+The recurrent previous-cycle state gives only a small gain over the 100K
+hard-only control (~0.355 vs ~0.350 accept ratio at similar retention).
+This is not enough to change the conclusion. The next meaningful test requires
+a newly collected trace with real verifier-confidence predraft_stats.
+```

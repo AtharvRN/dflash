@@ -254,6 +254,43 @@ def _survival_weights(num_slots: int, *, boundary_ks: tuple[int, ...], boundary_
     return weights / weights.mean().clamp_min(1e-6)
 
 
+def _conditional_survival_mask(survival: torch.Tensor) -> torch.Tensor:
+    return torch.cat([torch.ones_like(survival[:, :1]), survival[:, :-1]], dim=1)
+
+
+def _horizon_loss(
+    logits: torch.Tensor,
+    survival: torch.Tensor,
+    *,
+    objective: str,
+    survival_weights: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if objective == "survival_bce":
+        if survival_weights is None:
+            loss = F.binary_cross_entropy_with_logits(logits, survival)
+        else:
+            raw = F.binary_cross_entropy_with_logits(logits, survival, reduction="none")
+            loss = (raw * survival_weights.view(1, -1)).mean()
+        probs = torch.sigmoid(logits)
+        return loss, probs, torch.ones((), dtype=logits.dtype, device=logits.device)
+
+    if objective != "hazard":
+        raise ValueError(f"unsupported objective {objective!r}")
+
+    # CORN/discrete-time hazard objective:
+    # q_k = P(H >= k | H >= k - 1, x).  Only train thresholds that are reachable:
+    # all successes up to H and the first failure at H + 1.
+    reachable = _conditional_survival_mask(survival)
+    raw = F.binary_cross_entropy_with_logits(logits, survival, reduction="none")
+    if survival_weights is not None:
+        raw = raw * survival_weights.view(1, -1)
+        reachable = reachable * survival_weights.view(1, -1)
+    loss = (raw * reachable).sum() / reachable.sum().clamp_min(1.0)
+    conditional_probs = torch.sigmoid(logits)
+    survival_probs = torch.cumprod(conditional_probs, dim=1)
+    return loss, survival_probs, conditional_probs.mean()
+
+
 class HorizonPredictor(nn.Module):
     def __init__(
         self,
@@ -442,6 +479,7 @@ def evaluate(
     loader: DataLoader,
     *,
     device: torch.device,
+    objective: str = "survival_bce",
     monotonicize: bool,
     arms: tuple[int, ...],
     alphas: tuple[float, ...],
@@ -459,25 +497,35 @@ def evaluate(
         survival = survival.to(device, non_blocking=True)
         accepted_len = accepted_len.to(device, non_blocking=True)
         logits = model(features, mask)
-        loss = F.binary_cross_entropy_with_logits(logits, survival)
+        loss, probs_batch, _conditional_mean = _horizon_loss(
+            logits,
+            survival,
+            objective=objective,
+            survival_weights=None,
+        )
         losses.append(loss.item())
         counts.append(features.shape[0])
-        logits_all.append(logits.detach().cpu())
+        logits_all.append(probs_batch.detach().cpu())
         survival_all.append(survival.detach().cpu())
         accepted_all.append(accepted_len.detach().cpu())
 
-    logits = torch.cat(logits_all)
+    probs = torch.cat(logits_all)
     survival = torch.cat(survival_all)
     accepted_len = torch.cat(accepted_all)
-    probs = torch.sigmoid(logits)
-    if monotonicize:
+    if monotonicize and objective == "survival_bce":
         probs = _monotonicize(probs)
     expected_len = probs.sum(dim=1)
     pred_len = (probs >= 0.5).sum(dim=1).float()
+    rounded_len = expected_len.round().clamp(0, survival.shape[1])
     total = float(sum(counts))
     metrics = {
+        "horizon_loss": float(sum(loss * count for loss, count in zip(losses, counts)) / total),
         "bce": float(sum(loss * count for loss, count in zip(losses, counts)) / total),
         "expected_len_mae": (expected_len - accepted_len).abs().mean().item(),
+        "distance_mae": (expected_len - accepted_len).abs().mean().item(),
+        "expected_len_rmse": torch.sqrt(torch.mean((expected_len - accepted_len) ** 2)).item(),
+        "rounded_expected_len_mae": (rounded_len - accepted_len).abs().mean().item(),
+        "rounded_expected_len_exact": (rounded_len == accepted_len).float().mean().item(),
         "threshold_len_mae": (pred_len - accepted_len).abs().mean().item(),
         "threshold_len_exact": (pred_len == accepted_len).float().mean().item(),
         "mean_expected_len": expected_len.mean().item(),
@@ -505,6 +553,7 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     *,
     device: torch.device,
+    objective: str = "survival_bce",
     length_loss_weight: float,
     monotonic_weight: float,
     survival_weights: torch.Tensor | None,
@@ -520,15 +569,19 @@ def train_epoch(
         survival = survival.to(device, non_blocking=True)
         accepted_len = accepted_len.to(device, non_blocking=True)
         logits, aux_logits = model.forward_with_aux(features, mask)
-        if survival_weights is None:
-            bce = F.binary_cross_entropy_with_logits(logits, survival)
-        else:
-            bce_raw = F.binary_cross_entropy_with_logits(logits, survival, reduction="none")
-            bce = (bce_raw * survival_weights.view(1, -1)).mean()
-        probs = torch.sigmoid(logits)
+        horizon_loss, probs, conditional_mean = _horizon_loss(
+            logits,
+            survival,
+            objective=objective,
+            survival_weights=survival_weights,
+        )
         expected_len = probs.sum(dim=1)
         length_loss = F.smooth_l1_loss(expected_len, accepted_len)
-        monotonic_loss = F.relu(probs[:, 1:] - probs[:, :-1]).mean()
+        monotonic_loss = (
+            torch.zeros((), dtype=logits.dtype, device=logits.device)
+            if objective == "hazard"
+            else F.relu(probs[:, 1:] - probs[:, :-1]).mean()
+        )
         aux_arm_loss = torch.zeros((), dtype=logits.dtype, device=logits.device)
         aux_arm_acc = torch.zeros((), dtype=logits.dtype, device=logits.device)
         if aux_logits is not None and aux_arm_weight > 0:
@@ -536,7 +589,7 @@ def train_epoch(
             aux_arm_loss = F.cross_entropy(aux_logits, target_arm_idx)
             aux_arm_acc = (aux_logits.argmax(dim=-1) == target_arm_idx).float().mean()
         loss = (
-            bce
+            horizon_loss
             + length_loss_weight * length_loss
             + monotonic_weight * monotonic_loss
             + aux_arm_weight * aux_arm_loss
@@ -551,12 +604,15 @@ def train_epoch(
         total_rows += batch
         for key, value in {
             "loss": loss,
-            "bce": bce,
+            "horizon_loss": horizon_loss,
+            "bce": horizon_loss,
             "length_loss": length_loss,
+            "distance_loss": length_loss,
             "monotonic_loss": monotonic_loss,
             "aux_arm_loss": aux_arm_loss,
             "aux_arm_accuracy": aux_arm_acc,
             "expected_len_mae": (expected_len - accepted_len).abs().mean(),
+            "conditional_mean": conditional_mean,
         }.items():
             totals[key] = totals.get(key, 0.0) + float(value.detach().item()) * batch
     return {key: value / total_rows for key, value in totals.items()}
@@ -590,6 +646,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument(
+        "--objective",
+        choices=["survival_bce", "hazard"],
+        default="survival_bce",
+        help=(
+            "survival_bce uses independent P(H>=k) logits; hazard uses conditional "
+            "CORN/discrete-time survival logits whose cumulative product gives P(H>=k)."
+        ),
+    )
     parser.add_argument("--length-loss-weight", type=float, default=0.05)
     parser.add_argument("--monotonic-weight", type=float, default=0.02)
     parser.add_argument("--boundary-weight", type=float, default=1.0)
@@ -785,6 +850,7 @@ def main() -> None:
             model,
             val_loader,
             device=device,
+            objective=args.objective,
             monotonicize=args.monotonicize_eval,
             arms=arms,
             alphas=alphas,
@@ -819,6 +885,7 @@ def main() -> None:
             train_loader,
             optimizer,
             device=device,
+            objective=args.objective,
             length_loss_weight=args.length_loss_weight,
             monotonic_weight=args.monotonic_weight,
             survival_weights=survival_weight_tensor,
@@ -829,6 +896,7 @@ def main() -> None:
             model,
             val_loader,
             device=device,
+            objective=args.objective,
             monotonicize=args.monotonicize_eval,
             arms=arms,
             alphas=alphas,

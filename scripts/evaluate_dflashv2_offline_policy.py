@@ -113,6 +113,7 @@ def main() -> None:
         model,
         loader,
         device=device,
+        objective=str(config.get("objective", "survival_bce")),
         monotonicize=args.monotonicize_eval,
         arms=arms,
         alphas=alphas,

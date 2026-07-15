@@ -84,6 +84,10 @@ def _padded_context_window(
 
 
 def _draft_confidence_features(logits: torch.Tensor, token_ids: torch.Tensor) -> np.ndarray:
+    return _token_confidence_features(logits, token_ids)
+
+
+def _token_confidence_features(logits: torch.Tensor, token_ids: torch.Tensor) -> np.ndarray:
     log_probs = torch.log_softmax(logits.float(), dim=-1)
     probs = log_probs.exp()
     entropy = -(probs * log_probs).sum(dim=-1)
@@ -130,6 +134,7 @@ class HorizonShardWriter:
         self.accepted_len: np.memmap | None = None
         self.prompt_index: np.memmap | None = None
         self.cycle_id: np.memmap | None = None
+        self.predraft_stats: np.memmap | None = None
         self.postdraft_confidence: np.memmap | None = None
         self.postdraft_hidden: np.memmap | None = None
         self.postdraft_token_ids: np.memmap | None = None
@@ -178,6 +183,12 @@ class HorizonShardWriter:
             dtype=np.int32,
             shape=(self.rows_per_shard,),
         )
+        self.predraft_stats = np.lib.format.open_memmap(
+            shard_dir / "predraft_stats.npy",
+            mode="w+",
+            dtype=np.float16,
+            shape=(self.rows_per_shard, 8),
+        )
         if self.log_postdraft_confidence:
             self.postdraft_confidence = np.lib.format.open_memmap(
                 shard_dir / "postdraft_confidence.npy",
@@ -209,6 +220,7 @@ class HorizonShardWriter:
         accepted_len: int,
         prompt_index: int,
         cycle_id: int,
+        predraft_stats: np.ndarray,
         metadata: dict[str, Any],
         postdraft_confidence: np.ndarray | None = None,
         postdraft_hidden: np.ndarray | None = None,
@@ -222,6 +234,7 @@ class HorizonShardWriter:
         assert self.accepted_len is not None
         assert self.prompt_index is not None
         assert self.cycle_id is not None
+        assert self.predraft_stats is not None
         assert self.meta_file is not None
         idx = self.row_idx
         self.features[idx] = features
@@ -233,6 +246,7 @@ class HorizonShardWriter:
         self.accepted_len[idx] = np.uint8(accepted_len)
         self.prompt_index[idx] = int(prompt_index)
         self.cycle_id[idx] = int(cycle_id)
+        self.predraft_stats[idx] = predraft_stats
         if self.log_postdraft_confidence:
             assert self.postdraft_confidence is not None
             if postdraft_confidence is None:
@@ -264,6 +278,7 @@ class HorizonShardWriter:
             self.accepted_len,
             self.prompt_index,
             self.cycle_id,
+            self.predraft_stats,
             self.postdraft_confidence,
             self.postdraft_hidden,
             self.postdraft_token_ids,
@@ -276,6 +291,7 @@ class HorizonShardWriter:
         self.accepted_len = None
         self.prompt_index = None
         self.cycle_id = None
+        self.predraft_stats = None
         self.postdraft_confidence = None
         self.postdraft_hidden = None
         self.postdraft_token_ids = None
@@ -333,6 +349,10 @@ def collect_one_prompt(
         output_hidden_states=True,
     )
     first_token = sample(output.logits, temperature)
+    latest_verifier_confidence = _token_confidence_features(
+        output.logits[0, -1:], first_token[0].reshape(1)
+    )[0]
+    prev_cycle_summary = np.zeros((4,), dtype=np.float16)
     output_ids[:, :num_input_tokens] = input_ids
     output_ids[:, num_input_tokens : num_input_tokens + 1] = first_token
     target_hidden = extract_context_feature(output.hidden_states, draft_model.target_layer_ids)
@@ -408,6 +428,9 @@ def collect_one_prompt(
             accepted_len=accepted_draft_len,
             prompt_index=prompt_index,
             cycle_id=cycle_id,
+            predraft_stats=np.concatenate(
+                [latest_verifier_confidence, prev_cycle_summary], axis=0
+            ).astype(np.float16),
             metadata={
                 "prompt_index": prompt_index,
                 "manifest_index": row.get("manifest_index"),
@@ -421,6 +444,16 @@ def collect_one_prompt(
                 "generated_tokens_before_cycle": int(start - num_input_tokens),
                 "accepted_draft_len": accepted_draft_len,
                 "committed_len": committed_len,
+                "predraft_stats_columns": [
+                    "verifier_entropy_latest",
+                    "verifier_token_prob_latest",
+                    "verifier_top1_top2_margin_latest",
+                    "verifier_token_logprob_latest",
+                    "prev_accepted_len_norm",
+                    "prev_accept_ratio",
+                    "prev_budget_norm",
+                    "has_prev_cycle",
+                ],
                 "postdraft_confidence_columns": [
                     "draft_entropy",
                     "draft_token_prob",
@@ -442,6 +475,20 @@ def collect_one_prompt(
         output_ids[:, start + accepted_draft_len + 1] = correction_token
         start += committed_len
         past_key_values_target.crop(start)
+
+        latest_verifier_confidence = _token_confidence_features(
+            output.logits[0, accepted_draft_len : accepted_draft_len + 1],
+            correction_token[0].reshape(1),
+        )[0]
+        prev_cycle_summary = np.asarray(
+            [
+                accepted_draft_len / max(num_draft_slots, 1),
+                accepted_draft_len / max(num_draft_slots, 1),
+                num_draft_slots / max(num_draft_slots, 1),
+                1.0,
+            ],
+            dtype=np.float16,
+        )
 
         target_hidden = extract_context_feature(output.hidden_states, draft_model.target_layer_ids)[
             :, :committed_len, :
@@ -570,6 +617,17 @@ def main() -> None:
         "block_size": args.block_size,
         "num_slots": args.block_size - 1,
         "postdraft_confidence": args.log_postdraft_confidence,
+        "predraft_stats": True,
+        "predraft_stats_columns": [
+            "verifier_entropy_latest",
+            "verifier_token_prob_latest",
+            "verifier_top1_top2_margin_latest",
+            "verifier_token_logprob_latest",
+            "prev_accepted_len_norm",
+            "prev_accept_ratio",
+            "prev_budget_norm",
+            "has_prev_cycle",
+        ],
         "postdraft_confidence_columns": [
             "draft_entropy",
             "draft_token_prob",

@@ -106,7 +106,10 @@ class HorizonPredictorRuntime(nn.Module):
             nn.LayerNorm(proj_dim),
             nn.Dropout(dropout),
         )
-        if architecture == "gru":
+        if architecture == "last_mlp":
+            self.encoder = None
+            pooled_dim = proj_dim
+        elif architecture == "gru":
             self.encoder = nn.GRU(
                 input_size=proj_dim,
                 hidden_size=hidden_size,
@@ -144,6 +147,13 @@ class HorizonPredictorRuntime(nn.Module):
         )
 
     def forward(self, features: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        positions = torch.arange(mask.shape[1], device=mask.device).view(1, -1)
+        last_valid = (positions * (mask > 0.5)).max(dim=1).values.long()
+        if self.architecture == "last_mlp":
+            gather_idx = last_valid.view(-1, 1, 1).expand(-1, 1, features.shape[-1])
+            pooled = self.input_proj(features.float().gather(dim=1, index=gather_idx).squeeze(1))
+            return self.head(pooled)
+
         x = self.input_proj(features.float())
         x = x * mask.unsqueeze(-1)
         if self.architecture == "gru":
@@ -153,8 +163,6 @@ class HorizonPredictorRuntime(nn.Module):
                 x + self.pos_embed[:, : x.shape[1], :],
                 src_key_padding_mask=mask < 0.5,
             )
-        positions = torch.arange(mask.shape[1], device=mask.device).view(1, -1)
-        last_valid = (positions * (mask > 0.5)).max(dim=1).values.long()
         gather_idx = last_valid.view(-1, 1, 1).expand(-1, 1, encoded.shape[-1])
         pooled = encoded.gather(dim=1, index=gather_idx).squeeze(1)
         return self.head(pooled)
@@ -182,6 +190,7 @@ class DFlashV2HorizonBlockPolicy:
         self.input_dim = int(self.config["input_dim"])
         self.context_window = int(self.config["context_window"])
         self.num_slots = int(self.config["num_slots"])
+        self.objective = str(self.config.get("objective", "survival_bce"))
         model = HorizonPredictorRuntime(
             input_dim=self.input_dim,
             proj_dim=int(self.config["proj_dim"]),
@@ -192,7 +201,12 @@ class DFlashV2HorizonBlockPolicy:
             dropout=float(self.config.get("dropout", 0.0)),
             context_window=self.context_window,
         )
-        model.load_state_dict(checkpoint["model_state_dict"])
+        state_dict = {
+            key: value
+            for key, value in checkpoint["model_state_dict"].items()
+            if not key.startswith("aux_arm_head.")
+        }
+        model.load_state_dict(state_dict)
         model.eval()
         self.model = model
         self.arms = tuple(int(x) for x in arms)
@@ -231,8 +245,14 @@ class DFlashV2HorizonBlockPolicy:
         features, mask = self._make_features()
         features = features.to(self.device)
         mask = mask.to(self.device)
-        probs = torch.sigmoid(self.model(features, mask))[0]
-        if self.monotonicize_probs:
+        logits = self.model(features, mask)
+        probs = torch.sigmoid(logits)
+        if self.objective == "hazard":
+            probs = torch.cumprod(probs, dim=-1)
+        elif self.objective != "survival_bce":
+            raise ValueError(f"unsupported horizon objective {self.objective!r}")
+        probs = probs[0]
+        if self.monotonicize_probs and self.objective == "survival_bce":
             probs = torch.cummin(probs, dim=0).values
         budgets = torch.tensor([arm - 1 for arm in self.arms], device=probs.device, dtype=torch.long)
         expected_by_arm = torch.stack([probs[: int(budget.item())].sum() for budget in budgets])
