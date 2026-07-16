@@ -495,8 +495,11 @@ def _flatten_valid(
     accepted_len: torch.Tensor,
     mask: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    valid = mask > 0.5
-    return logits[valid], survival[valid], accepted_len[valid]
+    valid = (mask.reshape(-1) > 0.5).nonzero(as_tuple=False).squeeze(1)
+    logits_flat = logits.reshape(-1, logits.shape[-1]).index_select(0, valid)
+    survival_flat = survival.reshape(-1, survival.shape[-1]).index_select(0, valid)
+    accepted_flat = accepted_len.reshape(-1).index_select(0, valid)
+    return logits_flat, survival_flat, accepted_flat
 
 
 def _monotonicize(probs: torch.Tensor) -> torch.Tensor:
