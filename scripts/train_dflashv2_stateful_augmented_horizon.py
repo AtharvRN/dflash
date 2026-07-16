@@ -30,6 +30,7 @@ from scripts.train_dflashv2_horizon_predictor import (  # noqa: E402
 
 
 DEFAULT_STATS_DIM = 8
+SEQUENCE_CACHE_VERSION = 1
 
 
 class AugmentedShard(Shard):
@@ -209,6 +210,168 @@ class StatefulAugmentedDataset(Dataset[dict[str, torch.Tensor]]):
             "accepted_len": torch.from_numpy(accepted),
             "mask": torch.ones((len(seq),), dtype=torch.float32),
         }
+
+
+class CachedStatefulDataset(Dataset[dict[str, torch.Tensor]]):
+    def __init__(self, cache_dir: Path, sequence_indices: list[int] | None = None) -> None:
+        self.cache_dir = cache_dir
+        meta_path = cache_dir / "meta.json"
+        if not meta_path.exists():
+            raise FileNotFoundError(f"missing sequence cache metadata: {meta_path}")
+        self.meta = json.loads(meta_path.read_text())
+        self.features = np.load(cache_dir / "features.npy", mmap_mode="r")
+        self.stats = np.load(cache_dir / "stats.npy", mmap_mode="r")
+        self.survival = np.load(cache_dir / "survival.npy", mmap_mode="r")
+        self.accepted_len = np.load(cache_dir / "accepted_len.npy", mmap_mode="r")
+        self.seq_offsets = np.load(cache_dir / "seq_offsets.npy", mmap_mode="r")
+        self.sequence_indices = (
+            list(range(int(self.meta["num_sequences"])))
+            if sequence_indices is None
+            else list(sequence_indices)
+        )
+        self.hidden_size = int(self.features.shape[1])
+        self.stats_dim = int(self.stats.shape[1])
+        self.num_slots = int(self.survival.shape[1])
+        self.context_window = 1
+
+    def __len__(self) -> int:
+        return len(self.sequence_indices)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        seq_idx = int(self.sequence_indices[idx])
+        start = int(self.seq_offsets[seq_idx])
+        end = int(self.seq_offsets[seq_idx + 1])
+        return {
+            "features": torch.from_numpy(np.asarray(self.features[start:end]).copy()),
+            "stats": torch.from_numpy(np.asarray(self.stats[start:end]).copy()),
+            "survival": torch.from_numpy(np.asarray(self.survival[start:end]).copy()),
+            "accepted_len": torch.from_numpy(np.asarray(self.accepted_len[start:end]).copy()),
+            "mask": torch.ones((end - start,), dtype=torch.float32),
+        }
+
+
+def _sequence_cache_complete(cache_dir: Path) -> bool:
+    if not (cache_dir / "meta.json").exists():
+        return False
+    required = ["features.npy", "stats.npy", "survival.npy", "accepted_len.npy", "seq_offsets.npy"]
+    return all((cache_dir / name).exists() for name in required)
+
+
+def _materialize_sequence_cache(
+    cache_dir: Path,
+    dataset: StatefulAugmentedDataset,
+    *,
+    trace_dirs: list[Path],
+    max_scan_rows: int | None,
+    seed: int,
+) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    if not dataset.sequences:
+        raise ValueError("cannot materialize empty sequence cache")
+    total_rows = int(sum(len(seq) for seq in dataset.sequences))
+    seq_offsets_arr = np.empty((len(dataset.sequences) + 1,), dtype=np.int64)
+    seq_offsets_arr[0] = 0
+    for idx, seq in enumerate(dataset.sequences, start=1):
+        seq_offsets_arr[idx] = seq_offsets_arr[idx - 1] + len(seq)
+
+    features = np.lib.format.open_memmap(
+        cache_dir / "features.npy",
+        mode="w+",
+        dtype=np.float16,
+        shape=(total_rows, dataset.hidden_size),
+    )
+    stats = np.lib.format.open_memmap(
+        cache_dir / "stats.npy",
+        mode="w+",
+        dtype=np.float32,
+        shape=(total_rows, dataset.stats_dim),
+    )
+    survival = np.lib.format.open_memmap(
+        cache_dir / "survival.npy",
+        mode="w+",
+        dtype=np.float32,
+        shape=(total_rows, dataset.num_slots),
+    )
+    accepted_len = np.lib.format.open_memmap(
+        cache_dir / "accepted_len.npy",
+        mode="w+",
+        dtype=np.float32,
+        shape=(total_rows,),
+    )
+
+    write_idx = 0
+    next_log = 50_000
+    for seq_idx, seq in enumerate(dataset.sequences):
+        prev_accepted: float | None = None
+        for global_idx in seq:
+            fused, row_stats, row_survival, row_accepted = dataset._row(int(global_idx), prev_accepted)
+            features[write_idx] = fused
+            stats[write_idx] = row_stats
+            survival[write_idx] = row_survival
+            accepted_len[write_idx] = row_accepted
+            prev_accepted = row_accepted
+            write_idx += 1
+            if write_idx >= next_log:
+                print(
+                    json.dumps(
+                        {
+                            "event": "sequence_cache_write_progress",
+                            "rows": write_idx,
+                            "total_rows": total_rows,
+                        }
+                    ),
+                    flush=True,
+                )
+                next_log += 50_000
+        if seq_idx > 0 and seq_idx % 10_000 == 0:
+            features.flush()
+            stats.flush()
+            survival.flush()
+            accepted_len.flush()
+
+    features.flush()
+    stats.flush()
+    survival.flush()
+    accepted_len.flush()
+    np.save(cache_dir / "seq_offsets.npy", seq_offsets_arr)
+    meta = {
+        "version": SEQUENCE_CACHE_VERSION,
+        "trace_dirs": [str(path) for path in trace_dirs],
+        "max_scan_rows": max_scan_rows,
+        "seed": seed,
+        "num_sequences": len(dataset.sequences),
+        "num_rows": total_rows,
+        "hidden_size": dataset.hidden_size,
+        "stats_dim": dataset.stats_dim,
+        "num_slots": dataset.num_slots,
+        "dtype": {
+            "features": "float16",
+            "stats": "float32",
+            "survival": "float32",
+            "accepted_len": "float32",
+        },
+    }
+    (cache_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+    print(json.dumps({"event": "sequence_cache_write_done", **meta}), flush=True)
+
+
+def _split_sequence_indices(
+    num_sequences: int,
+    *,
+    val_fraction: float,
+    max_train_sequences: int | None,
+    max_val_sequences: int | None,
+) -> tuple[list[int], list[int]]:
+    if not 0.0 < val_fraction < 1.0:
+        raise ValueError(f"val_fraction must be in (0, 1), got {val_fraction}")
+    val_count = max(1, int(round(num_sequences * val_fraction)))
+    val_indices = list(range(val_count))
+    train_indices = list(range(val_count, num_sequences))
+    if max_train_sequences is not None:
+        train_indices = train_indices[:max_train_sequences]
+    if max_val_sequences is not None:
+        val_indices = val_indices[:max_val_sequences]
+    return train_indices, val_indices
 
 
 def _collate(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
@@ -481,6 +644,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-sequences", type=int, default=None)
     parser.add_argument("--max-train-sequences", type=int, default=None)
     parser.add_argument("--max-val-sequences", type=int, default=None)
+    parser.add_argument(
+        "--sequence-cache-dir",
+        type=Path,
+        default=None,
+        help="Optional contiguous cache for stateful sequence training. Built if missing, reused if present.",
+    )
+    parser.add_argument("--rebuild-sequence-cache", action="store_true")
+    parser.add_argument("--build-cache-only", action="store_true")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda")
@@ -503,29 +674,102 @@ def main() -> None:
     torch.manual_seed(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(json.dumps({"event": "load_augmented_shards_start", "trace_dirs": [str(p) for p in args.trace_dir]}), flush=True)
-    shards, trace_ids = _load_augmented_shards(
-        args.trace_dir,
-        max_scan_rows=args.max_scan_rows,
-    )
-    print(json.dumps({"event": "load_augmented_shards_done", "shards": len(shards), "rows": sum(s.rows for s in shards)}), flush=True)
-    print(json.dumps({"event": "build_sequences_start", "max_scan_rows": args.max_scan_rows}), flush=True)
-    sequences = _build_sequences(
-        shards,
-        trace_ids,
-        max_scan_rows=args.max_scan_rows,
-        max_sequences=args.max_sequences,
-        seed=args.seed,
-    )
-    print(json.dumps({"event": "build_sequences_done", "sequences": len(sequences), "rows": int(sum(len(s) for s in sequences))}), flush=True)
-    train_sequences, val_sequences = _split_sequences(
-        sequences,
-        val_fraction=args.val_fraction,
-        max_train_sequences=args.max_train_sequences,
-        max_val_sequences=args.max_val_sequences,
-    )
-    train_ds = StatefulAugmentedDataset(shards, train_sequences)
-    val_ds = StatefulAugmentedDataset(shards, val_sequences)
+    if args.sequence_cache_dir is not None and args.rebuild_sequence_cache:
+        for path in (
+            "features.npy",
+            "stats.npy",
+            "survival.npy",
+            "accepted_len.npy",
+            "seq_offsets.npy",
+            "meta.json",
+        ):
+            target = args.sequence_cache_dir / path
+            if target.exists():
+                target.unlink()
+
+    if args.sequence_cache_dir is not None and _sequence_cache_complete(args.sequence_cache_dir):
+        print(
+            json.dumps(
+                {
+                    "event": "sequence_cache_reuse",
+                    "cache_dir": str(args.sequence_cache_dir),
+                }
+            ),
+            flush=True,
+        )
+        if args.build_cache_only:
+            return
+        full_cache_ds = CachedStatefulDataset(args.sequence_cache_dir)
+        train_indices, val_indices = _split_sequence_indices(
+            len(full_cache_ds),
+            val_fraction=args.val_fraction,
+            max_train_sequences=args.max_train_sequences,
+            max_val_sequences=args.max_val_sequences,
+        )
+        train_ds = CachedStatefulDataset(args.sequence_cache_dir, train_indices)
+        val_ds = CachedStatefulDataset(args.sequence_cache_dir, val_indices)
+        train_rows = int(sum(int(full_cache_ds.seq_offsets[i + 1] - full_cache_ds.seq_offsets[i]) for i in train_indices))
+        val_rows = int(sum(int(full_cache_ds.seq_offsets[i + 1] - full_cache_ds.seq_offsets[i]) for i in val_indices))
+    else:
+        print(json.dumps({"event": "load_augmented_shards_start", "trace_dirs": [str(p) for p in args.trace_dir]}), flush=True)
+        shards, trace_ids = _load_augmented_shards(
+            args.trace_dir,
+            max_scan_rows=args.max_scan_rows,
+        )
+        print(json.dumps({"event": "load_augmented_shards_done", "shards": len(shards), "rows": sum(s.rows for s in shards)}), flush=True)
+        print(json.dumps({"event": "build_sequences_start", "max_scan_rows": args.max_scan_rows}), flush=True)
+        sequences = _build_sequences(
+            shards,
+            trace_ids,
+            max_scan_rows=args.max_scan_rows,
+            max_sequences=args.max_sequences,
+            seed=args.seed,
+        )
+        print(json.dumps({"event": "build_sequences_done", "sequences": len(sequences), "rows": int(sum(len(s) for s in sequences))}), flush=True)
+        if args.sequence_cache_dir is not None:
+            cache_ds = StatefulAugmentedDataset(shards, sequences)
+            print(
+                json.dumps(
+                    {
+                        "event": "sequence_cache_write_start",
+                        "cache_dir": str(args.sequence_cache_dir),
+                        "rows": int(sum(len(seq) for seq in sequences)),
+                        "sequences": len(sequences),
+                    }
+                ),
+                flush=True,
+            )
+            _materialize_sequence_cache(
+                args.sequence_cache_dir,
+                cache_ds,
+                trace_dirs=args.trace_dir,
+                max_scan_rows=args.max_scan_rows,
+                seed=args.seed,
+            )
+            if args.build_cache_only:
+                return
+            full_cache_ds = CachedStatefulDataset(args.sequence_cache_dir)
+            train_indices, val_indices = _split_sequence_indices(
+                len(full_cache_ds),
+                val_fraction=args.val_fraction,
+                max_train_sequences=args.max_train_sequences,
+                max_val_sequences=args.max_val_sequences,
+            )
+            train_ds = CachedStatefulDataset(args.sequence_cache_dir, train_indices)
+            val_ds = CachedStatefulDataset(args.sequence_cache_dir, val_indices)
+            train_rows = int(sum(int(full_cache_ds.seq_offsets[i + 1] - full_cache_ds.seq_offsets[i]) for i in train_indices))
+            val_rows = int(sum(int(full_cache_ds.seq_offsets[i + 1] - full_cache_ds.seq_offsets[i]) for i in val_indices))
+        else:
+            train_sequences, val_sequences = _split_sequences(
+                sequences,
+                val_fraction=args.val_fraction,
+                max_train_sequences=args.max_train_sequences,
+                max_val_sequences=args.max_val_sequences,
+            )
+            train_ds = StatefulAugmentedDataset(shards, train_sequences)
+            val_ds = StatefulAugmentedDataset(shards, val_sequences)
+            train_rows = int(sum(len(seq) for seq in train_sequences))
+            val_rows = int(sum(len(seq) for seq in val_sequences))
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     arms = tuple(int(x) for x in args.arms.split(",") if x)
     alphas = tuple(float(x) for x in args.alphas.split(",") if x)
@@ -551,8 +795,8 @@ def main() -> None:
             "num_slots": train_ds.num_slots,
             "train_sequences": len(train_ds),
             "val_sequences": len(val_ds),
-            "train_rows": int(sum(len(seq) for seq in train_sequences)),
-            "val_rows": int(sum(len(seq) for seq in val_sequences)),
+            "train_rows": train_rows,
+            "val_rows": val_rows,
             "arms": arms,
             "alphas": alphas,
             "stats_columns": [
