@@ -269,10 +269,33 @@ def _materialize_sequence_cache(
     if not dataset.sequences:
         raise ValueError("cannot materialize empty sequence cache")
     total_rows = int(sum(len(seq) for seq in dataset.sequences))
+    total_global_rows = int(sum(shard.rows for shard in dataset.shards))
     seq_offsets_arr = np.empty((len(dataset.sequences) + 1,), dtype=np.int64)
     seq_offsets_arr[0] = 0
     for idx, seq in enumerate(dataset.sequences, start=1):
         seq_offsets_arr[idx] = seq_offsets_arr[idx - 1] + len(seq)
+
+    accepted_by_global = np.empty((total_global_rows,), dtype=np.float32)
+    global_offset = 0
+    for shard in dataset.shards:
+        accepted_by_global[global_offset : global_offset + shard.rows] = np.asarray(
+            shard.accepted_len[: shard.rows],
+            dtype=np.float32,
+        )
+        global_offset += shard.rows
+
+    global_to_write = np.full((total_global_rows,), -1, dtype=np.int64)
+    previous_accepted = np.full((total_global_rows,), np.nan, dtype=np.float32)
+    write_idx = 0
+    for seq in dataset.sequences:
+        prev_global_idx: int | None = None
+        for global_idx_raw in seq:
+            global_idx = int(global_idx_raw)
+            global_to_write[global_idx] = write_idx
+            if prev_global_idx is not None:
+                previous_accepted[global_idx] = accepted_by_global[prev_global_idx]
+            prev_global_idx = global_idx
+            write_idx += 1
 
     features = np.lib.format.open_memmap(
         cache_dir / "features.npy",
@@ -299,35 +322,51 @@ def _materialize_sequence_cache(
         shape=(total_rows,),
     )
 
-    write_idx = 0
+    global_offset = 0
     next_log = 50_000
-    for seq_idx, seq in enumerate(dataset.sequences):
-        prev_accepted: float | None = None
-        for global_idx in seq:
-            fused, row_stats, row_survival, row_accepted = dataset._row(int(global_idx), prev_accepted)
-            features[write_idx] = fused
-            stats[write_idx] = row_stats
-            survival[write_idx] = row_survival
-            accepted_len[write_idx] = row_accepted
-            prev_accepted = row_accepted
-            write_idx += 1
-            if write_idx >= next_log:
+    written = 0
+    for shard in dataset.shards:
+        for local_idx in range(shard.rows):
+            global_idx = global_offset + local_idx
+            out_idx = int(global_to_write[global_idx])
+            if out_idx < 0:
+                continue
+            raw_mask = np.asarray(shard.mask[local_idx], dtype=np.float32)
+            valid = np.flatnonzero(raw_mask > 0.5)
+            feature_idx = int(valid[-1]) if valid.size else int(raw_mask.shape[0] - 1)
+            features[out_idx] = np.asarray(shard.features[local_idx, feature_idx], dtype=np.float16)
+            if shard.predraft_stats is not None:
+                stats[out_idx] = np.asarray(shard.predraft_stats[local_idx], dtype=np.float32)
+            else:
+                row_stats = np.zeros((dataset.stats_dim,), dtype=np.float32)
+                prev_accepted = float(previous_accepted[global_idx])
+                if not math.isnan(prev_accepted):
+                    norm = prev_accepted / float(max(dataset.num_slots, 1))
+                    row_stats[4:8] = np.asarray([norm, norm, 1.0, 1.0], dtype=np.float32)
+                stats[out_idx] = row_stats
+            survival[out_idx] = np.asarray(shard.survival[local_idx], dtype=np.float32)
+            accepted_len[out_idx] = accepted_by_global[global_idx]
+            written += 1
+            if written >= next_log:
                 print(
                     json.dumps(
                         {
                             "event": "sequence_cache_write_progress",
-                            "rows": write_idx,
+                            "rows": written,
                             "total_rows": total_rows,
                         }
                     ),
                     flush=True,
                 )
                 next_log += 50_000
-        if seq_idx > 0 and seq_idx % 10_000 == 0:
-            features.flush()
-            stats.flush()
-            survival.flush()
-            accepted_len.flush()
+        global_offset += shard.rows
+        features.flush()
+        stats.flush()
+        survival.flush()
+        accepted_len.flush()
+
+    if written != total_rows:
+        raise RuntimeError(f"sequence cache wrote {written} rows, expected {total_rows}")
 
     features.flush()
     stats.flush()
