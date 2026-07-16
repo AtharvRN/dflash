@@ -694,6 +694,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--disable-cudnn",
+        action="store_true",
+        help="Disable cuDNN kernels. Useful when GRU backward is unstable in a CUDA image.",
+    )
     parser.add_argument("--arms", default="4,8,12,16")
     parser.add_argument("--alphas", default="0.80,0.82,0.84,0.86,0.88,0.90,0.92,0.94,0.95,0.96,0.98")
     parser.add_argument("--selection-min-retention", type=float, default=0.95)
@@ -711,6 +716,8 @@ def main() -> None:
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    if args.disable_cudnn:
+        torch.backends.cudnn.enabled = False
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.sequence_cache_dir is not None and args.rebuild_sequence_cache:
