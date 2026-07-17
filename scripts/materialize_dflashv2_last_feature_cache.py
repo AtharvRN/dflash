@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import shutil
 import time
@@ -170,6 +171,178 @@ def _materialize_split(
         "input_dim": input_dim,
         "num_slots": num_slots,
         "elapsed_s": round(time.time() - started, 3),
+        "shards": shard_rows,
+    }
+    _write_json(split_dir / "meta.json", meta)
+    print(json.dumps({"event": "materialize_split_done", **meta}), flush=True)
+    return meta
+
+
+def _materialize_shard_task(task: dict[str, Any]) -> dict[str, Any]:
+    shard_path = Path(task["shard_path"])
+    split_dir = Path(task["split_dir"])
+    shard_idx = int(task["shard_index"])
+    local_indices = np.asarray(task["local_indices"], dtype=np.int64)
+    out_base = int(task["out_base"])
+    max_read_rows = int(task["max_read_rows"])
+    max_output_rows = int(task["max_output_rows"])
+
+    shard_started = time.time()
+    shard_features = np.load(shard_path / "features.npy", mmap_mode="r")
+    shard_mask = np.load(shard_path / "mask.npy", mmap_mode="r")
+    shard_survival = np.load(shard_path / "survival.npy", mmap_mode="r")
+    shard_accepted = np.load(shard_path / "accepted_len.npy", mmap_mode="r")
+
+    features = np.load(split_dir / "features.npy", mmap_mode="r+")
+    mask = np.load(split_dir / "mask.npy", mmap_mode="r+")
+    survival = np.load(split_dir / "survival.npy", mmap_mode="r+")
+    accepted = np.load(split_dir / "accepted_len.npy", mmap_mode="r+")
+
+    rel_idx = 0
+    while rel_idx < int(local_indices.shape[0]):
+        chunk_start = rel_idx
+        first_local = int(local_indices[chunk_start])
+        rel_idx += 1
+        while rel_idx < int(local_indices.shape[0]):
+            next_local = int(local_indices[rel_idx])
+            if rel_idx - chunk_start >= max_output_rows:
+                break
+            if next_local - first_local >= max_read_rows:
+                break
+            rel_idx += 1
+
+        chunk = local_indices[chunk_start:rel_idx].astype(np.int64, copy=False)
+        read_start = int(chunk[0])
+        read_end = int(chunk[-1]) + 1
+        positions = chunk - read_start
+        out_start = out_base + chunk_start
+        out_end = out_base + rel_idx
+
+        raw_mask = np.asarray(shard_mask[read_start:read_end], dtype=np.float32)
+        valid_mask = raw_mask > 0.5
+        has_valid = valid_mask.any(axis=1)
+        last_valid = valid_mask.shape[1] - 1 - np.argmax(valid_mask[:, ::-1], axis=1)
+        last_valid = np.where(has_valid, last_valid, valid_mask.shape[1] - 1)
+        selected_last = last_valid[positions]
+
+        feature_block = np.asarray(shard_features[read_start:read_end], dtype=np.float16)
+        features[out_start:out_end, 0] = feature_block[positions, selected_last]
+        mask[out_start:out_end, 0] = has_valid[positions].astype(np.float32)
+        survival[out_start:out_end] = np.asarray(shard_survival[chunk], dtype=np.float32)
+        accepted[out_start:out_end] = np.asarray(shard_accepted[chunk], dtype=np.float32)
+
+    features.flush()
+    mask.flush()
+    survival.flush()
+    accepted.flush()
+    return {
+        "shard": str(shard_path),
+        "shard_index": shard_idx,
+        "rows": int(local_indices.shape[0]),
+        "elapsed_s": round(time.time() - shard_started, 3),
+    }
+
+
+def _materialize_split_parallel(
+    *,
+    name: str,
+    shards: list[Any],
+    offsets: list[int],
+    indices: np.ndarray,
+    output_dir: Path,
+    max_read_rows: int,
+    max_output_rows: int,
+    parallel_workers: int,
+) -> dict[str, Any]:
+    split_dir = output_dir / name
+    split_dir.mkdir(parents=True, exist_ok=True)
+
+    order = np.sort(np.asarray(indices, dtype=np.int64))
+    input_dim = int(shards[0].features.shape[2])
+    num_slots = int(shards[0].survival.shape[1])
+
+    features = np.lib.format.open_memmap(
+        split_dir / "features.npy",
+        mode="w+",
+        dtype=np.float16,
+        shape=(order.shape[0], 1, input_dim),
+    )
+    mask = np.lib.format.open_memmap(
+        split_dir / "mask.npy",
+        mode="w+",
+        dtype=np.float32,
+        shape=(order.shape[0], 1),
+    )
+    survival = np.lib.format.open_memmap(
+        split_dir / "survival.npy",
+        mode="w+",
+        dtype=np.float32,
+        shape=(order.shape[0], num_slots),
+    )
+    accepted = np.lib.format.open_memmap(
+        split_dir / "accepted_len.npy",
+        mode="w+",
+        dtype=np.float32,
+        shape=(order.shape[0],),
+    )
+    features.flush()
+    mask.flush()
+    survival.flush()
+    accepted.flush()
+    del features, mask, survival, accepted
+
+    tasks: list[dict[str, Any]] = []
+    for shard_idx, shard in enumerate(shards):
+        shard_start = offsets[shard_idx]
+        shard_end = shard_start + int(shard.rows)
+        left = np.searchsorted(order, shard_start, side="left")
+        right = np.searchsorted(order, shard_end, side="left")
+        if right <= left:
+            continue
+        local_indices = order[left:right] - shard_start
+        tasks.append(
+            {
+                "shard_path": str(shard.path),
+                "split_dir": str(split_dir),
+                "shard_index": shard_idx,
+                "local_indices": local_indices,
+                "out_base": int(left),
+                "max_read_rows": int(max_read_rows),
+                "max_output_rows": int(max_output_rows),
+            }
+        )
+
+    started = time.time()
+    shard_rows: list[dict[str, Any]] = []
+    rows_done = 0
+    with concurrent.futures.ProcessPoolExecutor(max_workers=parallel_workers) as executor:
+        futures = [executor.submit(_materialize_shard_task, task) for task in tasks]
+        for future in concurrent.futures.as_completed(futures):
+            item = future.result()
+            shard_rows.append(item)
+            rows_done += int(item["rows"])
+            print(
+                json.dumps(
+                    {
+                        "event": "materialize_shard_done",
+                        "split": name,
+                        "parallel_workers": int(parallel_workers),
+                        "split_rows_done": int(rows_done),
+                        "split_rows_total": int(order.shape[0]),
+                        **item,
+                    }
+                ),
+                flush=True,
+            )
+
+    shard_rows.sort(key=lambda item: int(item["shard_index"]))
+    meta = {
+        "split": name,
+        "rows": int(order.shape[0]),
+        "input_dim": input_dim,
+        "num_slots": num_slots,
+        "elapsed_s": round(time.time() - started, 3),
+        "parallel_workers": int(parallel_workers),
         "shards": shard_rows,
     }
     _write_json(split_dir / "meta.json", meta)
@@ -416,6 +589,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-read-rows", type=int, default=1024)
     parser.add_argument("--max-output-rows", type=int, default=1024)
     parser.add_argument("--copy-rows", type=int, default=65536)
+    parser.add_argument(
+        "--parallel-workers",
+        type=int,
+        default=1,
+        help="Shard-level worker processes for materializing the temporary _all cache.",
+    )
     parser.add_argument("--selection-mode", choices=("random", "prefix"), default="random")
     parser.add_argument("--keep-all-cache", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
@@ -516,16 +695,28 @@ def main() -> None:
 
     combined_indices = np.sort(np.concatenate([train_indices, val_indices]).astype(np.int64, copy=False))
     all_dir = args.output_dir / "_all"
-    all_meta = _materialize_split(
-        name="_all",
-        shards=shards,
-        offsets=offsets,
-        indices=combined_indices,
-        output_dir=args.output_dir,
-        progress_every=args.progress_every,
-        max_read_rows=args.max_read_rows,
-        max_output_rows=args.max_output_rows,
-    )
+    if args.parallel_workers > 1:
+        all_meta = _materialize_split_parallel(
+            name="_all",
+            shards=shards,
+            offsets=offsets,
+            indices=combined_indices,
+            output_dir=args.output_dir,
+            max_read_rows=args.max_read_rows,
+            max_output_rows=args.max_output_rows,
+            parallel_workers=args.parallel_workers,
+        )
+    else:
+        all_meta = _materialize_split(
+            name="_all",
+            shards=shards,
+            offsets=offsets,
+            indices=combined_indices,
+            output_dir=args.output_dir,
+            progress_every=args.progress_every,
+            max_read_rows=args.max_read_rows,
+            max_output_rows=args.max_output_rows,
+        )
 
     rank = np.empty((total_rows,), dtype=np.int64)
     rank[combined_indices] = np.arange(combined_indices.shape[0], dtype=np.int64)
