@@ -501,6 +501,54 @@ def _load_or_create_val_prompts(
     return set(chosen)
 
 
+def _read_prompt_split_shard_task(task: dict[str, Any]) -> dict[str, Any]:
+    metadata_path = Path(task["metadata_path"])
+    shard_start = int(task["shard_start"])
+    shard_rows = int(task["shard_rows"])
+    prompt_key = str(task["prompt_key"])
+    val_prompt_ids = {str(item) for item in task["val_prompt_ids"]}
+    shard_index = int(task["shard_index"])
+
+    if not metadata_path.exists():
+        return {
+            "shard_index": shard_index,
+            "metadata_path": str(metadata_path),
+            "missing": True,
+            "train": [],
+            "val": [],
+            "observed_prompts": [],
+            "observed_val_prompts": [],
+        }
+
+    train: list[int] = []
+    val: list[int] = []
+    observed_prompts: set[str] = set()
+    observed_val_prompts: set[str] = set()
+    with metadata_path.open() as f:
+        for local_idx, line in enumerate(f):
+            if local_idx >= shard_rows:
+                break
+            row = json.loads(line)
+            prompt_id = _metadata_prompt_key(row, prompt_key)
+            observed_prompts.add(prompt_id)
+            idx = shard_start + local_idx
+            if prompt_id in val_prompt_ids:
+                val.append(idx)
+                observed_val_prompts.add(prompt_id)
+            else:
+                train.append(idx)
+
+    return {
+        "shard_index": shard_index,
+        "metadata_path": str(metadata_path),
+        "missing": False,
+        "train": train,
+        "val": val,
+        "observed_prompts": sorted(observed_prompts),
+        "observed_val_prompts": sorted(observed_val_prompts),
+    }
+
+
 def _make_prompt_splits_from_metadata(
     *,
     shards: list[Any],
@@ -510,7 +558,91 @@ def _make_prompt_splits_from_metadata(
     val_prompt_count: int,
     seed: int,
     max_total_rows: int | None,
+    parallel_workers: int,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    if val_prompt_ids_path.exists():
+        val_prompt_ids = _load_or_create_val_prompts(
+            prompt_ids=[],
+            path=val_prompt_ids_path,
+            val_prompt_count=val_prompt_count,
+            seed=seed,
+        )
+        tasks = [
+            {
+                "metadata_path": str(shard.path / "metadata.jsonl"),
+                "shard_start": int(offsets[shard_idx]),
+                "shard_rows": int(shard.rows),
+                "prompt_key": prompt_key,
+                "val_prompt_ids": sorted(val_prompt_ids),
+                "shard_index": int(shard_idx),
+            }
+            for shard_idx, shard in enumerate(shards)
+        ]
+        results: list[dict[str, Any]] = []
+        started = time.time()
+        if parallel_workers > 1:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=parallel_workers) as executor:
+                futures = [executor.submit(_read_prompt_split_shard_task, task) for task in tasks]
+                for future in concurrent.futures.as_completed(futures):
+                    result = future.result()
+                    results.append(result)
+                    print(
+                        json.dumps(
+                            {
+                                "event": "metadata_split_shard_done",
+                                "parallel_workers": int(parallel_workers),
+                                "shards_done": len(results),
+                                "shards_total": len(tasks),
+                                "shard_index": int(result["shard_index"]),
+                                "train_rows": len(result["train"]),
+                                "val_rows": len(result["val"]),
+                                "elapsed_s": round(time.time() - started, 3),
+                            }
+                        ),
+                        flush=True,
+                    )
+        else:
+            for task in tasks:
+                result = _read_prompt_split_shard_task(task)
+                results.append(result)
+
+        results.sort(key=lambda item: int(item["shard_index"]))
+        missing_metadata = [str(item["metadata_path"]) for item in results if item["missing"]]
+        if missing_metadata:
+            raise FileNotFoundError(
+                "prompt split requires metadata.jsonl for every shard; missing: "
+                + ", ".join(missing_metadata[:5])
+            )
+
+        train = [idx for item in results for idx in item["train"]]
+        val = [idx for item in results for idx in item["val"]]
+        observed_prompts = {prompt for item in results for prompt in item["observed_prompts"]}
+        observed_val_prompts = {prompt for item in results for prompt in item["observed_val_prompts"]}
+        if not train and not val:
+            raise ValueError("no rows found while reading metadata for prompt split")
+
+        rng = np.random.default_rng(seed)
+        train_arr = np.asarray(train, dtype=np.int64)
+        if max_total_rows is not None and train_arr.shape[0] + len(val) > max_total_rows:
+            train_budget = max(0, int(max_total_rows) - len(val))
+            if train_budget < train_arr.shape[0]:
+                train_arr = rng.choice(train_arr, size=train_budget, replace=False)
+        val_arr = np.asarray(val, dtype=np.int64)
+        meta = {
+            "split_by_prompt_metadata": True,
+            "prompt_key": prompt_key,
+            "val_prompt_ids_path": str(val_prompt_ids_path),
+            "num_observed_rows": int(len(train) + len(val)),
+            "num_observed_prompts": int(len(observed_prompts)),
+            "num_val_prompts_configured": int(len(val_prompt_ids)),
+            "num_val_prompts_observed": int(len(observed_val_prompts)),
+            "train_rows": int(train_arr.shape[0]),
+            "val_rows": int(val_arr.shape[0]),
+            "metadata_parallel_workers": int(parallel_workers),
+            "metadata_elapsed_s": round(time.time() - started, 3),
+        }
+        return train_arr, val_arr, meta
+
     row_indices: list[int] = []
     prompt_ids: list[str] = []
     missing_metadata: list[str] = []
@@ -667,6 +799,7 @@ def main() -> None:
             val_prompt_count=args.val_prompt_count,
             seed=args.seed,
             max_total_rows=args.max_total_rows,
+            parallel_workers=args.parallel_workers,
         )
     else:
         train_indices, val_indices = _make_materializer_splits(
