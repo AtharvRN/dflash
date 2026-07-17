@@ -280,6 +280,125 @@ def _make_materializer_splits(
     return selected[calibration_rows:], selected[:calibration_rows]
 
 
+def _metadata_prompt_key(row: dict[str, Any], prompt_key: str) -> str:
+    value = row.get(prompt_key)
+    if value is None:
+        value = row.get("manifest_index")
+    if value is None:
+        value = row.get("source_id")
+    if value is None:
+        value = row.get("prompt_index")
+    if value is None:
+        raise KeyError(f"metadata row has no prompt key {prompt_key!r}, manifest_index, source_id, or prompt_index")
+    return str(value)
+
+
+def _load_or_create_val_prompts(
+    *,
+    prompt_ids: list[str],
+    path: Path,
+    val_prompt_count: int,
+    seed: int,
+) -> set[str]:
+    if path.exists():
+        payload = json.loads(path.read_text())
+        if isinstance(payload, dict):
+            values = payload.get("val_prompt_ids")
+        else:
+            values = payload
+        if not isinstance(values, list):
+            raise ValueError(f"{path} must contain a list or a dict with val_prompt_ids")
+        return {str(item) for item in values}
+
+    unique = sorted(set(prompt_ids))
+    if not unique:
+        raise ValueError("cannot create validation prompt split from empty prompt set")
+    count = min(int(val_prompt_count), len(unique))
+    rng = np.random.default_rng(seed)
+    chosen = sorted(str(unique[int(idx)]) for idx in rng.choice(len(unique), size=count, replace=False))
+    payload = {
+        "format": "dflashv2_fixed_val_prompt_ids_v1",
+        "seed": int(seed),
+        "val_prompt_count_requested": int(val_prompt_count),
+        "num_observed_prompts": int(len(unique)),
+        "num_val_prompts": int(len(chosen)),
+        "val_prompt_ids": chosen,
+    }
+    _write_json(path, payload)
+    return set(chosen)
+
+
+def _make_prompt_splits_from_metadata(
+    *,
+    shards: list[Any],
+    offsets: list[int],
+    prompt_key: str,
+    val_prompt_ids_path: Path,
+    val_prompt_count: int,
+    seed: int,
+    max_total_rows: int | None,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    row_indices: list[int] = []
+    prompt_ids: list[str] = []
+    missing_metadata: list[str] = []
+    for shard_idx, shard in enumerate(shards):
+        metadata_path = shard.path / "metadata.jsonl"
+        if not metadata_path.exists():
+            missing_metadata.append(str(metadata_path))
+            continue
+        shard_start = offsets[shard_idx]
+        with metadata_path.open() as f:
+            for local_idx, line in enumerate(f):
+                if local_idx >= int(shard.rows):
+                    break
+                row = json.loads(line)
+                prompt_id = _metadata_prompt_key(row, prompt_key)
+                row_indices.append(shard_start + local_idx)
+                prompt_ids.append(prompt_id)
+
+    if missing_metadata:
+        raise FileNotFoundError(
+            "prompt split requires metadata.jsonl for every shard; missing: "
+            + ", ".join(missing_metadata[:5])
+        )
+    if not row_indices:
+        raise ValueError("no rows found while reading metadata for prompt split")
+
+    val_prompt_ids = _load_or_create_val_prompts(
+        prompt_ids=prompt_ids,
+        path=val_prompt_ids_path,
+        val_prompt_count=val_prompt_count,
+        seed=seed,
+    )
+    train: list[int] = []
+    val: list[int] = []
+    for idx, prompt_id in zip(row_indices, prompt_ids, strict=True):
+        if prompt_id in val_prompt_ids:
+            val.append(idx)
+        else:
+            train.append(idx)
+
+    rng = np.random.default_rng(seed)
+    train_arr = np.asarray(train, dtype=np.int64)
+    if max_total_rows is not None and train_arr.shape[0] + len(val) > max_total_rows:
+        train_budget = max(0, int(max_total_rows) - len(val))
+        if train_budget < train_arr.shape[0]:
+            train_arr = rng.choice(train_arr, size=train_budget, replace=False)
+    val_arr = np.asarray(val, dtype=np.int64)
+    meta = {
+        "split_by_prompt_metadata": True,
+        "prompt_key": prompt_key,
+        "val_prompt_ids_path": str(val_prompt_ids_path),
+        "num_observed_rows": int(len(row_indices)),
+        "num_observed_prompts": int(len(set(prompt_ids))),
+        "num_val_prompts_configured": int(len(val_prompt_ids)),
+        "num_val_prompts_observed": int(len(set(prompt_ids).intersection(val_prompt_ids))),
+        "train_rows": int(train_arr.shape[0]),
+        "val_rows": int(val_arr.shape[0]),
+    }
+    return train_arr, val_arr, meta
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -300,6 +419,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--selection-mode", choices=("random", "prefix"), default="random")
     parser.add_argument("--keep-all-cache", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--split-by-prompt-metadata",
+        action="store_true",
+        help="Split train/val by prompt id from shard metadata.jsonl instead of random rows.",
+    )
+    parser.add_argument(
+        "--prompt-key",
+        default="manifest_index",
+        help="Metadata key used for fixed prompt split; falls back to manifest_index/source_id/prompt_index.",
+    )
+    parser.add_argument(
+        "--val-prompt-count",
+        type=int,
+        default=5000,
+        help="Number of observed prompts to assign to validation when creating a new prompt-id file.",
+    )
+    parser.add_argument(
+        "--val-prompt-ids-path",
+        type=Path,
+        default=None,
+        help="JSON file containing fixed validation prompt ids. Created if missing.",
+    )
     return parser.parse_args()
 
 
@@ -336,13 +477,26 @@ def main() -> None:
         flush=True,
     )
 
-    train_indices, val_indices = _make_materializer_splits(
-        total_rows=total_rows,
-        max_total_rows=args.max_total_rows,
-        calibration_rows=args.calibration_rows,
-        seed=args.seed,
-        selection_mode=args.selection_mode,
-    )
+    prompt_split_meta: dict[str, Any] = {}
+    if args.split_by_prompt_metadata:
+        val_prompt_ids_path = args.val_prompt_ids_path or (args.output_dir / "val_prompt_ids.json")
+        train_indices, val_indices, prompt_split_meta = _make_prompt_splits_from_metadata(
+            shards=shards,
+            offsets=offsets,
+            prompt_key=args.prompt_key,
+            val_prompt_ids_path=val_prompt_ids_path,
+            val_prompt_count=args.val_prompt_count,
+            seed=args.seed,
+            max_total_rows=args.max_total_rows,
+        )
+    else:
+        train_indices, val_indices = _make_materializer_splits(
+            total_rows=total_rows,
+            max_total_rows=args.max_total_rows,
+            calibration_rows=args.calibration_rows,
+            seed=args.seed,
+            selection_mode=args.selection_mode,
+        )
     run_meta: dict[str, Any] = {
         "trace_dirs": [str(path) for path in args.trace_dir],
         "output_dir": str(args.output_dir),
@@ -354,6 +508,7 @@ def main() -> None:
         "calibration_rows": args.calibration_rows,
         "seed": args.seed,
         "selection_mode": args.selection_mode,
+        **prompt_split_meta,
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
     _write_json(args.output_dir / "meta.json", run_meta)
