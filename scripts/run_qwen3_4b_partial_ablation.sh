@@ -67,6 +67,7 @@ PY
     --alphas 0.8,0.85,0.9,0.92,0.95 \
     --selection-min-retention 0.95 \
     --checkpoint-selection selected_accept_ratio \
+    "$@" \
     >> "$log" 2>&1
 
   cp "$out/eval_math500/eval_metrics.json" "$EVALROOT/${name}_math500.json"
