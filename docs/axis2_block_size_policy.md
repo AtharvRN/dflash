@@ -306,6 +306,55 @@ token_gru_softce_tau1_dist0p2
 token_gru_ce_emd0p5_dist0p1
 ```
 
+### Qwen3-4B Integer-Horizon Result, 2026-07-18
+
+This run answers the specific question of whether the Qwen3-4B fused-only
+integer-horizon predictor had been trained beyond the small partial traces. It
+had not; this is the first full recovered-trace Qwen3-4B integer-horizon sweep.
+
+```text
+trace:
+  /workspace/dflashv2_data/traces/dflashv2_qwen3_4b_b16_instruct100k_full_4a100_recovered_20260717
+
+held-out eval:
+  /workspace/dflashv2_data/traces/math500_qwen3_4b_b16_eval_20260716_215958
+
+run id:
+  integer_horizon_qwen3_4b_recovered3510k_fixedval5k_20260718_044108
+
+cache:
+  /tmp/dflashv2_cache/integer_horizon_qwen3_4b_recovered3510k_fixedval5k_20260718_044108
+
+artifacts:
+  /workspace/dflashv2_data/runs/integer_horizon_qwen3_4b_recovered3510k_fixedval5k_20260718_044108
+  /workspace/dflashv2_data/evals/integer_horizon_qwen3_4b_recovered3510k_fixedval5k_20260718_044108
+  /workspace/dflashv2_data/logs/integer_horizon_qwen3_4b_recovered3510k_fixedval5k_20260718_044108
+
+materialized split:
+  selected rows: 3,481,558
+  train rows:    3,273,552
+  val rows:        208,006
+  observed prompts: 83,737
+  fixed val prompts: 5,000
+  input dim: 2,560
+```
+
+Math500 held-out integer-horizon metrics:
+
+```text
+objective                     expected MAE  rounded MAE  exact   argmax MAE  mean pred  mean target
+ce_dist0p2                    3.120         3.111        0.124   3.538       5.845      6.322
+ce_emd0p5_dist0p1             3.134         3.123        0.121   3.591       6.032      6.322
+softce_tau1_dist0p2           3.149         3.143        0.108   3.444       5.957      6.322
+softce_tau2_emd0p5_dist0p1    3.238         3.226        0.094   3.407       6.136      6.322
+```
+
+Conclusion: scaling Qwen3-4B fused-only integer-horizon training from the
+earlier 323K partial trace to the full 3.48M-row recovered split improved
+Math500 rounded MAE from roughly `3.316` to `3.111`, but the predictor is still
+weak. More data helps, but fused context alone is not enough to close the
+oracle gap.
+
 ### Training Loss
 
 For each trace row with label `H_t`, construct binary survival labels:
