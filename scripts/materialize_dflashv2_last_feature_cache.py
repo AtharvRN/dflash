@@ -5,6 +5,7 @@ import concurrent.futures
 import json
 import shutil
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -12,9 +13,69 @@ import numpy as np
 
 from train_dflashv2_horizon_predictor import (
     _compact_cache_ready,
-    _load_shards_multi,
     _make_splits,
 )
+
+
+@dataclass
+class MaterializeShard:
+    path: Path
+    rows: int
+    _features: np.ndarray | None = field(default=None, init=False, repr=False)
+    _mask: np.ndarray | None = field(default=None, init=False, repr=False)
+    _survival: np.ndarray | None = field(default=None, init=False, repr=False)
+    _accepted_len: np.ndarray | None = field(default=None, init=False, repr=False)
+
+    @property
+    def features(self) -> np.ndarray:
+        if self._features is None:
+            self._features = np.load(self.path / "features.npy", mmap_mode="r")
+        return self._features
+
+    @property
+    def mask(self) -> np.ndarray:
+        if self._mask is None:
+            self._mask = np.load(self.path / "mask.npy", mmap_mode="r")
+        return self._mask
+
+    @property
+    def survival(self) -> np.ndarray:
+        if self._survival is None:
+            self._survival = np.load(self.path / "survival.npy", mmap_mode="r")
+        return self._survival
+
+    @property
+    def accepted_len(self) -> np.ndarray:
+        if self._accepted_len is None:
+            self._accepted_len = np.load(self.path / "accepted_len.npy", mmap_mode="r")
+        return self._accepted_len
+
+
+def _load_materialize_shards(trace_dirs: list[Path]) -> list[MaterializeShard]:
+    shards: list[MaterializeShard] = []
+    for trace_dir in trace_dirs:
+        manifest_path = trace_dir / "manifest.json"
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"missing trace manifest: {manifest_path}")
+        manifest = json.loads(manifest_path.read_text())
+        for item in manifest["shards"]:
+            rows = int(item["rows"])
+            if rows <= 0:
+                continue
+            shard_path = Path(item["path"])
+            shard_dir = shard_path if shard_path.is_absolute() else trace_dir / shard_path
+            shards.append(MaterializeShard(path=shard_dir, rows=rows))
+    if not shards:
+        raise ValueError(f"no non-empty shards found in {trace_dirs}")
+    return shards
+
+
+def _input_dim(shard: MaterializeShard) -> int:
+    return int(np.load(shard.path / "features.npy", mmap_mode="r").shape[2])
+
+
+def _num_slots(shard: MaterializeShard) -> int:
+    return int(np.load(shard.path / "survival.npy", mmap_mode="r").shape[1])
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -47,8 +108,8 @@ def _materialize_split(
     split_dir.mkdir(parents=True, exist_ok=True)
 
     order = np.sort(np.asarray(indices, dtype=np.int64))
-    input_dim = int(shards[0].features.shape[2])
-    num_slots = int(shards[0].survival.shape[1])
+    input_dim = _input_dim(shards[0])
+    num_slots = _num_slots(shards[0])
 
     features = np.lib.format.open_memmap(
         split_dir / "features.npy",
@@ -315,8 +376,8 @@ def _materialize_split_parallel(
     split_dir.mkdir(parents=True, exist_ok=True)
 
     order = np.sort(np.asarray(indices, dtype=np.int64))
-    input_dim = int(shards[0].features.shape[2])
-    num_slots = int(shards[0].survival.shape[1])
+    input_dim = _input_dim(shards[0])
+    num_slots = _num_slots(shards[0])
 
     features = np.lib.format.open_memmap(
         split_dir / "features.npy",
@@ -894,7 +955,7 @@ def main() -> None:
         ),
         flush=True,
     )
-    shards = _load_shards_multi(args.trace_dir)
+    shards = _load_materialize_shards(args.trace_dir)
     offsets, total_rows = _build_offsets(shards)
     print(
         json.dumps(
