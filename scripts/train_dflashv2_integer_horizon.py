@@ -44,11 +44,12 @@ class CompactIntegerHorizonDataset(Dataset[tuple[torch.Tensor, torch.Tensor, tor
             if (split_dir / "predraft_token_mask.npy").exists()
             else None
         )
+        self.has_tokens = self.token_ids is not None and self.token_mask is not None
         self.rows = int(self.accepted_len.shape[0]) if max_rows is None else min(int(self.accepted_len.shape[0]), max_rows)
         self.context_window = int(self.features.shape[1])
         self.hidden_size = int(self.features.shape[2])
         self.num_classes = int(self.survival.shape[1]) + 1
-        self.token_window = int(self.token_ids.shape[1]) if self.token_ids is not None else 1
+        self.token_window = int(self.token_ids.shape[1]) if self.has_tokens else 1
 
     def __len__(self) -> int:
         return self.rows
@@ -148,9 +149,12 @@ class IntegerHorizonHead(nn.Module):
         vocab_size: int,
         token_embed_dim: int,
         token_hidden_size: int,
+        token_encoder: str,
+        token_window: int,
     ) -> None:
         super().__init__()
         self.use_token_tower = use_token_tower
+        self.token_encoder = token_encoder
         self.input_proj = nn.Sequential(
             nn.Linear(input_dim, proj_dim),
             nn.GELU(),
@@ -160,8 +164,19 @@ class IntegerHorizonHead(nn.Module):
         token_dim = 0
         if use_token_tower:
             self.token_embed = nn.Embedding(vocab_size, token_embed_dim, padding_idx=0)
+            self.token_pos_embed = nn.Embedding(token_window, token_embed_dim)
+            if token_encoder == "gru":
+                self.token_gru = nn.GRU(
+                    input_size=token_embed_dim,
+                    hidden_size=token_hidden_size,
+                    batch_first=True,
+                )
+            elif token_encoder == "mean":
+                self.token_gru = None
+            else:
+                raise ValueError(f"unsupported token_encoder={token_encoder!r}")
             self.token_proj = nn.Sequential(
-                nn.Linear(token_embed_dim, token_hidden_size),
+                nn.Linear(token_hidden_size if token_encoder == "gru" else token_embed_dim, token_hidden_size),
                 nn.GELU(),
                 nn.LayerNorm(token_hidden_size),
                 nn.Dropout(dropout),
@@ -169,6 +184,8 @@ class IntegerHorizonHead(nn.Module):
             token_dim = token_hidden_size
         else:
             self.token_embed = None
+            self.token_pos_embed = None
+            self.token_gru = None
             self.token_proj = None
         head_in = proj_dim + token_dim
         self.head = nn.Sequential(
@@ -198,11 +215,23 @@ class IntegerHorizonHead(nn.Module):
         if not self.use_token_tower:
             return self.head(fused)
         assert self.token_embed is not None
+        assert self.token_pos_embed is not None
         assert self.token_proj is not None
         ids = token_ids.clamp(min=0, max=self.token_embed.num_embeddings - 1)
         tok = self.token_embed(ids)
+        positions = torch.arange(ids.shape[1], device=ids.device).clamp(max=self.token_pos_embed.num_embeddings - 1)
+        tok = tok + self.token_pos_embed(positions).unsqueeze(0)
         weights = token_mask.unsqueeze(-1).float()
-        pooled = (tok * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+        tok = tok * weights
+        if self.token_encoder == "gru":
+            assert self.token_gru is not None
+            out, _ = self.token_gru(tok)
+            token_positions = torch.arange(token_mask.shape[1], device=token_mask.device).view(1, -1)
+            last_valid = (token_positions * (token_mask > 0.5)).max(dim=1).values.long()
+            gather_idx = last_valid.view(-1, 1, 1).expand(-1, 1, out.shape[-1])
+            pooled = out.gather(dim=1, index=gather_idx).squeeze(1)
+        else:
+            pooled = tok.sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
         token_features = self.token_proj(pooled)
         return self.head(torch.cat([fused, token_features], dim=-1))
 
@@ -399,9 +428,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--proj-dim", type=int, default=512)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--use-token-tower", action="store_true")
+    parser.add_argument(
+        "--allow-missing-token-ids",
+        action="store_true",
+        help="Allow --use-token-tower to run with zero token inputs when token arrays are missing.",
+    )
     parser.add_argument("--vocab-size", type=int, default=200000)
     parser.add_argument("--token-embed-dim", type=int, default=128)
     parser.add_argument("--token-hidden-size", type=int, default=256)
+    parser.add_argument("--token-encoder", choices=("gru", "mean"), default="gru")
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -453,6 +488,15 @@ def main() -> None:
         train_ds, val_ds = _build_datasets(args)
 
     reference = train_ds or val_ds
+    datasets = [ds for ds in (train_ds, val_ds) if ds is not None]
+    if args.use_token_tower and not args.allow_missing_token_ids:
+        missing_tokens = [type(ds).__name__ for ds in datasets if not bool(getattr(ds, "has_tokens", False))]
+        if missing_tokens:
+            raise ValueError(
+                "--use-token-tower requires predraft_token_ids.npy and predraft_token_mask.npy "
+                f"in every dataset split; missing for {missing_tokens}. "
+                "Recollect traces with --log-predraft-token-ids or pass --allow-missing-token-ids for a zero-token smoke test."
+            )
     model = IntegerHorizonHead(
         input_dim=reference.hidden_size,
         hidden_size=args.hidden_size,
@@ -463,6 +507,8 @@ def main() -> None:
         vocab_size=args.vocab_size,
         token_embed_dim=args.token_embed_dim,
         token_hidden_size=args.token_hidden_size,
+        token_encoder=args.token_encoder,
+        token_window=reference.token_window,
     ).to(device)
     if args.checkpoint is not None:
         checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -482,6 +528,7 @@ def main() -> None:
             "num_classes": reference.num_classes,
             "context_window": reference.context_window,
             "token_window": reference.token_window,
+            "has_tokens": bool(getattr(reference, "has_tokens", False)),
             "train_rows": len(train_ds) if train_ds is not None else None,
             "val_rows": len(val_ds),
             "loss_args": loss_args,

@@ -253,6 +253,59 @@ F. fused_window_plus_entropy
    fused context plus verifier uncertainty channels
 ```
 
+### Recent Token-ID Ablation
+
+The fused context may not expose enough discrete lexical information for exact
+horizon prediction. Add a causal token-identity ablation:
+
+```text
+input:
+  latest fused context vector c_t
+  recent committed token ids [x_{t-W+1}, ..., x_t]
+
+token tower:
+  token embedding + learned position embedding
+  small GRU over the left-padded recent-token window
+  final valid token state
+
+head:
+  concat(project(c_t), token_gru_state) -> MLP -> P(H in {0..15})
+```
+
+This keeps inference overhead small: one embedding lookup table, one tiny GRU
+over a short window such as `W=32`, and the same MLP horizon head.
+
+Important data constraint:
+
+```text
+The existing 3.51M Qwen3-4B trace collected on 2026-07-16 does not contain
+predraft_token_ids.npy. It cannot train this ablation.
+```
+
+Token-ID experiments require recollecting both train and held-out eval traces
+with:
+
+```bash
+--log-predraft-token-ids --token-window 32
+```
+
+Then materialize and run:
+
+```bash
+TRACE=/workspace/dflashv2_data/traces/dflashv2_qwen3_4b_b16_instruct100k_tokenids \
+MATH=/workspace/dflashv2_data/traces/math500_qwen3_4b_b16_eval_tokenids \
+bash scripts/run_dflashv2_token_horizon_experiment.sh
+```
+
+The token sweep compares:
+
+```text
+fused_ce_dist0p2
+token_gru_ce_dist0p2
+token_gru_softce_tau1_dist0p2
+token_gru_ce_emd0p5_dist0p1
+```
+
 ### Training Loss
 
 For each trace row with label `H_t`, construct binary survival labels:

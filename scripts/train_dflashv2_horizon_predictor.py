@@ -36,7 +36,8 @@ def _load_shards(trace_dir: Path) -> tuple[list[Shard], dict[str, Any]]:
         rows = int(item["rows"])
         if rows <= 0:
             continue
-        shard_dir = trace_dir / item["path"]
+        shard_path = Path(item["path"])
+        shard_dir = shard_path if shard_path.is_absolute() else trace_dir / shard_path
         shards.append(
             Shard(
                 path=shard_dir,
