@@ -265,13 +265,23 @@ def _horizon_loss(
     *,
     objective: str,
     survival_weights: torch.Tensor | None,
+    accepted_len: torch.Tensor | None = None,
+    tail_weight: float = 0.0,
+    tail_power: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if objective == "survival_bce":
+    if objective in {"survival_bce", "censored_survival_bce"}:
+        raw = F.binary_cross_entropy_with_logits(logits, survival, reduction="none")
         if survival_weights is None:
-            loss = F.binary_cross_entropy_with_logits(logits, survival)
+            weights = torch.ones_like(raw)
         else:
-            raw = F.binary_cross_entropy_with_logits(logits, survival, reduction="none")
-            loss = (raw * survival_weights.view(1, -1)).mean()
+            weights = survival_weights.view(1, -1).expand_as(raw)
+        if accepted_len is not None and tail_weight > 0:
+            num_slots = max(int(survival.shape[1]), 1)
+            example_weights = 1.0 + float(tail_weight) * (accepted_len.float() / num_slots).clamp(0, 1) ** float(
+                tail_power
+            )
+            weights = weights * example_weights.view(-1, 1)
+        loss = (raw * weights).sum() / weights.sum().clamp_min(1.0)
         probs = torch.sigmoid(logits)
         return loss, probs, torch.ones((), dtype=logits.dtype, device=logits.device)
 
@@ -286,6 +296,13 @@ def _horizon_loss(
     if survival_weights is not None:
         raw = raw * survival_weights.view(1, -1)
         reachable = reachable * survival_weights.view(1, -1)
+    if accepted_len is not None and tail_weight > 0:
+        num_slots = max(int(survival.shape[1]), 1)
+        example_weights = 1.0 + float(tail_weight) * (accepted_len.float() / num_slots).clamp(0, 1) ** float(
+            tail_power
+        )
+        raw = raw * example_weights.view(-1, 1)
+        reachable = reachable * example_weights.view(-1, 1)
     loss = (raw * reachable).sum() / reachable.sum().clamp_min(1.0)
     conditional_probs = torch.sigmoid(logits)
     survival_probs = torch.cumprod(conditional_probs, dim=1)
@@ -485,6 +502,8 @@ def evaluate(
     arms: tuple[int, ...],
     alphas: tuple[float, ...],
     selection_min_retention: float,
+    tail_weight: float = 0.0,
+    tail_power: float = 1.0,
 ) -> dict[str, float]:
     model.eval()
     logits_all: list[torch.Tensor] = []
@@ -503,6 +522,9 @@ def evaluate(
             survival,
             objective=objective,
             survival_weights=None,
+            accepted_len=accepted_len,
+            tail_weight=tail_weight,
+            tail_power=tail_power,
         )
         losses.append(loss.item())
         counts.append(features.shape[0])
@@ -513,7 +535,7 @@ def evaluate(
     probs = torch.cat(logits_all)
     survival = torch.cat(survival_all)
     accepted_len = torch.cat(accepted_all)
-    if monotonicize and objective == "survival_bce":
+    if monotonicize and objective in {"survival_bce", "censored_survival_bce"}:
         probs = _monotonicize(probs)
     expected_len = probs.sum(dim=1)
     pred_len = (probs >= 0.5).sum(dim=1).float()
@@ -536,6 +558,14 @@ def evaluate(
     for k in (1, 4, 8, 12, 15):
         if k <= survival.shape[1]:
             metrics[f"auroc_h_ge_{k}"] = _roc_auc(probs[:, k - 1], survival[:, k - 1])
+    for horizon in range(survival.shape[1] + 1):
+        mask = accepted_len == float(horizon)
+        if bool(mask.any()):
+            metrics[f"h{horizon}_count"] = float(mask.sum().item())
+            metrics[f"h{horizon}_rounded_mae"] = (rounded_len[mask] - accepted_len[mask]).abs().mean().item()
+            metrics[f"h{horizon}_expected_mae"] = (expected_len[mask] - accepted_len[mask]).abs().mean().item()
+            metrics[f"h{horizon}_mean_rounded"] = rounded_len[mask].mean().item()
+            metrics[f"h{horizon}_rounded_bias"] = (rounded_len[mask] - accepted_len[mask]).mean().item()
     for alpha in alphas:
         metrics.update(_policy_metrics(probs, accepted_len, arms=arms, alpha=alpha))
     metrics.update(
@@ -560,6 +590,8 @@ def train_epoch(
     survival_weights: torch.Tensor | None,
     aux_arm_weight: float,
     arms: tuple[int, ...],
+    tail_weight: float,
+    tail_power: float,
 ) -> dict[str, float]:
     model.train()
     totals: dict[str, float] = {}
@@ -575,6 +607,9 @@ def train_epoch(
             survival,
             objective=objective,
             survival_weights=survival_weights,
+            accepted_len=accepted_len,
+            tail_weight=tail_weight,
+            tail_power=tail_power,
         )
         expected_len = probs.sum(dim=1)
         length_loss = F.smooth_l1_loss(expected_len, accepted_len)
@@ -649,17 +684,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument(
         "--objective",
-        choices=["survival_bce", "hazard"],
+        choices=["survival_bce", "censored_survival_bce", "hazard"],
         default="survival_bce",
         help=(
-            "survival_bce uses independent P(H>=k) logits; hazard uses conditional "
-            "CORN/discrete-time survival logits whose cumulative product gives P(H>=k)."
+            "survival_bce and censored_survival_bce use independent P(H>=k) logits. "
+            "With block-size B=16, accepted_len=15 is right-censored as H>=15 because "
+            "there is no observed failure after the last drafted token. hazard uses "
+            "conditional CORN/discrete-time survival logits whose cumulative product gives P(H>=k)."
         ),
     )
     parser.add_argument("--length-loss-weight", type=float, default=0.05)
     parser.add_argument("--monotonic-weight", type=float, default=0.02)
     parser.add_argument("--boundary-weight", type=float, default=1.0)
     parser.add_argument("--boundary-ks", default="4,8,12,15")
+    parser.add_argument(
+        "--tail-weight",
+        type=float,
+        default=0.0,
+        help="Example weight multiplier for long horizons: 1 + tail_weight * (accepted_len / num_slots) ** tail_power.",
+    )
+    parser.add_argument("--tail-power", type=float, default=1.0)
     parser.add_argument("--aux-arm-weight", type=float, default=0.0)
     parser.add_argument("--max-total-rows", type=int, default=None)
     parser.add_argument("--calibration-rows", type=int, default=50000)
@@ -856,6 +900,8 @@ def main() -> None:
             arms=arms,
             alphas=alphas,
             selection_min_retention=args.selection_min_retention,
+            tail_weight=args.tail_weight,
+            tail_power=args.tail_power,
         )
         (args.output_dir / "eval_metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
         print(json.dumps(metrics, indent=2), flush=True)
@@ -892,6 +938,8 @@ def main() -> None:
             survival_weights=survival_weight_tensor,
             aux_arm_weight=args.aux_arm_weight,
             arms=arms,
+            tail_weight=args.tail_weight,
+            tail_power=args.tail_power,
         )
         val_metrics = evaluate(
             model,
@@ -902,6 +950,8 @@ def main() -> None:
             arms=arms,
             alphas=alphas,
             selection_min_retention=args.selection_min_retention,
+            tail_weight=args.tail_weight,
+            tail_power=args.tail_power,
         )
         record = {"epoch": epoch, "train": train_metrics, "val": val_metrics}
         with (args.output_dir / "metrics.jsonl").open("a") as f:
