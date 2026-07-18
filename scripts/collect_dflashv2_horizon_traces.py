@@ -83,6 +83,22 @@ def _padded_context_window(
     return features, mask
 
 
+def _padded_token_window(
+    output_ids: torch.Tensor,
+    *,
+    end_exclusive: int,
+    window: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    ids = output_ids[0, :end_exclusive].detach().cpu().numpy().astype(np.int64)
+    tail = ids[-window:]
+    pad = window - int(tail.shape[0])
+    token_ids = np.zeros((window,), dtype=np.int64)
+    token_mask = np.zeros((window,), dtype=np.uint8)
+    token_ids[pad:] = tail
+    token_mask[pad:] = 1
+    return token_ids, token_mask
+
+
 def _draft_confidence_features(logits: torch.Tensor, token_ids: torch.Tensor) -> np.ndarray:
     return _token_confidence_features(logits, token_ids)
 
@@ -117,6 +133,8 @@ class HorizonShardWriter:
         num_slots: int,
         log_postdraft_confidence: bool,
         log_postdraft_hidden: bool,
+        log_predraft_token_ids: bool,
+        token_window: int,
     ) -> None:
         self.output_dir = output_dir
         self.rows_per_shard = rows_per_shard
@@ -125,6 +143,8 @@ class HorizonShardWriter:
         self.num_slots = num_slots
         self.log_postdraft_confidence = log_postdraft_confidence
         self.log_postdraft_hidden = log_postdraft_hidden
+        self.log_predraft_token_ids = log_predraft_token_ids
+        self.token_window = token_window
         self.shard_idx = -1
         self.row_idx = 0
         self.total_rows = 0
@@ -135,6 +155,8 @@ class HorizonShardWriter:
         self.prompt_index: np.memmap | None = None
         self.cycle_id: np.memmap | None = None
         self.predraft_stats: np.memmap | None = None
+        self.predraft_token_ids: np.memmap | None = None
+        self.predraft_token_mask: np.memmap | None = None
         self.postdraft_confidence: np.memmap | None = None
         self.postdraft_hidden: np.memmap | None = None
         self.postdraft_token_ids: np.memmap | None = None
@@ -189,6 +211,19 @@ class HorizonShardWriter:
             dtype=np.float16,
             shape=(self.rows_per_shard, 8),
         )
+        if self.log_predraft_token_ids:
+            self.predraft_token_ids = np.lib.format.open_memmap(
+                shard_dir / "predraft_token_ids.npy",
+                mode="w+",
+                dtype=np.int64,
+                shape=(self.rows_per_shard, self.token_window),
+            )
+            self.predraft_token_mask = np.lib.format.open_memmap(
+                shard_dir / "predraft_token_mask.npy",
+                mode="w+",
+                dtype=np.uint8,
+                shape=(self.rows_per_shard, self.token_window),
+            )
         if self.log_postdraft_confidence:
             self.postdraft_confidence = np.lib.format.open_memmap(
                 shard_dir / "postdraft_confidence.npy",
@@ -222,6 +257,8 @@ class HorizonShardWriter:
         cycle_id: int,
         predraft_stats: np.ndarray,
         metadata: dict[str, Any],
+        predraft_token_ids: np.ndarray | None = None,
+        predraft_token_mask: np.ndarray | None = None,
         postdraft_confidence: np.ndarray | None = None,
         postdraft_hidden: np.ndarray | None = None,
         postdraft_token_ids: np.ndarray | None = None,
@@ -247,6 +284,13 @@ class HorizonShardWriter:
         self.prompt_index[idx] = int(prompt_index)
         self.cycle_id[idx] = int(cycle_id)
         self.predraft_stats[idx] = predraft_stats
+        if self.log_predraft_token_ids:
+            assert self.predraft_token_ids is not None
+            assert self.predraft_token_mask is not None
+            if predraft_token_ids is None or predraft_token_mask is None:
+                raise ValueError("predraft_token_ids/mask are required when log_predraft_token_ids=True")
+            self.predraft_token_ids[idx] = predraft_token_ids
+            self.predraft_token_mask[idx] = predraft_token_mask
         if self.log_postdraft_confidence:
             assert self.postdraft_confidence is not None
             if postdraft_confidence is None:
@@ -279,6 +323,8 @@ class HorizonShardWriter:
             self.prompt_index,
             self.cycle_id,
             self.predraft_stats,
+            self.predraft_token_ids,
+            self.predraft_token_mask,
             self.postdraft_confidence,
             self.postdraft_hidden,
             self.postdraft_token_ids,
@@ -292,6 +338,8 @@ class HorizonShardWriter:
         self.prompt_index = None
         self.cycle_id = None
         self.predraft_stats = None
+        self.predraft_token_ids = None
+        self.predraft_token_mask = None
         self.postdraft_confidence = None
         self.postdraft_hidden = None
         self.postdraft_token_ids = None
@@ -372,6 +420,11 @@ def collect_one_prompt(
             context_history,
             window=context_window,
             hidden_size=hidden_size,
+        )
+        predraft_token_ids, predraft_token_mask = _padded_token_window(
+            output_ids,
+            end_exclusive=start + 1,
+            window=writer.token_window,
         )
 
         block_output_ids = output_ids[:, start : start + block_size].clone()
@@ -463,7 +516,11 @@ def collect_one_prompt(
                 if writer.log_postdraft_confidence
                 else None,
                 "postdraft_hidden": writer.log_postdraft_hidden,
+                "predraft_token_ids": writer.log_predraft_token_ids,
+                "predraft_token_window": writer.token_window if writer.log_predraft_token_ids else None,
             },
+            predraft_token_ids=predraft_token_ids if writer.log_predraft_token_ids else None,
+            predraft_token_mask=predraft_token_mask if writer.log_predraft_token_ids else None,
             postdraft_confidence=postdraft_confidence,
             postdraft_hidden=postdraft_hidden,
             postdraft_token_ids=postdraft_token_ids,
@@ -534,6 +591,20 @@ def parse_args() -> argparse.Namespace:
             "DSPARK-style confidence head. This is storage-heavy."
         ),
     )
+    parser.add_argument(
+        "--log-predraft-token-ids",
+        action="store_true",
+        help=(
+            "Store the last prefix token ids before each draft cycle. This supports "
+            "token-prefix horizon heads that use actual token identity, not entropy history."
+        ),
+    )
+    parser.add_argument(
+        "--token-window",
+        type=int,
+        default=32,
+        help="Number of latest prefix token ids to store when --log-predraft-token-ids is enabled.",
+    )
     parser.add_argument("--attn-implementation", default="sdpa")
     parser.add_argument("--dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
     return parser.parse_args()
@@ -582,6 +653,8 @@ def main() -> None:
         num_slots=args.block_size - 1,
         log_postdraft_confidence=args.log_postdraft_confidence,
         log_postdraft_hidden=args.log_postdraft_hidden,
+        log_predraft_token_ids=args.log_predraft_token_ids,
+        token_window=args.token_window,
     )
     stopped_by_cycle_budget = False
     try:
@@ -641,6 +714,8 @@ def main() -> None:
         if args.log_postdraft_hidden
         else None,
         "postdraft_token_ids_shape": [args.block_size] if args.log_postdraft_hidden else None,
+        "predraft_token_ids": args.log_predraft_token_ids,
+        "predraft_token_ids_shape": [args.token_window] if args.log_predraft_token_ids else None,
         "rows_per_shard": args.rows_per_shard,
         "shards": writer.shards,
         "stopped_by_cycle_budget": stopped_by_cycle_budget,

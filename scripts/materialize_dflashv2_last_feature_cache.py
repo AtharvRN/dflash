@@ -41,6 +41,7 @@ def _materialize_split(
     progress_every: int,
     max_read_rows: int,
     max_output_rows: int,
+    include_predraft_token_ids: bool,
 ) -> dict[str, Any]:
     split_dir = output_dir / name
     split_dir.mkdir(parents=True, exist_ok=True)
@@ -73,6 +74,22 @@ def _materialize_split(
         dtype=np.float32,
         shape=(order.shape[0],),
     )
+    token_ids = None
+    token_mask = None
+    if include_predraft_token_ids:
+        token_window = int(np.load(shards[0].path / "predraft_token_ids.npy", mmap_mode="r").shape[1])
+        token_ids = np.lib.format.open_memmap(
+            split_dir / "predraft_token_ids.npy",
+            mode="w+",
+            dtype=np.int64,
+            shape=(order.shape[0], token_window),
+        )
+        token_mask = np.lib.format.open_memmap(
+            split_dir / "predraft_token_mask.npy",
+            mode="w+",
+            dtype=np.float32,
+            shape=(order.shape[0], token_window),
+        )
 
     started = time.time()
     cursor = 0
@@ -87,6 +104,16 @@ def _materialize_split(
 
         shard_started = time.time()
         local_indices = order[left:right] - shard_start
+        shard_token_ids = (
+            np.load(shard.path / "predraft_token_ids.npy", mmap_mode="r")
+            if include_predraft_token_ids
+            else None
+        )
+        shard_token_mask = (
+            np.load(shard.path / "predraft_token_mask.npy", mmap_mode="r")
+            if include_predraft_token_ids
+            else None
+        )
         if cursor != left:
             raise RuntimeError(f"internal cursor mismatch for split={name}: cursor={cursor}, left={left}")
         rel_idx = 0
@@ -121,6 +148,13 @@ def _materialize_split(
             mask[out_start:out_end, 0] = has_valid[positions].astype(np.float32)
             survival[out_start:out_end] = np.asarray(shard.survival[chunk], dtype=np.float32)
             accepted[out_start:out_end] = np.asarray(shard.accepted_len[chunk], dtype=np.float32)
+            if include_predraft_token_ids:
+                assert token_ids is not None
+                assert token_mask is not None
+                assert shard_token_ids is not None
+                assert shard_token_mask is not None
+                token_ids[out_start:out_end] = np.asarray(shard_token_ids[chunk], dtype=np.int64)
+                token_mask[out_start:out_end] = np.asarray(shard_token_mask[chunk], dtype=np.float32)
 
             processed = rel_idx
             if progress_every > 0 and processed % progress_every == 0:
@@ -165,6 +199,10 @@ def _materialize_split(
     mask.flush()
     survival.flush()
     accepted.flush()
+    if token_ids is not None:
+        token_ids.flush()
+    if token_mask is not None:
+        token_mask.flush()
     meta = {
         "split": name,
         "rows": int(order.shape[0]),
@@ -186,17 +224,24 @@ def _materialize_shard_task(task: dict[str, Any]) -> dict[str, Any]:
     out_base = int(task["out_base"])
     max_read_rows = int(task["max_read_rows"])
     max_output_rows = int(task["max_output_rows"])
+    include_predraft_token_ids = bool(task.get("include_predraft_token_ids", False))
 
     shard_started = time.time()
     shard_features = np.load(shard_path / "features.npy", mmap_mode="r")
     shard_mask = np.load(shard_path / "mask.npy", mmap_mode="r")
     shard_survival = np.load(shard_path / "survival.npy", mmap_mode="r")
     shard_accepted = np.load(shard_path / "accepted_len.npy", mmap_mode="r")
+    shard_token_ids = np.load(shard_path / "predraft_token_ids.npy", mmap_mode="r") if include_predraft_token_ids else None
+    shard_token_mask = (
+        np.load(shard_path / "predraft_token_mask.npy", mmap_mode="r") if include_predraft_token_ids else None
+    )
 
     features = np.load(split_dir / "features.npy", mmap_mode="r+")
     mask = np.load(split_dir / "mask.npy", mmap_mode="r+")
     survival = np.load(split_dir / "survival.npy", mmap_mode="r+")
     accepted = np.load(split_dir / "accepted_len.npy", mmap_mode="r+")
+    token_ids = np.load(split_dir / "predraft_token_ids.npy", mmap_mode="r+") if include_predraft_token_ids else None
+    token_mask = np.load(split_dir / "predraft_token_mask.npy", mmap_mode="r+") if include_predraft_token_ids else None
 
     rel_idx = 0
     while rel_idx < int(local_indices.shape[0]):
@@ -230,11 +275,22 @@ def _materialize_shard_task(task: dict[str, Any]) -> dict[str, Any]:
         mask[out_start:out_end, 0] = has_valid[positions].astype(np.float32)
         survival[out_start:out_end] = np.asarray(shard_survival[chunk], dtype=np.float32)
         accepted[out_start:out_end] = np.asarray(shard_accepted[chunk], dtype=np.float32)
+        if include_predraft_token_ids:
+            assert token_ids is not None
+            assert token_mask is not None
+            assert shard_token_ids is not None
+            assert shard_token_mask is not None
+            token_ids[out_start:out_end] = np.asarray(shard_token_ids[chunk], dtype=np.int64)
+            token_mask[out_start:out_end] = np.asarray(shard_token_mask[chunk], dtype=np.float32)
 
     features.flush()
     mask.flush()
     survival.flush()
     accepted.flush()
+    if token_ids is not None:
+        token_ids.flush()
+    if token_mask is not None:
+        token_mask.flush()
     return {
         "shard": str(shard_path),
         "shard_index": shard_idx,
@@ -253,6 +309,7 @@ def _materialize_split_parallel(
     max_read_rows: int,
     max_output_rows: int,
     parallel_workers: int,
+    include_predraft_token_ids: bool,
 ) -> dict[str, Any]:
     split_dir = output_dir / name
     split_dir.mkdir(parents=True, exist_ok=True)
@@ -285,11 +342,31 @@ def _materialize_split_parallel(
         dtype=np.float32,
         shape=(order.shape[0],),
     )
+    token_ids = None
+    token_mask = None
+    if include_predraft_token_ids:
+        token_window = int(np.load(shards[0].path / "predraft_token_ids.npy", mmap_mode="r").shape[1])
+        token_ids = np.lib.format.open_memmap(
+            split_dir / "predraft_token_ids.npy",
+            mode="w+",
+            dtype=np.int64,
+            shape=(order.shape[0], token_window),
+        )
+        token_mask = np.lib.format.open_memmap(
+            split_dir / "predraft_token_mask.npy",
+            mode="w+",
+            dtype=np.float32,
+            shape=(order.shape[0], token_window),
+        )
     features.flush()
     mask.flush()
     survival.flush()
     accepted.flush()
-    del features, mask, survival, accepted
+    if token_ids is not None:
+        token_ids.flush()
+    if token_mask is not None:
+        token_mask.flush()
+    del features, mask, survival, accepted, token_ids, token_mask
 
     tasks: list[dict[str, Any]] = []
     for shard_idx, shard in enumerate(shards):
@@ -309,6 +386,7 @@ def _materialize_split_parallel(
                 "out_base": int(left),
                 "max_read_rows": int(max_read_rows),
                 "max_output_rows": int(max_output_rows),
+                "include_predraft_token_ids": bool(include_predraft_token_ids),
             }
         )
 
@@ -365,6 +443,16 @@ def _copy_compact_subset(
     src_mask = np.load(source_dir / "mask.npy", mmap_mode="r")
     src_survival = np.load(source_dir / "survival.npy", mmap_mode="r")
     src_accepted = np.load(source_dir / "accepted_len.npy", mmap_mode="r")
+    src_token_ids = (
+        np.load(source_dir / "predraft_token_ids.npy", mmap_mode="r")
+        if (source_dir / "predraft_token_ids.npy").exists()
+        else None
+    )
+    src_token_mask = (
+        np.load(source_dir / "predraft_token_mask.npy", mmap_mode="r")
+        if (source_dir / "predraft_token_mask.npy").exists()
+        else None
+    )
 
     features = np.lib.format.open_memmap(
         split_dir / "features.npy",
@@ -390,6 +478,22 @@ def _copy_compact_subset(
         dtype=np.float32,
         shape=(positions.shape[0],),
     )
+    token_ids = None
+    token_mask = None
+    if src_token_ids is not None:
+        token_ids = np.lib.format.open_memmap(
+            split_dir / "predraft_token_ids.npy",
+            mode="w+",
+            dtype=np.int64,
+            shape=(positions.shape[0], src_token_ids.shape[1]),
+        )
+    if src_token_mask is not None:
+        token_mask = np.lib.format.open_memmap(
+            split_dir / "predraft_token_mask.npy",
+            mode="w+",
+            dtype=np.float32,
+            shape=(positions.shape[0], src_token_mask.shape[1]),
+        )
 
     started = time.time()
     for start in range(0, int(positions.shape[0]), copy_rows):
@@ -399,6 +503,12 @@ def _copy_compact_subset(
         mask[start:end] = src_mask[chunk]
         survival[start:end] = src_survival[chunk]
         accepted[start:end] = src_accepted[chunk]
+        if token_ids is not None:
+            assert src_token_ids is not None
+            token_ids[start:end] = src_token_ids[chunk]
+        if token_mask is not None:
+            assert src_token_mask is not None
+            token_mask[start:end] = src_token_mask[chunk]
         print(
             json.dumps(
                 {
@@ -416,6 +526,10 @@ def _copy_compact_subset(
     mask.flush()
     survival.flush()
     accepted.flush()
+    if token_ids is not None:
+        token_ids.flush()
+    if token_mask is not None:
+        token_mask.flush()
     meta = {
         "split": name,
         "rows": int(positions.shape[0]),
@@ -727,6 +841,11 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Shard-level worker processes for materializing the temporary _all cache.",
     )
+    parser.add_argument(
+        "--include-predraft-token-ids",
+        action="store_true",
+        help="Also materialize predraft_token_ids.npy and predraft_token_mask.npy when present in every shard.",
+    )
     parser.add_argument("--selection-mode", choices=("random", "prefix"), default="random")
     parser.add_argument("--keep-all-cache", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
@@ -787,6 +906,19 @@ def main() -> None:
         ),
         flush=True,
     )
+    include_predraft_token_ids = bool(args.include_predraft_token_ids)
+    if include_predraft_token_ids:
+        missing = [
+            str(shard.path)
+            for shard in shards
+            if not (shard.path / "predraft_token_ids.npy").exists()
+            or not (shard.path / "predraft_token_mask.npy").exists()
+        ]
+        if missing:
+            raise FileNotFoundError(
+                "--include-predraft-token-ids requires predraft token arrays in every shard; "
+                f"missing in {missing[:5]}"
+            )
 
     prompt_split_meta: dict[str, Any] = {}
     if args.split_by_prompt_metadata:
@@ -820,6 +952,7 @@ def main() -> None:
         "calibration_rows": args.calibration_rows,
         "seed": args.seed,
         "selection_mode": args.selection_mode,
+        "include_predraft_token_ids": include_predraft_token_ids,
         **prompt_split_meta,
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
@@ -838,6 +971,7 @@ def main() -> None:
             max_read_rows=args.max_read_rows,
             max_output_rows=args.max_output_rows,
             parallel_workers=args.parallel_workers,
+            include_predraft_token_ids=include_predraft_token_ids,
         )
     else:
         all_meta = _materialize_split(
@@ -849,6 +983,7 @@ def main() -> None:
             progress_every=args.progress_every,
             max_read_rows=args.max_read_rows,
             max_output_rows=args.max_output_rows,
+            include_predraft_token_ids=include_predraft_token_ids,
         )
 
     rank = np.empty((total_rows,), dtype=np.int64)
