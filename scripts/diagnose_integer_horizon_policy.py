@@ -283,7 +283,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--train-dir", type=Path, required=True)
     parser.add_argument("--val-dir", type=Path, required=True)
-    parser.add_argument("--math-trace-dir", type=Path, required=True)
+    parser.add_argument("--math-trace-dir", type=Path, default=None)
+    parser.add_argument(
+        "--eval-trace-dir",
+        action="append",
+        default=[],
+        metavar="NAME=PATH",
+        help="Additional held-out trace split, for example humaneval=/path/to/trace.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -291,7 +298,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-train-rows", type=int, default=None)
     parser.add_argument("--max-val-rows", type=int, default=None)
     parser.add_argument("--max-math-rows", type=int, default=None)
+    parser.add_argument("--max-eval-rows", type=int, default=None)
     return parser.parse_args()
+
+
+def _parse_eval_trace_dirs(args: argparse.Namespace) -> list[tuple[str, Path, int | None]]:
+    evals: list[tuple[str, Path, int | None]] = []
+    if args.math_trace_dir is not None:
+        evals.append(("math500", args.math_trace_dir, args.max_math_rows))
+    for item in args.eval_trace_dir:
+        if "=" not in item:
+            raise ValueError(f"--eval-trace-dir must be NAME=PATH, got {item!r}")
+        name, raw_path = item.split("=", 1)
+        name = name.strip()
+        if not name:
+            raise ValueError(f"--eval-trace-dir has empty name: {item!r}")
+        evals.append((name, Path(raw_path), args.max_eval_rows))
+    if not evals:
+        raise ValueError("provide --math-trace-dir and/or at least one --eval-trace-dir NAME=PATH")
+    return evals
 
 
 def main() -> None:
@@ -299,7 +324,11 @@ def main() -> None:
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     train_ds = _make_dataset(args.train_dir, kind="compact", max_rows=args.max_train_rows)
     val_ds = _make_dataset(args.val_dir, kind="compact", max_rows=args.max_val_rows)
-    math_ds = _make_dataset(args.math_trace_dir, kind="trace", max_rows=args.max_math_rows)
+    eval_specs = _parse_eval_trace_dirs(args)
+    eval_datasets = [
+        (name, path, _make_dataset(path, kind="trace", max_rows=max_rows))
+        for name, path, max_rows in eval_specs
+    ]
     model, config = _load_model(args.checkpoint, train_ds, device)
     loss_args = dict(config.get("loss_args", {}))
     if not loss_args:
@@ -313,7 +342,7 @@ def main() -> None:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     results = []
-    for name, dataset in (("train", train_ds), ("val", val_ds), ("math500", math_ds)):
+    for name, dataset in [("train", train_ds), ("val", val_ds), *[(name, ds) for name, _path, ds in eval_datasets]]:
         print(json.dumps({"event": "diagnose_split_start", "split": name, "rows": len(dataset)}), flush=True)
         results.append(
             evaluate_split(
@@ -333,7 +362,7 @@ def main() -> None:
         "checkpoint": str(args.checkpoint),
         "train_dir": str(args.train_dir),
         "val_dir": str(args.val_dir),
-        "math_trace_dir": str(args.math_trace_dir),
+        "eval_trace_dirs": {name: str(path) for name, path, _ds in eval_datasets},
         "loss_args": loss_args,
         "results": results,
         "distribution_shift": comparisons,
