@@ -255,25 +255,54 @@ def _emd_loss(probs: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return (pred_survival - target_survival).abs().mean()
 
 
+def _weighted_mean(values: torch.Tensor, weights: torch.Tensor | None) -> torch.Tensor:
+    if weights is None:
+        return values.mean()
+    return (values * weights).sum() / weights.sum().clamp_min(1e-8)
+
+
 def _loss_and_predictions(
     logits: torch.Tensor,
     accepted_len: torch.Tensor,
     *,
+    loss_mode: str,
     ce_weight: float,
     soft_ce_weight: float,
     soft_tau: float,
     distance_weight: float,
     emd_weight: float,
+    class_weights: torch.Tensor | None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     num_classes = logits.shape[1]
     target = accepted_len.long().clamp(min=0, max=num_classes - 1)
     probs = torch.softmax(logits, dim=-1)
     grid = _class_grid(num_classes, logits.device).view(1, -1)
     expected = (probs * grid).sum(dim=-1)
-    ce = F.cross_entropy(logits, target)
+    row_weights = class_weights[target] if class_weights is not None else None
+    if loss_mode == "weighted_smooth_l1":
+        smooth_l1 = F.smooth_l1_loss(expected, accepted_len, reduction="none")
+        loss = _weighted_mean(smooth_l1, row_weights)
+        zero = torch.zeros((), dtype=logits.dtype, device=logits.device)
+        return loss, {
+            "ce": zero,
+            "soft_ce": zero,
+            "distance_loss": (expected - accepted_len).abs().mean(),
+            "emd_loss": zero,
+            "smooth_l1": smooth_l1.mean(),
+            "expected_len": expected,
+            "argmax_len": probs.argmax(dim=-1).float(),
+            "rounded_len": expected.round().clamp(0, num_classes - 1),
+        }
+
+    if loss_mode != "ce_distance":
+        raise ValueError(f"unsupported loss_mode={loss_mode!r}")
+
+    ce = F.cross_entropy(logits, target, weight=class_weights)
     soft_target = _soft_targets(accepted_len.clamp(0, num_classes - 1), num_classes=num_classes, tau=soft_tau)
-    soft_ce = -(soft_target * F.log_softmax(logits, dim=-1)).sum(dim=-1).mean()
-    distance = (probs * (grid - accepted_len.view(-1, 1)).abs()).sum(dim=-1).mean()
+    soft_ce_per_row = -(soft_target * F.log_softmax(logits, dim=-1)).sum(dim=-1)
+    soft_ce = _weighted_mean(soft_ce_per_row, row_weights)
+    distance_per_row = (probs * (grid - accepted_len.view(-1, 1)).abs()).sum(dim=-1)
+    distance = _weighted_mean(distance_per_row, row_weights)
     emd = _emd_loss(probs, accepted_len.clamp(0, num_classes - 1))
     loss = ce_weight * ce + soft_ce_weight * soft_ce + distance_weight * distance + emd_weight * emd
     return loss, {
@@ -281,10 +310,54 @@ def _loss_and_predictions(
         "soft_ce": soft_ce,
         "distance_loss": distance,
         "emd_loss": emd,
+        "smooth_l1": F.smooth_l1_loss(expected, accepted_len),
         "expected_len": expected,
         "argmax_len": probs.argmax(dim=-1).float(),
         "rounded_len": expected.round().clamp(0, num_classes - 1),
     }
+
+
+def _class_counts_from_dataset(dataset: Dataset, num_classes: int) -> np.ndarray:
+    if isinstance(dataset, CompactIntegerHorizonDataset):
+        accepted = np.asarray(dataset.accepted_len[: len(dataset)], dtype=np.int64)
+        accepted = np.clip(accepted, 0, num_classes - 1)
+        return np.bincount(accepted, minlength=num_classes).astype(np.int64)
+    if isinstance(dataset, TraceIntegerHorizonDataset):
+        counts = np.zeros((num_classes,), dtype=np.int64)
+        for global_idx in np.asarray(dataset.indices, dtype=np.int64):
+            shard_idx = bisect.bisect_right(dataset.offsets, int(global_idx)) - 1
+            local_idx = int(global_idx) - dataset.offsets[shard_idx]
+            horizon = int(dataset.shards[shard_idx].accepted_len[local_idx])
+            counts[min(max(horizon, 0), num_classes - 1)] += 1
+        return counts
+    raise TypeError(f"cannot compute class counts for dataset type {type(dataset).__name__}")
+
+
+def _make_class_weights(
+    counts: np.ndarray,
+    *,
+    scheme: str,
+    max_weight: float,
+) -> np.ndarray | None:
+    if scheme == "none":
+        return None
+    counts = counts.astype(np.float64)
+    nonzero = counts > 0
+    if not np.any(nonzero):
+        raise ValueError("cannot compute class weights from an empty target histogram")
+    safe_counts = np.maximum(counts, 1.0)
+    if scheme == "inverse":
+        weights = 1.0 / safe_counts
+    elif scheme == "inverse_sqrt":
+        weights = 1.0 / np.sqrt(safe_counts)
+    else:
+        raise ValueError(f"unsupported class weight scheme {scheme!r}")
+    weights[~nonzero] = 0.0
+    weights = weights / weights[nonzero].mean()
+    if max_weight > 0:
+        weights = np.minimum(weights, max_weight)
+        weights[nonzero] = weights[nonzero] / weights[nonzero].mean()
+    return weights.astype(np.float32)
 
 
 def _make_loader(dataset: Dataset, *, batch_size: int, shuffle: bool, num_workers: int) -> DataLoader:
@@ -327,7 +400,13 @@ def _metric_summary(predictions: dict[str, torch.Tensor], accepted_len: torch.Te
 
 
 @torch.inference_mode()
-def evaluate(model: IntegerHorizonHead, loader: DataLoader, *, device: torch.device, loss_args: dict[str, float]) -> dict[str, float]:
+def evaluate(
+    model: IntegerHorizonHead,
+    loader: DataLoader,
+    *,
+    device: torch.device,
+    loss_args: dict[str, Any],
+) -> dict[str, float]:
     model.eval()
     totals: dict[str, float] = {}
     rows = 0
@@ -339,6 +418,7 @@ def evaluate(model: IntegerHorizonHead, loader: DataLoader, *, device: torch.dev
         loss, preds = _loss_and_predictions(logits, batch.accepted_len, **loss_args)
         metrics = _metric_summary(preds, batch.accepted_len)
         metrics.update({key: value.detach().item() for key, value in preds.items() if key.endswith("_loss")})
+        metrics["smooth_l1"] = preds.get("smooth_l1", torch.tensor(float("nan"), device=device)).detach().item()
         metrics["loss"] = loss.detach().item()
         metrics["ce"] = preds.get("ce", torch.tensor(float("nan"), device=device)).detach().item()
         batch_rows = int(batch.accepted_len.shape[0])
@@ -363,7 +443,7 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     *,
     device: torch.device,
-    loss_args: dict[str, float],
+    loss_args: dict[str, Any],
 ) -> dict[str, float]:
     model.train()
     totals: dict[str, float] = {}
@@ -384,6 +464,7 @@ def train_epoch(
                 "soft_ce": preds["soft_ce"].detach().item(),
                 "distance_loss": preds["distance_loss"].detach().item(),
                 "emd_loss": preds["emd_loss"].detach().item(),
+                "smooth_l1": preds["smooth_l1"].detach().item(),
             }
         )
         batch_rows = int(batch.accepted_len.shape[0])
@@ -448,6 +529,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calibration-rows", type=int, default=50000)
     parser.add_argument("--max-train-rows", type=int, default=None)
     parser.add_argument("--max-val-rows", type=int, default=None)
+    parser.add_argument(
+        "--loss-mode",
+        choices=("ce_distance", "weighted_smooth_l1"),
+        default="ce_distance",
+        help=(
+            "ce_distance trains the 16-way ordinal classifier with CE/soft-CE plus distance terms. "
+            "weighted_smooth_l1 trains the scalar expected horizon from the 16-way distribution."
+        ),
+    )
+    parser.add_argument("--class-weight-scheme", choices=("none", "inverse", "inverse_sqrt"), default="none")
+    parser.add_argument(
+        "--class-weight-max",
+        type=float,
+        default=8.0,
+        help="Optional cap before renormalizing nonzero class weights. Use <=0 for no cap.",
+    )
     parser.add_argument("--ce-weight", type=float, default=1.0)
     parser.add_argument("--soft-ce-weight", type=float, default=0.0)
     parser.add_argument("--soft-tau", type=float, default=1.0)
@@ -497,6 +594,18 @@ def main() -> None:
                 f"in every dataset split; missing for {missing_tokens}. "
                 "Recollect traces with --log-predraft-token-ids or pass --allow-missing-token-ids for a zero-token smoke test."
             )
+    class_counts = None
+    class_weights_np = None
+    class_weights = None
+    if train_ds is not None:
+        class_counts = _class_counts_from_dataset(train_ds, reference.num_classes)
+        class_weights_np = _make_class_weights(
+            class_counts,
+            scheme=args.class_weight_scheme,
+            max_weight=args.class_weight_max,
+        )
+        if class_weights_np is not None:
+            class_weights = torch.tensor(class_weights_np, dtype=torch.float32, device=device)
     model = IntegerHorizonHead(
         input_dim=reference.hidden_size,
         hidden_size=args.hidden_size,
@@ -515,12 +624,16 @@ def main() -> None:
         model.load_state_dict(checkpoint["model_state_dict"])
 
     loss_args = {
+        "loss_mode": str(args.loss_mode),
         "ce_weight": float(args.ce_weight),
         "soft_ce_weight": float(args.soft_ce_weight),
         "soft_tau": float(args.soft_tau),
         "distance_weight": float(args.distance_weight),
         "emd_weight": float(args.emd_weight),
+        "class_weights": class_weights,
     }
+    loss_args_config = {key: value for key, value in loss_args.items() if key != "class_weights"}
+    loss_args_config["class_weights"] = None if class_weights_np is None else class_weights_np.tolist()
     config = vars(args).copy()
     config.update(
         {
@@ -531,7 +644,8 @@ def main() -> None:
             "has_tokens": bool(getattr(reference, "has_tokens", False)),
             "train_rows": len(train_ds) if train_ds is not None else None,
             "val_rows": len(val_ds),
-            "loss_args": loss_args,
+            "class_counts": None if class_counts is None else class_counts.tolist(),
+            "loss_args": loss_args_config,
         }
     )
     (args.output_dir / "config.json").write_text(json.dumps(config, indent=2, default=str) + "\n")
