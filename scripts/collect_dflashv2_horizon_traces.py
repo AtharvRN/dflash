@@ -99,6 +99,20 @@ def _padded_token_window(
     return token_ids, token_mask
 
 
+def _padded_float_window(
+    history: deque[float],
+    *,
+    window: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    tail = np.asarray(list(history)[-window:], dtype=np.float16)
+    pad = window - int(tail.shape[0])
+    values = np.zeros((window,), dtype=np.float16)
+    mask = np.zeros((window,), dtype=np.uint8)
+    values[pad:] = tail
+    mask[pad:] = 1
+    return values, mask
+
+
 def _draft_confidence_features(logits: torch.Tensor, token_ids: torch.Tensor) -> np.ndarray:
     return _token_confidence_features(logits, token_ids)
 
@@ -135,6 +149,8 @@ class HorizonShardWriter:
         log_postdraft_hidden: bool,
         log_predraft_token_ids: bool,
         token_window: int,
+        log_verifier_entropy_window: bool,
+        verifier_entropy_window: int,
     ) -> None:
         self.output_dir = output_dir
         self.rows_per_shard = rows_per_shard
@@ -145,6 +161,8 @@ class HorizonShardWriter:
         self.log_postdraft_hidden = log_postdraft_hidden
         self.log_predraft_token_ids = log_predraft_token_ids
         self.token_window = token_window
+        self.log_verifier_entropy_window = log_verifier_entropy_window
+        self.verifier_entropy_window = verifier_entropy_window
         self.shard_idx = -1
         self.row_idx = 0
         self.total_rows = 0
@@ -157,6 +175,8 @@ class HorizonShardWriter:
         self.predraft_stats: np.memmap | None = None
         self.predraft_token_ids: np.memmap | None = None
         self.predraft_token_mask: np.memmap | None = None
+        self.predraft_verifier_entropy: np.memmap | None = None
+        self.predraft_verifier_entropy_mask: np.memmap | None = None
         self.postdraft_confidence: np.memmap | None = None
         self.postdraft_hidden: np.memmap | None = None
         self.postdraft_token_ids: np.memmap | None = None
@@ -224,6 +244,19 @@ class HorizonShardWriter:
                 dtype=np.uint8,
                 shape=(self.rows_per_shard, self.token_window),
             )
+        if self.log_verifier_entropy_window:
+            self.predraft_verifier_entropy = np.lib.format.open_memmap(
+                shard_dir / "predraft_verifier_entropy.npy",
+                mode="w+",
+                dtype=np.float16,
+                shape=(self.rows_per_shard, self.verifier_entropy_window),
+            )
+            self.predraft_verifier_entropy_mask = np.lib.format.open_memmap(
+                shard_dir / "predraft_verifier_entropy_mask.npy",
+                mode="w+",
+                dtype=np.uint8,
+                shape=(self.rows_per_shard, self.verifier_entropy_window),
+            )
         if self.log_postdraft_confidence:
             self.postdraft_confidence = np.lib.format.open_memmap(
                 shard_dir / "postdraft_confidence.npy",
@@ -259,6 +292,8 @@ class HorizonShardWriter:
         metadata: dict[str, Any],
         predraft_token_ids: np.ndarray | None = None,
         predraft_token_mask: np.ndarray | None = None,
+        predraft_verifier_entropy: np.ndarray | None = None,
+        predraft_verifier_entropy_mask: np.ndarray | None = None,
         postdraft_confidence: np.ndarray | None = None,
         postdraft_hidden: np.ndarray | None = None,
         postdraft_token_ids: np.ndarray | None = None,
@@ -291,6 +326,16 @@ class HorizonShardWriter:
                 raise ValueError("predraft_token_ids/mask are required when log_predraft_token_ids=True")
             self.predraft_token_ids[idx] = predraft_token_ids
             self.predraft_token_mask[idx] = predraft_token_mask
+        if self.log_verifier_entropy_window:
+            assert self.predraft_verifier_entropy is not None
+            assert self.predraft_verifier_entropy_mask is not None
+            if predraft_verifier_entropy is None or predraft_verifier_entropy_mask is None:
+                raise ValueError(
+                    "predraft_verifier_entropy/mask are required when "
+                    "log_verifier_entropy_window=True"
+                )
+            self.predraft_verifier_entropy[idx] = predraft_verifier_entropy
+            self.predraft_verifier_entropy_mask[idx] = predraft_verifier_entropy_mask
         if self.log_postdraft_confidence:
             assert self.postdraft_confidence is not None
             if postdraft_confidence is None:
@@ -325,6 +370,8 @@ class HorizonShardWriter:
             self.predraft_stats,
             self.predraft_token_ids,
             self.predraft_token_mask,
+            self.predraft_verifier_entropy,
+            self.predraft_verifier_entropy_mask,
             self.postdraft_confidence,
             self.postdraft_hidden,
             self.postdraft_token_ids,
@@ -340,6 +387,8 @@ class HorizonShardWriter:
         self.predraft_stats = None
         self.predraft_token_ids = None
         self.predraft_token_mask = None
+        self.predraft_verifier_entropy = None
+        self.predraft_verifier_entropy_mask = None
         self.postdraft_confidence = None
         self.postdraft_hidden = None
         self.postdraft_token_ids = None
@@ -400,6 +449,8 @@ def collect_one_prompt(
     latest_verifier_confidence = _token_confidence_features(
         output.logits[0, -1:], first_token[0].reshape(1)
     )[0]
+    verifier_entropy_history: deque[float] = deque(maxlen=writer.verifier_entropy_window)
+    verifier_entropy_history.append(float(latest_verifier_confidence[0]))
     prev_cycle_summary = np.zeros((4,), dtype=np.float16)
     output_ids[:, :num_input_tokens] = input_ids
     output_ids[:, num_input_tokens : num_input_tokens + 1] = first_token
@@ -425,6 +476,10 @@ def collect_one_prompt(
             output_ids,
             end_exclusive=start + 1,
             window=writer.token_window,
+        )
+        predraft_verifier_entropy, predraft_verifier_entropy_mask = _padded_float_window(
+            verifier_entropy_history,
+            window=writer.verifier_entropy_window,
         )
 
         block_output_ids = output_ids[:, start : start + block_size].clone()
@@ -467,6 +522,10 @@ def collect_one_prompt(
             output_hidden_states=True,
         )
         posterior = sample(output.logits, temperature)
+        verifier_confidence_for_block = _token_confidence_features(
+            output.logits[0, :block_size],
+            posterior[0, :block_size],
+        )
         accepted_draft_len = int(
             (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[
                 0
@@ -518,9 +577,19 @@ def collect_one_prompt(
                 "postdraft_hidden": writer.log_postdraft_hidden,
                 "predraft_token_ids": writer.log_predraft_token_ids,
                 "predraft_token_window": writer.token_window if writer.log_predraft_token_ids else None,
+                "predraft_verifier_entropy_window": writer.log_verifier_entropy_window,
+                "predraft_verifier_entropy_window_size": (
+                    writer.verifier_entropy_window if writer.log_verifier_entropy_window else None
+                ),
             },
             predraft_token_ids=predraft_token_ids if writer.log_predraft_token_ids else None,
             predraft_token_mask=predraft_token_mask if writer.log_predraft_token_ids else None,
+            predraft_verifier_entropy=(
+                predraft_verifier_entropy if writer.log_verifier_entropy_window else None
+            ),
+            predraft_verifier_entropy_mask=(
+                predraft_verifier_entropy_mask if writer.log_verifier_entropy_window else None
+            ),
             postdraft_confidence=postdraft_confidence,
             postdraft_hidden=postdraft_hidden,
             postdraft_token_ids=postdraft_token_ids,
@@ -533,10 +602,9 @@ def collect_one_prompt(
         start += committed_len
         past_key_values_target.crop(start)
 
-        latest_verifier_confidence = _token_confidence_features(
-            output.logits[0, accepted_draft_len : accepted_draft_len + 1],
-            correction_token[0].reshape(1),
-        )[0]
+        for entropy in verifier_confidence_for_block[:committed_len, 0]:
+            verifier_entropy_history.append(float(entropy))
+        latest_verifier_confidence = verifier_confidence_for_block[accepted_draft_len]
         prev_cycle_summary = np.asarray(
             [
                 accepted_draft_len / max(num_draft_slots, 1),
@@ -605,6 +673,20 @@ def parse_args() -> argparse.Namespace:
         default=32,
         help="Number of latest prefix token ids to store when --log-predraft-token-ids is enabled.",
     )
+    parser.add_argument(
+        "--log-verifier-entropy-window",
+        action="store_true",
+        help=(
+            "Store a causal window of verifier entropies for the last committed prefix tokens "
+            "before each draft cycle."
+        ),
+    )
+    parser.add_argument(
+        "--verifier-entropy-window",
+        type=int,
+        default=64,
+        help="Number of latest committed-token verifier entropies to store.",
+    )
     parser.add_argument("--attn-implementation", default="sdpa")
     parser.add_argument("--dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
     return parser.parse_args()
@@ -655,6 +737,8 @@ def main() -> None:
         log_postdraft_hidden=args.log_postdraft_hidden,
         log_predraft_token_ids=args.log_predraft_token_ids,
         token_window=args.token_window,
+        log_verifier_entropy_window=args.log_verifier_entropy_window,
+        verifier_entropy_window=args.verifier_entropy_window,
     )
     stopped_by_cycle_budget = False
     try:
@@ -716,6 +800,10 @@ def main() -> None:
         "postdraft_token_ids_shape": [args.block_size] if args.log_postdraft_hidden else None,
         "predraft_token_ids": args.log_predraft_token_ids,
         "predraft_token_ids_shape": [args.token_window] if args.log_predraft_token_ids else None,
+        "predraft_verifier_entropy_window": args.log_verifier_entropy_window,
+        "predraft_verifier_entropy_window_shape": [args.verifier_entropy_window]
+        if args.log_verifier_entropy_window
+        else None,
         "rows_per_shard": args.rows_per_shard,
         "shards": writer.shards,
         "stopped_by_cycle_budget": stopped_by_cycle_budget,
