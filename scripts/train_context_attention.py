@@ -233,7 +233,10 @@ def main():
                 best_path = save_checkpoint(0, initial_metrics, initial_policy)
                 atomic_json(directory / "initial.json", {"calibration_mae": initial_metrics["expected_mae"],
                             "calibration_nll": initial_nll, "calibration_proxy_policy": initial_policy})
-                futures.append(backup_pool.submit(backup, [directory / "initial.json"]))
+                initial_paths = [directory / "initial.json"]
+                if args.backup_checkpoints == "all":
+                    initial_paths.append(best_path)
+                futures.append(backup_pool.submit(backup, initial_paths))
             for epoch in range(1, args.epochs+1):
                 model.train()
                 total_nll, total_mae, samples = 0.0, 0.0, 0

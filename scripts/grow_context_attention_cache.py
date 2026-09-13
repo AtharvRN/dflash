@@ -25,6 +25,7 @@ def audit_labels(paths, rows, workers):
         survival = np.load(path/"survival.npy")[local]
         cycles = np.load(path/"cycle_id.npy")[local]
         mismatch = (labels != expected) | (cycles != selected[:, 3])
+        mismatch |= ~np.isin(labels, np.arange(16)) | ~np.isin(expected, np.arange(16))
         mismatch |= (survival != (expected[:, None] >= np.arange(1,16))).any(1)
         if mismatch.any():
             return {"shard":int(shard), "path":str(path), "rows":len(selected),

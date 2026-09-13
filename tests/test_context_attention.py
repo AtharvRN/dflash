@@ -213,7 +213,7 @@ class ContextDataTest(unittest.TestCase):
                 "--device", "cpu", "--epochs", "1", "--layers", "1", "--heads", "2",
                 "--ff-width", "16", "--batch-size", "8", "--eval-batch-size", "8", "--workers", "0",
                 "--models", "last_mlp", "one_query", "position_queries", "residual_attention", "residual_last_only",
-                "--selection-metric", "accept_ratio", "--backup-checkpoints", "final"],
+                "--selection-metric", "accept_ratio", "--backup-checkpoints", "all"],
                 env={**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
                 capture_output=True, text=True, timeout=90)
             self.assertEqual(completed.returncode, 0, completed.stderr)
@@ -225,6 +225,7 @@ class ContextDataTest(unittest.TestCase):
                 self.assertEqual(metrics["assessment"]["rows"], 8)
                 self.assertTrue((root/"persistent"/name/metrics["best_checkpoint"]).exists())
             self.assertTrue(result["residual_attention"]["baseline_frozen_verified"])
+            self.assertTrue((root/"persistent/residual_attention/best_epoch_0.pt").exists())
             checkpoint = torch.load(root/"persistent"/"residual_attention"/result["residual_attention"]["best_checkpoint"], weights_only=False)
             initial = json.loads((root/"run"/"residual_attention"/"initial.json").read_text())
             self.assertLessEqual(checkpoint["selection_score"], -initial["calibration_proxy_policy"]["aggregate_accept_ratio"])

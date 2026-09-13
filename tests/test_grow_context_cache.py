@@ -54,12 +54,12 @@ class GrowCacheTest(unittest.TestCase):
     def test_audit_detects_partial_label_and_cycle_writes(self):
         with tempfile.TemporaryDirectory() as tmp:
             p=Path(tmp)
-            rows=np.array([[0,0,10,0,1],[0,1,10,1,2],[0,2,10,2,0]])
-            np.save(p/"accepted_len.npy",np.array([1,0,0]))
+            rows=np.array([[0,0,10,0,1],[0,1,10,1,2],[0,2,10,2,0],[0,3,10,3,16]])
+            np.save(p/"accepted_len.npy",np.array([1,0,0,16]))
             np.save(p/"survival.npy",rows[:,4,None]>=np.arange(1,16))
-            np.save(p/"cycle_id.npy",np.array([0,1,0]))
+            np.save(p/"cycle_id.npy",np.array([0,1,0,3]))
             reports=audit_labels([p],rows,1)
-            self.assertEqual(reports[0]["mismatched_rows"],rows[[1,2]].tolist())
+            self.assertEqual(reports[0]["mismatched_rows"],rows[[1,2,3]].tolist())
 
 
 if __name__ == "__main__":
