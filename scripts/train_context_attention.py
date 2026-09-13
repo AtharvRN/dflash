@@ -55,9 +55,9 @@ class ContextDataset(Dataset):
 
 
 def make_model(name, info, args):
-    if name == "residual_attention":
+    if name in ("residual_attention", "residual_last_only"):
         return ResidualContextAcceptancePredictor(make_model("last_mlp", info, args),
-                                                  make_model("one_query", info, args))
+                          make_model("one_query", info, args), last_only=name == "residual_last_only")
     if name == "last_mlp":
         return HorizonPredictor(input_dim=info["input_dim"], proj_dim=512, hidden_size=256,
                                 num_slots=info["num_slots"], architecture="last_mlp", num_layers=1,
@@ -125,7 +125,7 @@ def main():
     p.add_argument("--cache-dir", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--persistent-dir", type=Path)
-    p.add_argument("--models", nargs="+", choices=["last_mlp", "one_query", "position_queries", "residual_attention"],
+    p.add_argument("--models", nargs="+", choices=["last_mlp", "one_query", "position_queries", "residual_attention", "residual_last_only"],
                    default=["last_mlp", "one_query", "position_queries"])
     p.add_argument("--epochs", type=int, default=6)
     p.add_argument("--batch-size", type=int, default=128)
@@ -147,9 +147,9 @@ def main():
     args = p.parse_args()
     if args.epochs < 1 or args.batch_size < 1 or args.cpu_threads < 1 or not 0 < args.retention <= 1:
         raise ValueError("Invalid epoch/batch/retention settings")
-    if "residual_attention" in args.models and ("last_mlp" not in args.models or
-            args.models.index("last_mlp") > args.models.index("residual_attention")):
-        raise ValueError("Train the matched last_mlp before residual_attention")
+    for name in ("residual_attention", "residual_last_only"):
+        if name in args.models and ("last_mlp" not in args.models or args.models.index("last_mlp") > args.models.index(name)):
+            raise ValueError("Train the matched last_mlp before residual models")
     torch.set_num_threads(args.cpu_threads)
     args.output_dir.mkdir(parents=True, exist_ok=False)
     device = torch.device(args.device)
@@ -202,7 +202,7 @@ def main():
             random.seed(args.seed)
             model = make_model(name, info, args).to(device)
             baseline_state, baseline_path = None, None
-            if name == "residual_attention":
+            if isinstance(model, ResidualContextAcceptancePredictor):
                 baseline_path = args.output_dir / "last_mlp" / results["last_mlp"]["best_checkpoint"]
                 baseline_checkpoint = torch.load(baseline_path, map_location="cpu", weights_only=False)
                 baseline_state = baseline_checkpoint["model"]

@@ -128,6 +128,17 @@ class ContextAttentionTest(unittest.TestCase):
         clone.load_state_dict(model.state_dict())
         torch.testing.assert_close(model(x,mask), clone(x,mask), atol=0, rtol=0)
 
+    def test_last_only_correction_ignores_earlier_features(self):
+        from types import SimpleNamespace
+        model = make_model("residual_last_only", {"input_dim":8,"context_window":6,"num_slots":15},
+                           SimpleNamespace(dropout=0.,layers=1,heads=2,ff_width=16)).eval()
+        torch.nn.init.normal_(model.correction.head.weight)
+        x, mask = torch.randn(2,6,8), torch.tensor([[0,1,1,1,0,0],[1,1,1,1,1,1]])
+        changed = x.clone()
+        changed[0,:3] = torch.randn(3,8)*10
+        changed[1,:5] = torch.randn(5,8)*10
+        torch.testing.assert_close(model(x,mask), model(changed,mask), atol=0, rtol=0)
+
 
 class ContextDataTest(unittest.TestCase):
     def test_reject_contradictory_features_and_interior_mask_holes(self):
@@ -201,13 +212,13 @@ class ContextDataTest(unittest.TestCase):
                 "--output-dir", str(root/"run"), "--persistent-dir", str(root/"persistent"),
                 "--device", "cpu", "--epochs", "1", "--layers", "1", "--heads", "2",
                 "--ff-width", "16", "--batch-size", "8", "--eval-batch-size", "8", "--workers", "0",
-                "--models", "last_mlp", "one_query", "position_queries", "residual_attention",
+                "--models", "last_mlp", "one_query", "position_queries", "residual_attention", "residual_last_only",
                 "--selection-metric", "accept_ratio", "--backup-checkpoints", "final"],
                 env={**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
                 capture_output=True, text=True, timeout=90)
             self.assertEqual(completed.returncode, 0, completed.stderr)
             result = json.loads((root/"run"/"summary.json").read_text())
-            self.assertEqual(set(result), {"last_mlp", "one_query", "position_queries", "residual_attention"})
+            self.assertEqual(set(result), {"last_mlp", "one_query", "position_queries", "residual_attention", "residual_last_only"})
             self.assertEqual(result, json.loads((root/"persistent"/"summary.json").read_text()))
             for name, metrics in result.items():
                 self.assertEqual(metrics["full_validation"]["rows"], 16)

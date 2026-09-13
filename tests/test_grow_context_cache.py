@@ -6,7 +6,7 @@ import unittest
 
 import numpy as np
 
-from scripts.grow_context_attention_cache import grow_cache
+from scripts.grow_context_attention_cache import grow_cache, audit_labels
 
 
 class GrowCacheTest(unittest.TestCase):
@@ -20,7 +20,7 @@ class GrowCacheTest(unittest.TestCase):
             y = np.array([0,15,4,8,99])
             rows = np.array([[0,0,10,0,0], [0,1,20,0,15], [0,2,10,1,4], [0,3,30,0,8]])
             arrays = {"features":x, "mask":np.ones((5,3),np.uint8), "accepted_len":y,
-                      "survival":y[:,None]>=np.arange(1,16)}
+                      "survival":y[:,None]>=np.arange(1,16), "cycle_id":np.array([0,0,1,0,99])}
             for name,array in arrays.items():
                 np.save(shard/(name+".npy"),array)
             for name,array in {"features":x[[1,3]], "mask":np.ones((2,3),np.uint8),
@@ -50,6 +50,16 @@ class GrowCacheTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,"ordering"):
                 grow_cache(parent, root/"invalid",2,1,913)
             self.assertFalse((root/"invalid/manifest.json").exists())
+
+    def test_audit_detects_partial_label_and_cycle_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p=Path(tmp)
+            rows=np.array([[0,0,10,0,1],[0,1,10,1,2],[0,2,10,2,0]])
+            np.save(p/"accepted_len.npy",np.array([1,0,0]))
+            np.save(p/"survival.npy",rows[:,4,None]>=np.arange(1,16))
+            np.save(p/"cycle_id.npy",np.array([0,1,0]))
+            reports=audit_labels([p],rows,1)
+            self.assertEqual(reports[0]["mismatched_rows"],rows[[1,2]].tolist())
 
 
 if __name__ == "__main__":

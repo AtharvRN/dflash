@@ -81,10 +81,11 @@ class ContextAcceptancePredictor(nn.Module):
 
 class ResidualContextAcceptancePredictor(nn.Module):
     """Frozen last-vector predictor plus a zero-initialized context correction."""
-    def __init__(self, baseline: nn.Module, correction: ContextAcceptancePredictor):
+    def __init__(self, baseline: nn.Module, correction: ContextAcceptancePredictor, *, last_only: bool = False):
         super().__init__()
         self.baseline = baseline.requires_grad_(False).eval()
         self.correction = correction
+        self.last_only = last_only
         nn.init.zeros_(self.correction.head.weight)
         nn.init.zeros_(self.correction.head.bias)
 
@@ -94,9 +95,16 @@ class ResidualContextAcceptancePredictor(nn.Module):
         return self
 
     def forward(self, features: torch.Tensor, mask: torch.Tensor):
+        if not ((mask == 0) | (mask == 1)).all():
+            raise ValueError("Context mask must be binary")
         with torch.no_grad():
             baseline = self.baseline(features, mask)
-        return baseline.float() + self.correction(features, mask).float()
+        correction_mask = mask
+        if self.last_only:
+            positions = torch.arange(mask.shape[1], device=mask.device).expand_as(mask)
+            last = positions.masked_fill(~mask.bool(), -1).max(1).values
+            correction_mask = (positions == last[:, None]) & mask.bool()
+        return baseline.float() + self.correction(features, correction_mask).float()
 
 
 def acceptance_nll(logits: torch.Tensor, accepted: torch.Tensor,
