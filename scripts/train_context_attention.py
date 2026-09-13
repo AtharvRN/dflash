@@ -66,7 +66,7 @@ def metrics(survival, accepted):
     return {"rows": len(accepted), "expected_mae": float(absolute.mean()),
             "median_mae": float(((survival >= .5).sum(-1)-accepted).abs().float().mean()),
             "mean_expected": float(prediction.mean()), "mean_accepted": float(accepted.float().mean()),
-            "brier": float(((survival-(accepted[:, None] >= torch.arange(1, survival.shape[1]+1)))**2).mean()),
+            "brier": float(((survival-(accepted[:, None] >= torch.arange(1, survival.shape[1]+1)).float())**2).mean()),
             "by_length": by_length}
 
 

@@ -1,5 +1,9 @@
 import math
+import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -56,6 +60,8 @@ class ContextAttentionTest(unittest.TestCase):
         x = torch.randn(1, 6, 8)
         with self.assertRaises(ValueError):
             model(x, torch.zeros(1, 6))
+        with self.assertRaises(ValueError):
+            model(x, torch.full((1, 6), .5))
         normal = model(x, torch.ones(1, 6))
         anchored = model(x, torch.ones(1, 6), torch.randn(1, 8))
         self.assertFalse(torch.allclose(normal, anchored))
@@ -135,6 +141,41 @@ class ContextDataTest(unittest.TestCase):
         assessment_a = proxy_metrics(s, torch.tensor([0,0]), selected["alpha"])
         assessment_b = proxy_metrics(s, torch.tensor([3,3]), selected["alpha"])
         self.assertEqual(assessment_a["mean_budget"], assessment_b["mean_budget"])
+
+    def test_training_cli_and_persistent_results(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / "cache"
+            cache.mkdir()
+            rng = np.random.default_rng(1)
+            info = {"format": "dflash_context_attention_cache_v1", "input_kind": "predraft_fused",
+                    "input_dim": 8, "context_window": 4, "num_slots": 15}
+            (cache / "manifest.json").write_text(json.dumps(info))
+            for name, offset in (("train", 0), ("val", 100)):
+                path = cache / name
+                path.mkdir()
+                np.save(path/"features.npy", rng.standard_normal((16,4,8)).astype(np.float16))
+                np.save(path/"mask.npy", np.ones((16,4), np.uint8))
+                np.save(path/"accepted_len.npy", np.arange(16))
+                rows = np.stack([np.zeros(16), np.arange(16), np.arange(16)+offset,
+                                 np.zeros(16), np.arange(16)], axis=1).astype(np.int64)
+                np.save(path/"row_index.npy", rows)
+            np.save(cache/"val"/"calibration.npy", np.arange(16)%2 == 0)
+            script = Path(__file__).resolve().parents[1]/"scripts"/"train_context_attention.py"
+            completed = subprocess.run([sys.executable, str(script), "--cache-dir", str(cache),
+                "--output-dir", str(root/"run"), "--persistent-dir", str(root/"persistent"),
+                "--device", "cpu", "--epochs", "1", "--layers", "1", "--heads", "2",
+                "--ff-width", "16", "--batch-size", "8", "--eval-batch-size", "8", "--workers", "0"],
+                env={**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
+                capture_output=True, text=True, timeout=90)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result = json.loads((root/"run"/"summary.json").read_text())
+            self.assertEqual(set(result), {"last_mlp", "one_query", "position_queries"})
+            self.assertEqual(result, json.loads((root/"persistent"/"summary.json").read_text()))
+            for name, metrics in result.items():
+                self.assertEqual(metrics["full_validation"]["rows"], 16)
+                self.assertEqual(metrics["assessment"]["rows"], 8)
+                self.assertTrue((root/"persistent"/name/metrics["best_checkpoint"]).exists())
 
 
 if __name__ == "__main__":

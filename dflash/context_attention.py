@@ -58,6 +58,8 @@ class ContextAcceptancePredictor(nn.Module):
                 anchor_embedding: torch.Tensor | None = None) -> torch.Tensor:
         if features.ndim != 3 or features.shape[:2] != mask.shape or features.shape[-1] != self.input_dim:
             raise ValueError("Expected features [batch, context, width] and matching mask")
+        if not ((mask == 0) | (mask == 1)).all():
+            raise ValueError("Context mask must be binary")
         valid = mask.bool()
         if features.shape[1] > self.context_window or not valid.any(dim=1).all():
             raise ValueError("Context exceeds configured window or contains an empty row")
