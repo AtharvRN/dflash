@@ -54,7 +54,7 @@ def main():
              ylabel="Accepted draft tokens relative to B16 (%)",
              title="Frozen policies on the same B16 reference states")
     axis.margins(y=.2)
-    axis.legend(frameon=False, loc="lower left")
+    axis.legend(frameon=True, facecolor="white", framealpha=1, loc="lower left")
     axis.set_axisbelow(True)
     axis.grid(axis="y", alpha=.2)
     fig.savefig(args.output_dir / "paired_policy_retention.png", dpi=180)
