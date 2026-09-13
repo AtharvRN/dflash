@@ -15,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import transformers
 from torch import nn
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
@@ -175,7 +176,7 @@ def run_prompt(args, row, target, draft, tokenizer, policies, count_before):
     del prefill
     eos = target.generation_config.eos_token_id
     eos = set(eos if isinstance(eos, list) else [eos]) - {None}
-    offsets = np.linspace(0, args.max_new_tokens - 16, args.states_per_prompt, dtype=int).tolist()
+    offsets = np.linspace(0, max(0, args.max_new_tokens - 32), args.states_per_prompt, dtype=int).tolist()
     next_offset, start, cycle = 0, n, 0
     rows = []
     rng = random.Random(args.seed + int(row["manifest_index"]))
@@ -324,12 +325,14 @@ def main():
     if args.persistent_dir:
         args.persistent_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(args.seed)
+    torch.backends.cuda.matmul.allow_tf32 = False
     rows = select_prompts(args.manifest, args.validation_ids, args.max_prompts, args.seed)
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
     config.update({"prompt_ids": [str(r["manifest_index"]) for r in rows], "temperature": 0,
                    "thinking": False, "ground_truth": "direct verification for every actual draft",
                    "trajectory": "B16 reference; policies evaluated at identical states, not closed-loop",
-                   "torch_version": torch.__version__, "gpu": torch.cuda.get_device_name(),
+                   "torch_version": torch.__version__, "transformers_version": transformers.__version__,
+                   "gpu": torch.cuda.get_device_name(), "allow_tf32": False,
                    "git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()})
     for name, path in (("model_config", args.model/"config.json"), ("draft_config", args.draft_model/"config.json")):
         config[name] = json.loads(path.read_text())
@@ -341,7 +344,7 @@ def main():
     draft = DFlashDraftModel.from_pretrained(args.draft_model, torch_dtype=dtype,
              attn_implementation=args.attn_implementation, local_files_only=True).cuda().eval()
     policies = Policies(args, draft)
-    all_rows, prompts, features = [], [], []
+    all_rows, prompts = [], []
     started = time.monotonic()
     pool = ThreadPoolExecutor(max_workers=1)
     backups = []
