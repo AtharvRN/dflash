@@ -17,7 +17,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from dflash.context_attention import ContextAcceptancePredictor, acceptance_nll, acceptance_survival, choose_budget
+from dflash.context_attention import ContextAcceptancePredictor, ResidualContextAcceptancePredictor, acceptance_nll, acceptance_survival, choose_budget
 from scripts.train_dflashv2_horizon_predictor import HorizonPredictor
 from scripts.prepare_context_attention_cache import validate_context_masks, validate_feature_kind
 
@@ -55,6 +55,9 @@ class ContextDataset(Dataset):
 
 
 def make_model(name, info, args):
+    if name == "residual_attention":
+        return ResidualContextAcceptancePredictor(make_model("last_mlp", info, args),
+                                                  make_model("one_query", info, args))
     if name == "last_mlp":
         return HorizonPredictor(input_dim=info["input_dim"], proj_dim=512, hidden_size=256,
                                 num_slots=info["num_slots"], architecture="last_mlp", num_layers=1,
@@ -122,7 +125,7 @@ def main():
     p.add_argument("--cache-dir", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--persistent-dir", type=Path)
-    p.add_argument("--models", nargs="+", choices=["last_mlp", "one_query", "position_queries"],
+    p.add_argument("--models", nargs="+", choices=["last_mlp", "one_query", "position_queries", "residual_attention"],
                    default=["last_mlp", "one_query", "position_queries"])
     p.add_argument("--epochs", type=int, default=6)
     p.add_argument("--batch-size", type=int, default=128)
@@ -136,12 +139,17 @@ def main():
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--length-weight", type=float, default=0.0)
     p.add_argument("--retention", type=float, default=.96)
+    p.add_argument("--selection-metric", choices=["mae", "accept_ratio"], default="mae")
+    p.add_argument("--backup-checkpoints", choices=["all", "final"], default="all")
     p.add_argument("--seed", type=int, default=913)
     p.add_argument("--device", default="cuda")
     p.add_argument("--no-amp", action="store_true")
     args = p.parse_args()
     if args.epochs < 1 or args.batch_size < 1 or args.cpu_threads < 1 or not 0 < args.retention <= 1:
         raise ValueError("Invalid epoch/batch/retention settings")
+    if "residual_attention" in args.models and ("last_mlp" not in args.models or
+            args.models.index("last_mlp") > args.models.index("residual_attention")):
+        raise ValueError("Train the matched last_mlp before residual_attention")
     torch.set_num_threads(args.cpu_threads)
     args.output_dir.mkdir(parents=True, exist_ok=False)
     device = torch.device(args.device)
@@ -193,13 +201,39 @@ def main():
             np.random.seed(args.seed)
             random.seed(args.seed)
             model = make_model(name, info, args).to(device)
-            optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=.01)
+            baseline_state, baseline_path = None, None
+            if name == "residual_attention":
+                baseline_path = args.output_dir / "last_mlp" / results["last_mlp"]["best_checkpoint"]
+                baseline_checkpoint = torch.load(baseline_path, map_location="cpu", weights_only=False)
+                baseline_state = baseline_checkpoint["model"]
+                model.baseline.load_state_dict(baseline_state)
+                del baseline_checkpoint
+            trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+            optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=.01)
             train_loader = loader(train, train_mode=True)
             directory = args.output_dir / name
             directory.mkdir()
-            best_mae, history, best_path = float("inf"), [], None
+            best_score, history, best_path = float("inf"), [], None
             started = time.monotonic()
             parameters = sum(p.numel() for p in model.parameters())
+            def score(cal_metrics, cal_policy):
+                return cal_metrics["expected_mae"] if args.selection_metric == "mae" else -cal_policy["aggregate_accept_ratio"]
+            def save_checkpoint(epoch, cal_metrics, cal_policy):
+                path = directory / f"best_epoch_{epoch}.pt"
+                torch.save({"model": model.state_dict(), "architecture": name, "epoch": epoch,
+                            "model_config": config, "calibration_mae": cal_metrics["expected_mae"],
+                            "selection_score": score(cal_metrics, cal_policy),
+                            "baseline_checkpoint": str(baseline_path) if baseline_path else None}, path)
+                return path
+            if baseline_state is not None:
+                pred, labels, initial_nll = predict(model, cal_loader, device, amp)
+                initial_metrics = metrics(pred, labels)
+                initial_policy = calibrate(pred, labels, args.retention)
+                best_score = score(initial_metrics, initial_policy)
+                best_path = save_checkpoint(0, initial_metrics, initial_policy)
+                atomic_json(directory / "initial.json", {"calibration_mae": initial_metrics["expected_mae"],
+                            "calibration_nll": initial_nll, "calibration_proxy_policy": initial_policy})
+                futures.append(backup_pool.submit(backup, [directory / "initial.json"]))
             for epoch in range(1, args.epochs+1):
                 model.train()
                 total_nll, total_mae, samples = 0.0, 0.0, 0
@@ -214,31 +248,36 @@ def main():
                     if not torch.isfinite(loss):
                         raise FloatingPointError("Nonfinite training loss")
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
+                    torch.nn.utils.clip_grad_norm_(trainable, 1.0, error_if_nonfinite=True)
                     optimizer.step()
                     total_nll += float(nll.detach()) * len(y)
                     total_mae += float((expected.detach()-y).abs().sum())
                     samples += len(y)
                 pred, labels, cal_nll = predict(model, cal_loader, device, amp)
                 cal_metrics = metrics(pred, labels)
+                cal_policy = calibrate(pred, labels, args.retention)
                 epoch_record = {"model": name, "epoch": epoch, "train_nll": total_nll/samples,
                                 "train_mae": total_mae/samples, "calibration_nll": cal_nll,
                                 "calibration_mae": cal_metrics["expected_mae"],
+                                "calibration_proxy_policy": cal_policy,
                                 "elapsed_s": time.monotonic()-started}
                 history.append(epoch_record)
                 paths = []
-                if cal_metrics["expected_mae"] < best_mae:
-                    best_mae = cal_metrics["expected_mae"]
-                    best_path = directory / f"best_epoch_{epoch}.pt"
-                    torch.save({"model": model.state_dict(), "architecture": name, "epoch": epoch,
-                                "model_config": config, "calibration_mae": best_mae}, best_path)
-                    paths.append(best_path)
+                if score(cal_metrics, cal_policy) < best_score:
+                    best_score = score(cal_metrics, cal_policy)
+                    best_path = save_checkpoint(epoch, cal_metrics, cal_policy)
+                    if args.backup_checkpoints == "all":
+                        paths.append(best_path)
                 atomic_json(directory / "history.json", history)
                 # Immutable snapshot prevents a racing background copy of an overwritten history file.
                 atomic_json(directory / f"epoch_{epoch}.json", epoch_record)
                 paths.append(directory / f"epoch_{epoch}.json")
                 futures.append(backup_pool.submit(backup, paths))
                 print(json.dumps(epoch_record), flush=True)
+            if baseline_state is not None:
+                for key, value in model.baseline.state_dict().items():
+                    if not torch.equal(value.cpu(), baseline_state[key]):
+                        raise RuntimeError(f"Frozen baseline changed: {key}")
             checkpoint = torch.load(best_path, map_location=device, weights_only=False)
             model.load_state_dict(checkpoint["model"])
             del checkpoint
@@ -246,6 +285,8 @@ def main():
             cal = torch.from_numpy(calibration_mask)
             selected = calibrate(prediction[cal], accepted[cal], args.retention)
             result = {"parameters": parameters, "best_epoch": int(best_path.stem.split("_")[-1]),
+                      "trainable_parameters": sum(p.numel() for p in trainable),
+                      "baseline_frozen_verified": baseline_state is not None,
                       "best_checkpoint": best_path.name, "full_validation": metrics(prediction, accepted),
                       "full_validation_nll": val_nll,
                       "assessment": metrics(prediction[~cal], accepted[~cal]),
@@ -256,10 +297,10 @@ def main():
             atomic_json(directory / "result.json", result)
             results[name] = result
             atomic_json(args.output_dir / "summary.json", results)
-            futures.append(backup_pool.submit(backup, [directory / "result.json", directory / "history.json",
+            futures.append(backup_pool.submit(backup, [best_path, directory / "result.json", directory / "history.json",
                                                        directory / "validation_survival.npy"]))
             print(json.dumps({"completed": name, "result": result}), flush=True)
-            del model, optimizer, train_loader
+            del model, optimizer, train_loader, trainable, baseline_state
             if device.type == "cuda":
                 torch.cuda.empty_cache()
         futures.append(backup_pool.submit(backup, [args.output_dir / "summary.json"]))

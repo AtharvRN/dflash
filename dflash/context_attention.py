@@ -79,6 +79,26 @@ class ContextAcceptancePredictor(nn.Module):
         return logits[:, 0] if self.num_queries == 1 else logits.squeeze(-1)
 
 
+class ResidualContextAcceptancePredictor(nn.Module):
+    """Frozen last-vector predictor plus a zero-initialized context correction."""
+    def __init__(self, baseline: nn.Module, correction: ContextAcceptancePredictor):
+        super().__init__()
+        self.baseline = baseline.requires_grad_(False).eval()
+        self.correction = correction
+        nn.init.zeros_(self.correction.head.weight)
+        nn.init.zeros_(self.correction.head.bias)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.baseline.eval()
+        return self
+
+    def forward(self, features: torch.Tensor, mask: torch.Tensor):
+        with torch.no_grad():
+            baseline = self.baseline(features, mask)
+        return baseline.float() + self.correction(features, mask).float()
+
+
 def acceptance_nll(logits: torch.Tensor, accepted: torch.Tensor,
                    reduction: str = "mean") -> torch.Tensor:
     """First-rejection likelihood; the maximum accepted length is right-censored."""

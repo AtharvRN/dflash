@@ -10,9 +10,9 @@ import unittest
 import numpy as np
 import torch
 
-from dflash.context_attention import ContextAcceptancePredictor, acceptance_nll, acceptance_survival, choose_budget
+from dflash.context_attention import ContextAcceptancePredictor, ResidualContextAcceptancePredictor, acceptance_nll, acceptance_survival, choose_budget
 from scripts.prepare_context_attention_cache import materialize, partition_staged, scan_shard, split_rows, validate_context_masks, validate_feature_kind
-from scripts.train_context_attention import calibrate, proxy_metrics
+from scripts.train_context_attention import calibrate, proxy_metrics, make_model
 
 
 class ContextAttentionTest(unittest.TestCase):
@@ -105,6 +105,29 @@ class ContextAttentionTest(unittest.TestCase):
                 opt.step()
             self.assertLess(float(loss.detach()), initial*.2)
 
+    def test_residual_starts_at_baseline_and_freezes_it(self):
+        from types import SimpleNamespace
+        args = SimpleNamespace(dropout=.4, layers=1, heads=2, ff_width=16)
+        info = {"input_dim":8, "context_window":6, "num_slots":15}
+        model = make_model("residual_attention", info, args).train()
+        x, mask, y = torch.randn(4,6,8), torch.ones(4,6), torch.tensor([0,3,8,15])
+        state = {k:v.clone() for k,v in model.baseline.state_dict().items()}
+        torch.testing.assert_close(model(x,mask), model.baseline(x,mask), atol=0, rtol=0)
+        self.assertFalse(model.baseline.training)
+        opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=.01)
+        for _ in range(2):
+            opt.zero_grad()
+            acceptance_nll(model(x,mask), y).backward()
+            opt.step()
+        self.assertTrue(all(p.grad is None for p in model.baseline.parameters()))
+        self.assertGreater(float(model.correction.queries.grad.abs().sum()), 0)
+        for k,v in model.baseline.state_dict().items():
+            torch.testing.assert_close(v, state[k], atol=0, rtol=0)
+        model.eval()
+        clone = make_model("residual_attention", info, args).eval()
+        clone.load_state_dict(model.state_dict())
+        torch.testing.assert_close(model(x,mask), clone(x,mask), atol=0, rtol=0)
+
 
 class ContextDataTest(unittest.TestCase):
     def test_reject_contradictory_features_and_interior_mask_holes(self):
@@ -177,17 +200,23 @@ class ContextDataTest(unittest.TestCase):
             completed = subprocess.run([sys.executable, str(script), "--cache-dir", str(cache),
                 "--output-dir", str(root/"run"), "--persistent-dir", str(root/"persistent"),
                 "--device", "cpu", "--epochs", "1", "--layers", "1", "--heads", "2",
-                "--ff-width", "16", "--batch-size", "8", "--eval-batch-size", "8", "--workers", "0"],
+                "--ff-width", "16", "--batch-size", "8", "--eval-batch-size", "8", "--workers", "0",
+                "--models", "last_mlp", "one_query", "position_queries", "residual_attention",
+                "--selection-metric", "accept_ratio", "--backup-checkpoints", "final"],
                 env={**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
                 capture_output=True, text=True, timeout=90)
             self.assertEqual(completed.returncode, 0, completed.stderr)
             result = json.loads((root/"run"/"summary.json").read_text())
-            self.assertEqual(set(result), {"last_mlp", "one_query", "position_queries"})
+            self.assertEqual(set(result), {"last_mlp", "one_query", "position_queries", "residual_attention"})
             self.assertEqual(result, json.loads((root/"persistent"/"summary.json").read_text()))
             for name, metrics in result.items():
                 self.assertEqual(metrics["full_validation"]["rows"], 16)
                 self.assertEqual(metrics["assessment"]["rows"], 8)
                 self.assertTrue((root/"persistent"/name/metrics["best_checkpoint"]).exists())
+            self.assertTrue(result["residual_attention"]["baseline_frozen_verified"])
+            checkpoint = torch.load(root/"persistent"/"residual_attention"/result["residual_attention"]["best_checkpoint"], weights_only=False)
+            initial = json.loads((root/"run"/"residual_attention"/"initial.json").read_text())
+            self.assertLessEqual(checkpoint["selection_score"], -initial["calibration_proxy_policy"]["aggregate_accept_ratio"])
 
 
 if __name__ == "__main__":
