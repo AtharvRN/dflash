@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 from dflash.context_attention import ContextAcceptancePredictor, acceptance_nll, acceptance_survival, choose_budget
-from scripts.prepare_context_attention_cache import materialize, partition_staged, scan_shard, split_rows
+from scripts.prepare_context_attention_cache import materialize, partition_staged, scan_shard, split_rows, validate_context_masks, validate_feature_kind
 from scripts.train_context_attention import calibrate, proxy_metrics
 
 
@@ -107,6 +107,15 @@ class ContextAttentionTest(unittest.TestCase):
 
 
 class ContextDataTest(unittest.TestCase):
+    def test_reject_contradictory_features_and_interior_mask_holes(self):
+        validate_feature_kind({"predraft_feature_kind": "fused"})
+        with self.assertRaises(ValueError):
+            validate_feature_kind({"predraft_feature_kind": "raw-target"})
+        validate_context_masks(np.array([[0,1,1], [1,1,0]]))
+        for mask in ([[1,0,1]], [[0,0,0]], [[1,.5,0]]):
+            with self.assertRaises(ValueError):
+                validate_context_masks(np.array(mask))
+
     def test_prompt_splits_and_padded_tail_rows(self):
         import json
         with tempfile.TemporaryDirectory() as tmp:

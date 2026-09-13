@@ -26,6 +26,20 @@ def prompt_ids(path, key):
     return result
 
 
+def validate_feature_kind(manifest):
+    if manifest.get("predraft_feature_kind", "fused") != "fused":
+        raise ValueError("Source explicitly declares non-fused pre-draft features")
+
+
+def validate_context_masks(masks):
+    if masks.ndim != 2 or not np.isin(masks, [0, 1]).all() or not masks.any(1).all():
+        raise ValueError("Context masks must be binary and nonempty")
+    first = masks.argmax(1)
+    last = masks.shape[1] - 1 - masks[:, ::-1].argmax(1)
+    if not np.array_equal(masks.sum(1), last-first+1):
+        raise ValueError("Context masks contain interior holes")
+
+
 def scan_shard(task):
     index, path = task
     ids, cycles, labels = [], [], []
@@ -80,8 +94,9 @@ def materialize(paths, rows, output, *, window, width, workers):
         if source.max() >= min(len(x), len(y)):
             raise ValueError(f"Metadata exceeds allocated rows: {path}")
         selected_x, selected_m, selected_y = np.asarray(x[source]), np.asarray(m[source]), np.asarray(y[source])
-        if not np.isfinite(selected_x).all() or not np.isin(selected_m, [0, 1]).all() or not selected_m.any(1).all():
-            raise ValueError(f"Invalid features or masks: {path}")
+        if not np.isfinite(selected_x).all():
+            raise ValueError(f"Invalid features: {path}")
+        validate_context_masks(selected_m)
         if not np.array_equal(selected_y, rows[dest, 4]) or not np.isin(selected_y, np.arange(16)).all():
             raise ValueError(f"Label/metadata disagreement: {path}")
         # Compare stored survival labels as a separate off-by-one/alignment check.
@@ -126,6 +141,7 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
     manifest = json.loads(args.trace_manifest.read_text())
+    validate_feature_kind(manifest)
     canonical = json.loads((args.split_dir / "manifest.json").read_text())
     if manifest.get("source_trace_dir") != canonical["trace_dir"]:
         raise ValueError("Trace provenance differs from the canonical split source")

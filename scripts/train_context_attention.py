@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader, Dataset
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dflash.context_attention import ContextAcceptancePredictor, acceptance_nll, acceptance_survival, choose_budget
 from scripts.train_dflashv2_horizon_predictor import HorizonPredictor
+from scripts.prepare_context_attention_cache import validate_context_masks, validate_feature_kind
 
 
 def atomic_json(path, data):
@@ -117,6 +118,7 @@ def main():
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--eval-batch-size", type=int, default=256)
     p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--cpu-threads", type=int, default=4)
     p.add_argument("--layers", type=int, default=2)
     p.add_argument("--heads", type=int, default=16)
     p.add_argument("--ff-width", type=int, default=1024)
@@ -128,14 +130,19 @@ def main():
     p.add_argument("--device", default="cuda")
     p.add_argument("--no-amp", action="store_true")
     args = p.parse_args()
-    if args.epochs < 1 or args.batch_size < 1 or not 0 < args.retention <= 1:
+    if args.epochs < 1 or args.batch_size < 1 or args.cpu_threads < 1 or not 0 < args.retention <= 1:
         raise ValueError("Invalid epoch/batch/retention settings")
+    torch.set_num_threads(args.cpu_threads)
     args.output_dir.mkdir(parents=True, exist_ok=False)
     device = torch.device(args.device)
     amp = device.type == "cuda" and not args.no_amp
     info = json.loads((args.cache_dir / "manifest.json").read_text())
     if info["format"] != "dflash_context_attention_cache_v1" or info["input_kind"] != "predraft_fused":
         raise ValueError("Not a compatible pre-draft cache")
+    if "trace_manifest" in info:
+        validate_feature_kind(json.loads(Path(info["trace_manifest"]).read_text()))
+    for split in ("train", "val"):
+        validate_context_masks(np.load(args.cache_dir / split / "mask.npy"))
     train_index = np.load(args.cache_dir / "train" / "row_index.npy")
     val_index = np.load(args.cache_dir / "val" / "row_index.npy")
     calibration_mask = np.load(args.cache_dir / "val" / "calibration.npy").astype(bool)
