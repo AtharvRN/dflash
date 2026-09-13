@@ -29,6 +29,19 @@ class PairedLengthsTest(unittest.TestCase):
         self.assertAlmostEqual(result["policies"]["test"]["actual_retention"], 4/7)
         self.assertAlmostEqual(result["policies"]["test"]["proxy_retention"], 5/7)
 
+    def test_same_width_control_separates_verifier_change(self):
+        row = {"prompt_id": "a", "eligible": True,
+               "outcomes": {"4": {"accepted": 1, "truncated_accepted": 2,
+                                    "draft_ids": [1, 2, 3]},
+                            "16": {"accepted": 5, "draft_ids": list(range(15))}},
+               "policies": {"test": 4}, "reverse_order_checked": False,
+               "canonical_checked": 0, "canonical_disagreements": 0,
+               "truncated_verify_checks": 1}
+        block = summarize([row], bootstrap=10)["blocks"]["4"]
+        self.assertEqual(block["label_mae"], 2)
+        self.assertEqual(block["short_vs_same_width_truncated_mae"], 1)
+        self.assertEqual(block["target_width_control_mae"], 1)
+
     def test_validation_ids_filter_before_sampling(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
