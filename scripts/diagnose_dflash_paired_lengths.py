@@ -70,6 +70,7 @@ def summarize(rows, bootstrap=1000):
         proxy = np.array([min(r["outcomes"]["16"]["accepted"], int(b) - 1) for r in eligible])
         baseline = np.array([r["outcomes"]["16"]["accepted"] for r in eligible], dtype=float)
         error = actual - proxy
+        truncated = np.array([r["outcomes"][b].get("truncated_accepted", min(r["outcomes"]["16"]["accepted"], int(b)-1)) for r in eligible])
         # Resample whole prompts, keeping all their paired states together.
         totals = np.zeros((len(groups), 5))
         for r, e, base in zip(eligible, error, baseline):
@@ -80,6 +81,10 @@ def summarize(rows, bootstrap=1000):
             "mean_actual_accepted": float(actual.mean()), "mean_proxy_accepted": float(proxy.mean()),
             "label_mae": float(abs(error).mean()), "signed_error": float(error.mean()),
             "mismatch_rate": float((error != 0).mean()),
+            "short_vs_same_width_truncated_mae": float(np.abs(actual-truncated).mean()),
+            "short_vs_same_width_truncated_bias": float((actual-truncated).mean()),
+            "target_width_control_mismatch_rate": float((truncated != proxy).mean()),
+            "target_width_control_mae": float(np.abs(truncated-proxy).mean()),
             "mae_ci95": ci(boot[:, 0] / boot[:, 3]),
             "signed_error_ci95": ci(boot[:, 1] / boot[:, 3]),
             "mismatch_ci95": ci(boot[:, 2] / boot[:, 3]),
@@ -214,6 +219,22 @@ def run_prompt(args, row, target, draft, tokenizer, policies, count_before):
                 alt_output, _, alt_a = verify(block, copy.deepcopy(tc_snapshot))
                 outcomes[str(b)] = {"accepted": alt_a, "draft_ids": block[0, 1:].tolist()}
                 del alt_output
+            truncated_checks = 0
+            for b in order:
+                trunc_output, trunc_posterior, trunc_a = verify(baseline[:, :b].contiguous(), copy.deepcopy(tc_snapshot))
+                outcomes[str(b)]["truncated_accepted"] = trunc_a
+                differences = (trunc_posterior[:, :-1] != posterior[:, :b-1]).nonzero().tolist()
+                outcomes[str(b)]["target_width_argmax_differences"] = differences
+                if differences:
+                    k = differences[0][1]
+                    base_top = output.logits[0, k].float().topk(2).values
+                    trunc_top = trunc_output.logits[0, k].float().topk(2).values
+                    outcomes[str(b)]["first_target_width_difference"] = {
+                        "position": k, "baseline_margin": float(base_top[0]-base_top[1]),
+                        "truncated_margin": float(trunc_top[0]-trunc_top[1]),
+                        "max_abs_logit_difference": float((output.logits[0, k].float()-trunc_output.logits[0, k].float()).abs().max())}
+                truncated_checks += 1
+                del trunc_output
             state_index = count_before + len(rows)
             reverse_checked = state_index < args.reverse_check_states
             if reverse_checked:
@@ -223,7 +244,7 @@ def run_prompt(args, row, target, draft, tokenizer, policies, count_before):
                     assert block[0, 1:].tolist() == outcomes[str(b)]["draft_ids"], "Draft cache/order contamination"
                     assert alt_a == outcomes[str(b)]["accepted"], "Target cache/order contamination"
                     del alt_output
-            canonical_checked = canonical_disagreements = truncated_checks = 0
+            canonical_checked = canonical_disagreements = 0
             if state_index < args.canonical_check_states:
                 tc = copy.deepcopy(tc_snapshot)
                 token = sequence[:, start:start+1]
@@ -240,11 +261,6 @@ def run_prompt(args, row, target, draft, tokenizer, policies, count_before):
                     observed = min(len(candidate), len(canonical))
                     canonical_checked += 1
                     canonical_disagreements += prefix_matches(candidate, canonical) != min(outcomes[str(b)]["accepted"], observed)
-                    if b != 16:
-                        truncated_output, _, trunc_a = verify(baseline[:, :b], copy.deepcopy(tc_snapshot))
-                        assert trunc_a == min(accepted, b-1), "Target verification prefix differs across shapes"
-                        truncated_checks += 1
-                        del truncated_output
                 del one, tc
             terminal = any(any(t in eos for t in o["draft_ids"][:o["accepted"]]) for o in outcomes.values())
             prefix = sequence[0, :start+1].tolist()
@@ -292,6 +308,7 @@ def parse_args():
     p.add_argument("--canonical-check-states", type=int, default=10)
     p.add_argument("--seed", type=int, default=913)
     p.add_argument("--attn-implementation", default="sdpa")
+    p.add_argument("--dtype", choices=["bfloat16", "float32"], default="bfloat16")
     return p.parse_args()
 
 
@@ -318,9 +335,10 @@ def main():
         config[name] = json.loads(path.read_text())
     atomic_json(args.output_dir / "config.json", config)
     tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
-    target = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16,
+    dtype = getattr(torch, args.dtype)
+    target = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype,
              attn_implementation=args.attn_implementation, local_files_only=True).cuda().eval()
-    draft = DFlashDraftModel.from_pretrained(args.draft_model, torch_dtype=torch.bfloat16,
+    draft = DFlashDraftModel.from_pretrained(args.draft_model, torch_dtype=dtype,
              attn_implementation=args.attn_implementation, local_files_only=True).cuda().eval()
     policies = Policies(args, draft)
     all_rows, prompts, features = [], [], []
