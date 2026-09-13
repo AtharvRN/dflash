@@ -16,7 +16,8 @@ from scripts.train_context_attention import atomic_json, buffered_backup
 
 def summarize(totals):
     count, error, accepted, budget, reference = np.moveaxis(totals, -1, 0)
-    return np.stack([error/count, accepted/budget, accepted/reference, accepted/count, budget/count], axis=-1)
+    retention = np.divide(accepted, reference, out=np.full(np.shape(reference), np.nan), where=reference>0)
+    return np.stack([error/count, accepted/budget, retention, accepted/count, budget/count], axis=-1)
 
 
 def paired_intervals(reference, candidate, *, draws=2000, seed=913):
@@ -29,10 +30,16 @@ def paired_intervals(reference, candidate, *, draws=2000, seed=913):
     for start in range(0, draws, 100):
         indices = rng.integers(len(reference), size=(min(100,draws-start),len(reference)))
         deltas.append(summarize(candidate[indices].sum(1))-summarize(reference[indices].sum(1)))
-    lo, hi = np.quantile(np.concatenate(deltas), [.025,.975], axis=0)
+    deltas = np.concatenate(deltas)
     point = summarize(candidate.sum(0))-summarize(reference.sum(0))
     names = ["mae", "accept_ratio", "retention", "mean_accepted", "mean_budget"]
-    return {name:{"difference":float(point[i]),"ci95":[float(lo[i]),float(hi[i])]} for i,name in enumerate(names)}
+    result = {}
+    for i,name in enumerate(names):
+        valid = deltas[np.isfinite(deltas[:, i]), i]
+        result[name] = {"difference":float(point[i]) if np.isfinite(point[i]) else None,
+                        "ci95":np.quantile(valid,[.025,.975]).tolist() if len(valid) else None,
+                        "valid_bootstrap_draws":len(valid)}
+    return result
 
 
 def main():
@@ -58,7 +65,7 @@ def main():
     if "residual_last_only" in results and "residual_attention" in results:
         pairs.append(("residual_last_only","residual_attention"))
     report={"assessment_rows":len(y),"assessment_prompts":len(prompts),"bootstrap_draws":2000,
-            "note":"Candidate minus reference. Resampling unit is prompt; thresholds frozen on calibration. Does not measure training-seed variability.",
+            "note":"Candidate minus reference. Resampling unit is prompt; thresholds frozen on calibration. Does not measure training-seed variability. Retention intervals exclude zero-reference draws; valid counts are reported.",
             "comparisons":{f"{candidate}_minus_{reference}":paired_intervals(grouped[reference],grouped[candidate]) for reference,candidate in pairs}}
     path=args.run_dir/"paired_comparison.json"
     atomic_json(path,report)
