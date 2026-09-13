@@ -28,6 +28,16 @@ def atomic_json(path, data):
     tmp.replace(path)
 
 
+def buffered_backup(source, destination):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp = destination.with_suffix(destination.suffix + ".tmp")
+    # Kernel sendfile copies are unusually slow on the experiment's Ceph PVC.
+    with source.open("rb") as reader, temp.open("wb") as writer:
+        shutil.copyfileobj(reader, writer, length=4 * 1024 * 1024)
+    shutil.copystat(source, temp)
+    temp.replace(destination)
+
+
 class ContextDataset(Dataset):
     def __init__(self, path, indices=None):
         self.features = np.load(path / "features.npy", mmap_mode="r")
@@ -174,10 +184,7 @@ def main():
         if args.persistent_dir:
             for path in paths:
                 destination = args.persistent_dir / path.relative_to(args.output_dir)
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                temp = destination.with_suffix(destination.suffix+".tmp")
-                shutil.copy2(path, temp)
-                temp.replace(destination)
+                buffered_backup(path, destination)
     futures.append(backup_pool.submit(backup, [args.output_dir / "config.json"]))
     results = {}
     try:
