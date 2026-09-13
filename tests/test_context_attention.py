@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 from dflash.context_attention import ContextAcceptancePredictor, acceptance_nll, acceptance_survival, choose_budget
-from scripts.prepare_context_attention_cache import materialize, scan_shard, split_rows
+from scripts.prepare_context_attention_cache import materialize, partition_staged, scan_shard, split_rows
 from scripts.train_context_attention import calibrate, proxy_metrics
 
 
@@ -128,6 +128,9 @@ class ContextDataTest(unittest.TestCase):
             self.assertEqual(len(val), 1)
             materialize([shard], train, root / "train", window=3, width=8, workers=1)
             np.testing.assert_array_equal(np.load(root/"train"/"features.npy"), x[[0,2]])
+            partition_staged(root/"train", root/"partition", np.array([1]))
+            np.testing.assert_array_equal(np.load(root/"partition"/"features.npy"), x[[2]])
+            np.testing.assert_array_equal(np.load(root/"partition"/"row_index.npy"), train[[1]])
             with self.assertRaises(ValueError):
                 split_rows(rows, {10,20}, {20}, None, 0)
             with self.assertRaises(ValueError):

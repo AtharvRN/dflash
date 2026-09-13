@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import time
 
 import numpy as np
@@ -70,7 +71,8 @@ def materialize(paths, rows, output, *, window, width, workers):
         shard, dest = task
         source = rows[dest, 1]
         path = paths[shard]
-        x = np.load(path / "features.npy", mmap_mode="r")
+        # Bulk reads avoid thousands of small network page faults on PVC-backed files.
+        x = np.load(path / "features.npy")
         m = np.load(path / "mask.npy", mmap_mode="r")
         y = np.load(path / "accepted_len.npy", mmap_mode="r")
         if x.ndim != 3 or x.shape[1:] != (window, width) or m.shape != x.shape[:2]:
@@ -99,6 +101,17 @@ def materialize(paths, rows, output, *, window, width, workers):
         array.flush()
 
 
+def partition_staged(joint, destination, indices):
+    destination.mkdir()
+    for name in ("features", "mask", "accepted_len", "row_index"):
+        source = np.load(joint / (name+".npy"), mmap_mode="r")
+        target = np.lib.format.open_memmap(destination / (name+".npy"), mode="w+", dtype=source.dtype,
+                                          shape=(len(indices), *source.shape[1:]))
+        for start in range(0, len(indices), 1024):
+            target[start:start+1024] = source[indices[start:start+1024]]
+        target.flush()
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--trace-manifest", type=Path, required=True)
@@ -113,6 +126,9 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
     manifest = json.loads(args.trace_manifest.read_text())
+    canonical = json.loads((args.split_dir / "manifest.json").read_text())
+    if manifest.get("source_trace_dir") != canonical["trace_dir"]:
+        raise ValueError("Trace provenance differs from the canonical split source")
     paths = [Path(s["path"]) if Path(s["path"]).is_absolute() else args.trace_manifest.parent / s["path"]
              for s in manifest["shards"]]
     if len(set(paths)) != len(paths):
@@ -129,15 +145,20 @@ def main():
     if len(np.unique(rows[:, 2:4], axis=0)) != len(rows):
         raise ValueError("Duplicate (manifest_index, cycle_id) states")
     train, val = split_rows(rows, train_ids, val_ids, args.max_train_rows, args.seed)
-    canonical = json.loads((args.split_dir / "manifest.json").read_text())
     if len(rows) != canonical["num_rows_total"] or len(val) != canonical["val"]["rows"]:
         raise ValueError("Metadata counts differ from canonical split")
     first = np.load(paths[0] / "features.npy", mmap_mode="r")
     window, width = first.shape[1:]
     if width != 2560 or window != 16:
         raise ValueError("This pilot expects original Qwen3-4B fused W16 traces")
-    for name, selected in (("train", train), ("val", val)):
-        materialize(paths, selected, args.output_dir / name, window=window, width=width, workers=args.workers)
+    selected = np.concatenate([train, val])
+    selected = selected[np.lexsort((selected[:, 1], selected[:, 0]))]
+    joint = args.output_dir / "joint"
+    materialize(paths, selected, joint, window=window, width=width, workers=args.workers)
+    for name, allowed in (("train", train_ids), ("val", val_ids)):
+        partition_staged(joint, args.output_dir / name, np.flatnonzero(np.isin(selected[:, 2], list(allowed))))
+    # This temporary directory was created by this invocation, and both partitions are now durable locally.
+    shutil.rmtree(joint)
     # Preserve the canonical validation set; partition its prompts only for calibration vs assessment.
     observed_val = np.unique(val[:, 2])
     shuffled = np.random.default_rng(args.seed+1).permutation(observed_val)
