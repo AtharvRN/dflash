@@ -64,6 +64,19 @@ def select_prompts(manifest, split_dir, reference, train_count, val_count, seed)
     return selected
 
 
+def validate_reference_split(split_dir, reference):
+    for name in ("train_prompt_ids.json", "val_prompt_ids.json"):
+        path = split_dir / name
+        expected = reference.get("hashes", {}).get(str(path))
+        if expected is None or sha256(path) != expected:
+            raise ValueError(f"Canonical split does not match authenticated reference: {path}")
+
+
+def require_empty_destination(path):
+    if path.exists() and (not path.is_dir() or any(path.iterdir())):
+        raise ValueError(f"Refusing to overwrite persistent artifacts: {path}")
+
+
 def observable_label(block, accepted, eos, remaining):
     """Exclude terminal/capped accepted prefixes instead of inventing a rejection."""
     if remaining < 16:
@@ -196,6 +209,10 @@ def main():
     if min(args.train_prompts, args.max_cycles, args.max_prompt_tokens) < 1 or args.val_prompts < 4 or args.max_new_tokens < 16:
         raise ValueError("Invalid sampling limits")
     reference = json.loads(args.reference_cache_manifest.read_text())
+    validate_reference_split(args.split_dir, reference)
+    require_empty_destination(args.persistent_dir)
+    if args.persistent_dir.resolve() == args.output_dir.resolve():
+        raise ValueError("Temporary and persistent directories must differ")
     selected = select_prompts(args.manifest, args.split_dir, reference, args.train_prompts, args.val_prompts, args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=False)
     (args.output_dir / "shards").mkdir()
@@ -225,6 +242,19 @@ def main():
         "temperature": 0, "thinking": False, "parameter_models_frozen": True})
     config["model_files_sha256"] = {str(path): sha256(path) for directory in (args.model, args.draft_model)
         for path in sorted(directory.iterdir()) if path.is_file() and path.suffix in (".json", ".safetensors")}
+    repository = Path(__file__).resolve().parents[1]
+    config["source_sha256"] = {str(path.relative_to(repository)): sha256(path) for path in
+        (Path(__file__).resolve(), repository / "dflash/model.py")}
+    provenance_files = {}
+    for i, source in enumerate(config["hashes"]):
+        # The full prompt manifest is already PVC-backed; snapshot the small inputs
+        # whose temporary paths otherwise make a restart-time audit impossible.
+        if source == str(args.manifest):
+            continue
+        relative = Path("provenance") / f"{i}_{Path(source).name}"
+        buffered_backup(Path(source), args.output_dir / relative)
+        provenance_files[source] = str(relative)
+    config["provenance_files"] = provenance_files
     atomic_json(args.output_dir / "config.json", config)
     # Persist the exact fusion weights for audit/reconstruction, not for predictor training.
     torch.save({"fc": draft.fc.state_dict(), "hidden_norm": draft.hidden_norm.state_dict(),
@@ -235,7 +265,8 @@ def main():
         def backup(paths):
             for path in paths:
                 buffered_backup(path, args.persistent_dir / path.relative_to(args.output_dir))
-        futures.append(pool.submit(backup, [args.output_dir / "config.json", args.output_dir / "fusion.pt"]))
+        futures.append(pool.submit(backup, [args.output_dir / "config.json", args.output_dir / "fusion.pt"] +
+            [args.output_dir / relative for relative in provenance_files.values()]))
         for i, (group, row) in enumerate(selected):
             data, info = collect_prompt(row, target, draft, tokenizer, args)
             pid = int(row["manifest_index"])

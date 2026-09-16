@@ -239,6 +239,41 @@ def sha256(path):
     return digest.hexdigest()
 
 
+def validate_audit(cache_dir):
+    """Require an audit bound to every current cache array and auditor source."""
+    cache_dir = Path(cache_dir)
+    audit_path = cache_dir / "audit.json"
+    if not audit_path.is_file():
+        raise ValueError("Missing audit.json; run audit_prefusion_cache.py before training")
+    report = json.loads(audit_path.read_text())
+    if not isinstance(report, dict) or not isinstance(report.get("binding"), dict):
+        raise ValueError("audit.json must contain a binding dictionary")
+    required = {"manifest.json", "fusion.pt", "val/calibration.npy"}
+    for split in ("train", "val"):
+        required.update(f"{split}/{name}.npy" for name in (
+            "raw_features", "features", "mask", "accepted_len", "row_index"))
+        required.update(path.relative_to(cache_dir).as_posix()
+                        for path in (cache_dir / split).glob("*.npy"))
+    binding = report["binding"]
+    if set(binding) != required:
+        raise ValueError(f"Audit binding file set mismatch: missing={sorted(required - set(binding))}, "
+                         f"unexpected={sorted(set(binding) - required)}")
+    for relative in sorted(required):
+        path = cache_dir / relative
+        if not path.is_file():
+            raise ValueError(f"Audit-bound file missing: {relative}")
+        if binding[relative] != sha256(path):
+            raise ValueError(f"Stale audit binding SHA-256 mismatch: {relative}")
+    auditor = Path(__file__).with_name("audit_prefusion_cache.py")
+    if report.get("auditor_source_sha256") != sha256(auditor):
+        raise ValueError("Stale audit auditor_source_sha256 mismatch; rerun the current auditor")
+    rows = sum(len(np.load(cache_dir / split / "accepted_len.npy", mmap_mode="r", allow_pickle=False))
+               for split in ("train", "val"))
+    if type(report.get("rows")) is not int or report["rows"] != rows:
+        raise ValueError(f"Audit row count mismatch: expected {rows}, got {report.get('rows')!r}")
+    return report
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cache-dir", "--cache", type=Path, required=True)
@@ -267,6 +302,10 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.persistent_dir and args.persistent_dir.exists():
+        if not args.persistent_dir.is_dir() or any(args.persistent_dir.iterdir()):
+            raise ValueError("Persistent directory must be absent or empty; refusing to overwrite a prior run")
+    audit_report = validate_audit(args.cache_dir)
     info, calibration_mask = validate_cache(args.cache_dir)
     torch.set_num_threads(args.cpu_threads)
     device = torch.device(args.device)
@@ -282,7 +321,9 @@ def main(argv=None):
               for key, value in vars(args).items()}
     config.update({
         "cache_manifest": info, "cache_manifest_sha256": sha256(args.cache_dir / "manifest.json"),
+        "cache_audit": audit_report,
         "cache_validation": {"structure_labels_prompt_groups_checked": True,
+                             "audit_binding_and_auditor_source_verified": True,
                              "paired_shards_hash_and_alignment_checked": "shards" in info,
                              "external_collection_inputs_rehashed": False},
         "git_commit": git_commit, "torch": str(torch.__version__), "numpy": np.__version__,

@@ -3,13 +3,14 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import torch
 
 from scripts.train_prefusion_acceptance import (
     MODEL_NAMES, PrefusionDataset, acceptance_nll, make_loader, make_model,
-    model_spec, parameter_matched_proj_dim, parse_args, sha256, validate_cache,
+    main, model_spec, parameter_matched_proj_dim, parse_args, sha256, validate_audit, validate_cache,
 )
 
 
@@ -79,6 +80,131 @@ class ParameterMatchingTest(unittest.TestCase):
                 self.assertGreater(float(features.grad.abs().sum()), 0)
         with self.assertRaises(ValueError):
             make_model("unknown", info)
+
+
+class AuditValidationTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.cache = self.root / "cache"
+        self.cache.mkdir()
+        write_cache(self.cache)
+        torch.save({"fixture": True}, self.cache / "fusion.pt")
+        paths = [self.cache / "manifest.json", self.cache / "fusion.pt"]
+        paths += list((self.cache / "train").glob("*.npy"))
+        paths += list((self.cache / "val").glob("*.npy"))
+        self.report = {
+            "rows": 16,
+            "binding": {path.relative_to(self.cache).as_posix(): sha256(path) for path in paths},
+            "auditor_source_sha256": sha256(Path(__file__).resolve().parents[1] /
+                                            "scripts/audit_prefusion_cache.py"),
+        }
+        self.write_report(self.report)
+        self.output = self.root / "run"
+        self.argv = ["--cache", str(self.cache), "--output", str(self.output), "--device", "cpu"]
+
+    def write_report(self, report):
+        (self.cache / "audit.json").write_text(json.dumps(report))
+
+    def test_valid_audit(self):
+        self.assertEqual(validate_audit(self.cache), self.report)
+
+    def test_missing_audit_blocks_main_without_creating_output(self):
+        (self.cache / "audit.json").unlink()
+        # Structural validation remains available to synthetic/unit-test callers.
+        validate_cache(self.cache)
+        with self.assertRaisesRegex(ValueError, "Missing audit.json"):
+            validate_audit(self.cache)
+        with self.assertRaisesRegex(ValueError, "Missing audit.json"):
+            main(self.argv)
+        self.assertFalse(self.output.exists())
+
+    def test_each_bound_file_change_invalidates_audit(self):
+        for relative in self.report["binding"]:
+            with self.subTest(relative=relative):
+                path = self.cache / relative
+                original = path.read_bytes()
+                path.write_bytes(original + b"changed")
+                with self.assertRaisesRegex(ValueError, "Stale audit binding SHA-256 mismatch"):
+                    validate_audit(self.cache)
+                path.write_bytes(original)
+
+    def test_stale_audit_blocks_main_without_creating_output(self):
+        self.write_report({**self.report, "auditor_source_sha256": "0" * 64})
+        with self.assertRaisesRegex(ValueError, "auditor_source_sha256 mismatch"):
+            main(self.argv)
+        self.assertFalse(self.output.exists())
+
+    def test_binding_set_is_required_and_exact(self):
+        for relative in self.report["binding"]:
+            with self.subTest(missing=relative):
+                binding = dict(self.report["binding"])
+                del binding[relative]
+                self.write_report({**self.report, "binding": binding})
+                with self.assertRaisesRegex(ValueError, "binding file set mismatch"):
+                    validate_audit(self.cache)
+        for invalid in ({}, {"binding": []}, []):
+            self.write_report(invalid)
+            with self.assertRaisesRegex(ValueError, "binding dictionary"):
+                validate_audit(self.cache)
+        for extra in ("../outside.npy", "/outside.npy", "train/../manifest.json"):
+            self.write_report({**self.report, "binding": {**self.report["binding"], extra: "0" * 64}})
+            with self.assertRaisesRegex(ValueError, "binding file set mismatch"):
+                validate_audit(self.cache)
+
+    def test_new_cache_arrays_must_be_bound(self):
+        self.write_report(self.report)
+        path = self.cache / "train/extra.npy"
+        np.save(path, np.arange(8))
+        with self.assertRaisesRegex(ValueError, "binding file set mismatch"):
+            validate_audit(self.cache)
+        report = {**self.report, "binding": {**self.report["binding"], "train/extra.npy": sha256(path)}}
+        self.write_report(report)
+        self.assertEqual(validate_audit(self.cache), report)
+
+    def test_missing_bound_file(self):
+        (self.cache / "fusion.pt").unlink()
+        with self.assertRaisesRegex(ValueError, "Audit-bound file missing: fusion.pt"):
+            validate_audit(self.cache)
+
+    def test_report_rows_and_source_hash_required(self):
+        for rows in (0, 8, 17, 16.0, "16", True, None):
+            self.write_report({**self.report, "rows": rows})
+            with self.subTest(rows=rows), self.assertRaisesRegex(ValueError, "row count mismatch"):
+                validate_audit(self.cache)
+        for key, message in (("rows", "row count mismatch"),
+                             ("auditor_source_sha256", "auditor_source_sha256 mismatch")):
+            report = dict(self.report)
+            del report[key]
+            self.write_report(report)
+            with self.assertRaisesRegex(ValueError, message):
+                validate_audit(self.cache)
+
+    def test_nonempty_or_file_persistent_path_rejected_before_output_creation(self):
+        persistent = self.root / "persistent"
+        persistent.mkdir()
+        previous = persistent / ".prior-run"
+        previous.write_text("preserve")
+        with self.assertRaisesRegex(ValueError, "Persistent directory must be absent or empty"):
+            main(self.argv + ["--persistent", str(persistent)])
+        self.assertFalse(self.output.exists())
+        self.assertEqual(previous.read_text(), "preserve")
+        with self.assertRaisesRegex(ValueError, "Persistent directory must be absent or empty"):
+            main(self.argv + ["--persistent", str(previous)])
+        self.assertFalse(self.output.exists())
+
+    def test_empty_or_absent_persistent_directory_passes_preflight(self):
+        persistent = self.root / "persistent"
+        for existing in (False, True):
+            if existing:
+                persistent.mkdir()
+            # Stop after real preflight checks, before creating output or training.
+            with patch("scripts.train_prefusion_acceptance.torch.set_num_threads",
+                       side_effect=RuntimeError("preflight complete")):
+                with self.assertRaisesRegex(RuntimeError, "preflight complete"):
+                    main(self.argv + ["--persistent", str(persistent)])
+            self.assertFalse(self.output.exists())
 
 
 class PrefusionCacheTest(unittest.TestCase):

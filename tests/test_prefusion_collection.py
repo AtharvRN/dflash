@@ -6,10 +6,27 @@ import unittest
 import numpy as np
 import torch
 
-from scripts.collect_prefusion_acceptance import select_prompts, observable_label, materialize
+from scripts.collect_prefusion_acceptance import (select_prompts, observable_label, materialize,
+                                                 require_empty_destination, validate_reference_split, sha256)
 
 
 class PrefusionCollectionTests(unittest.TestCase):
+    def test_no_overwrite_and_reference_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            require_empty_destination(root)
+            reference = {"hashes": {}}
+            for name in ('train_prompt_ids.json', 'val_prompt_ids.json'):
+                path = root/name
+                path.write_text('{}')
+                reference['hashes'][str(path)] = sha256(path)
+            validate_reference_split(root, reference)
+            with self.assertRaises(ValueError):
+                require_empty_destination(root)
+            (root/'val_prompt_ids.json').write_text('{"changed": true}')
+            with self.assertRaises(ValueError):
+                validate_reference_split(root, reference)
+
     def test_terminal_and_cap(self):
         block = torch.arange(16)[None]
         self.assertTrue(observable_label(block, 0, {9}, 16))
