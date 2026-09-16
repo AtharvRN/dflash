@@ -117,3 +117,31 @@ The pipeline advances automatically from collection to auditing to training.
 `collection.log`, `audit.log`, `training.log`, and `pipeline_exit.txt` under the
 artifact root record its phases and final exit code. Final model results will be
 written to `training/summary.json`; they were not available at launch.
+
+## Completed Pilot And Scaling Follow-Up
+
+The pilot subsequently completed with exit code 0: 13,935 training rows,
+1,373 calibration rows, and 5,662 assessment rows. Collection took 1,162.75
+seconds. The provenance/alignment audit passed, with fusion relative RMSE 0.337%.
+
+| Model | Assessment expected MAE | Mean accepted | Mean draft budget | Aggregate accept ratio | Retention |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Raw | 2.7917 | 5.4624 | 10.1309 | 0.5392 | 0.9618 |
+| Fused | 2.8374 | 5.4520 | 9.9558 | 0.5476 | 0.9599 |
+| Fused parameter-matched | 2.7487 | 5.4520 | 10.0079 | 0.5448 | 0.9599 |
+
+These are offline clipping-policy metrics, not throughput. The raw input did
+not beat the fused controls on the pilot's policy efficiency.
+
+The requested scaling follow-up expands training to 100,000 cycle rows, NOT
+100,000 prompts. `scripts/run_prefusion_expansion.sh` reuses the original paired
+shards and collects only new canonical training prompts. The 7,035 validation
+rows (including their calibration mask) are copied byte-for-byte. Original
+training rows remain an unchanged prefix. Model weights, sampling settings,
+collector source, canonical split hashes, and runtime versions must match.
+
+Temporary destination: `/tmp/prefusion_100k_20260915_cache`.
+Persistent destination: `/workspace/dflashv2_data/runs/prefusion_100k_20260915`.
+Per-prompt shards and receipts are backed up during collection; the final cache
+must pass the full alignment and frozen-fusion audit before completion. The
+wrapper collects and audits only; it does not silently launch a training sweep.
