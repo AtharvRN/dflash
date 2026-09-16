@@ -99,4 +99,21 @@ destinations. The target and drafter are frozen and never loaded by the trainer.
 Pilot artifact root:
 `/workspace/dflashv2_data/runs/prefusion_pilot_20260915`.
 
-Status: implementation and smoke verification complete; full pilot results pending.
+## Launch Status
+
+All 70 combined tests passed both locally and on the pod. The strict end-to-end
+smoke pipeline (collection, authenticated audit, six epochs for all three models,
+checkpoint reload and backups) exited 0. Smoke artifact root:
+`/workspace/dflashv2_data/runs/prefusion_strict_smoke_20260915`.
+
+The full pilot was launched from commit `63d995d` on 2026-09-15 Pacific time.
+The first progress check observed 384 rows from 15/768 selected prompts after
+22 seconds of collection. This is launch-time status, not a live progress report.
+The detached pipeline PID was 1659 and collector PID 1663 on this pod instance.
+No recurring monitor was created. Estimated initial duration was 20-30 minutes,
+subject to prompt lengths and PVC backup throughput.
+
+The pipeline advances automatically from collection to auditing to training.
+`collection.log`, `audit.log`, `training.log`, and `pipeline_exit.txt` under the
+artifact root record its phases and final exit code. Final model results will be
+written to `training/summary.json`; they were not available at launch.
