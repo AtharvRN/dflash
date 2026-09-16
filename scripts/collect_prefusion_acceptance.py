@@ -18,7 +18,11 @@ from scripts.train_context_attention import atomic_json, buffered_backup
 
 
 def sha256(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def select_prompts(manifest, split_dir, reference, train_count, val_count, seed):
@@ -219,6 +223,8 @@ def main():
         "feature_position": "latest committed token at start-1; anchor at start excluded",
         "labels": "direct greedy B16 prefix acceptance; accepted EOS and output-cap states excluded",
         "temperature": 0, "thinking": False, "parameter_models_frozen": True})
+    config["model_files_sha256"] = {str(path): sha256(path) for directory in (args.model, args.draft_model)
+        for path in sorted(directory.iterdir()) if path.is_file() and path.suffix in (".json", ".safetensors")}
     atomic_json(args.output_dir / "config.json", config)
     # Persist the exact fusion weights for audit/reconstruction, not for predictor training.
     torch.save({"fc": draft.fc.state_dict(), "hidden_norm": draft.hidden_norm.state_dict(),
