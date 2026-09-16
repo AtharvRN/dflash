@@ -145,3 +145,13 @@ Persistent destination: `/workspace/dflashv2_data/runs/prefusion_100k_20260915`.
 Per-prompt shards and receipts are backed up during collection; the final cache
 must pass the full alignment and frozen-fusion audit before completion. The
 wrapper collects and audits only; it does not silently launch a training sweep.
+
+Expansion verification: 52 targeted tests passed locally and on the pod. A
+real-model append smoke grew training from 13,935 to 13,967 rows; all 21,002
+combined rows passed the full audit (fusion relative RMSE 0.337%). Validation
+and the original training prefix were unchanged. After the audit, its redundant
+PVC backup was deliberately stopped (exit 143); do not treat that smoke's PVC
+directory as a complete cache. The authenticated smoke remains in `/tmp`.
+
+The full 100k collection was launched from code commit `0def2c9` with detached
+wrapper PID 2072 on the same pod. No recurring monitor was created.
