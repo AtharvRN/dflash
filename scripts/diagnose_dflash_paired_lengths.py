@@ -167,7 +167,8 @@ def run_prompt(args, row, target, draft, tokenizer, policies, count_before):
     n = ids.shape[1]
     if n > args.max_prompt_tokens:
         return [], {"prompt_id": str(row["manifest_index"]), "skipped": "prompt_length", "tokens": n}
-    positions = torch.arange(n + args.max_new_tokens + 32, device="cuda").unsqueeze(0)
+    largest_block = max(16, max(args.blocks))
+    positions = torch.arange(n + args.max_new_tokens + largest_block, device="cuda").unsqueeze(0)
     target_cache, draft_cache = DynamicCache(), DynamicCache()
     prefill = target(ids, position_ids=positions[:, :n], past_key_values=target_cache,
                      use_cache=True, output_hidden_states=True, logits_to_keep=1)
@@ -176,7 +177,7 @@ def run_prompt(args, row, target, draft, tokenizer, policies, count_before):
     del prefill
     eos = target.generation_config.eos_token_id
     eos = set(eos if isinstance(eos, list) else [eos]) - {None}
-    offsets = np.linspace(0, max(0, args.max_new_tokens - 32), args.states_per_prompt, dtype=int).tolist()
+    offsets = np.linspace(0, max(0, args.max_new_tokens - max(32, largest_block)), args.states_per_prompt, dtype=int).tolist()
     next_offset, start, cycle = 0, n, 0
     rows = []
     rng = random.Random(args.seed + int(row["manifest_index"]))
@@ -201,7 +202,7 @@ def run_prompt(args, row, target, draft, tokenizer, policies, count_before):
 
     while start < n + args.max_new_tokens and int(sequence[0, start]) not in eos:
         selected = (next_offset < len(offsets) and start - n >= offsets[next_offset]
-                    and start - n <= args.max_new_tokens - 16)
+                    and start - n <= args.max_new_tokens - largest_block)
         pending = hidden
         if selected:
             tc_snapshot = copy.deepcopy(target_cache)
@@ -222,6 +223,8 @@ def run_prompt(args, row, target, draft, tokenizer, policies, count_before):
                 del alt_output
             truncated_checks = 0
             for b in order:
+                if b > 16:
+                    continue  # A B16 draft cannot supply a longer unchanged prefix.
                 trunc_output, trunc_posterior, trunc_a = verify(baseline[:, :b].contiguous(), copy.deepcopy(tc_snapshot))
                 outcomes[str(b)]["truncated_accepted"] = trunc_a
                 differences = (trunc_posterior[:, :-1] != posterior[:, :b-1]).nonzero().tolist()
@@ -250,7 +253,7 @@ def run_prompt(args, row, target, draft, tokenizer, policies, count_before):
                 tc = copy.deepcopy(tc_snapshot)
                 token = sequence[:, start:start+1]
                 canonical = []
-                for k in range(15):
+                for k in range(largest_block - 1):
                     one = target(token, position_ids=positions[:, start+k:start+k+1], past_key_values=tc,
                                  use_cache=True, logits_to_keep=1)
                     token = one.logits[:, -1].argmax(-1, keepdim=True)
