@@ -1,13 +1,29 @@
 import itertools
+import hashlib
 import json
 from pathlib import Path
 import tempfile
 import unittest
 import numpy as np
 from scripts.block_headroom import exact_frontier, select_training_prompts, summarize
+from scripts.audit_block_headroom import validate_states
 
 
 class HeadroomTests(unittest.TestCase):
+    def test_audit_detects_prefix_tampering_and_reference_drift(self):
+        def state(prefix,cycle):
+            return {'prefix_token_ids':prefix,'prefix_length':len(prefix)-1,'cycle':cycle,
+                    'prefix_sha256':hashlib.sha256(np.array(prefix,dtype=np.int64).tobytes()).hexdigest(),
+                    'outcomes':{'16':{'draft_ids':[7]*15,'accepted':2}}}
+        a=state([1,2,3],0)
+        b=state([1,2,3,7,7,8],1)
+        validate_states([a,b],[16])
+        with self.assertRaisesRegex(ValueError,'committed prefix'):
+            validate_states([a,state([1,2,3,9,7,8],1)],[16])
+        b['prefix_token_ids'][0]=99
+        with self.assertRaisesRegex(ValueError,'hash'):
+            validate_states([b],[16])
+
     def test_dp_matches_exhaustive_and_reconstructs(self):
         rng=np.random.default_rng(926)
         for _ in range(20):
