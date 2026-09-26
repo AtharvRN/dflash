@@ -12,11 +12,6 @@ import sys
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-# Reuse the image's Torch without importing its newer Transformers first.
-image_packages = '/opt/sglang/lib/python3.12/site-packages'
-if Path(image_packages).exists() and image_packages not in sys.path:
-    sys.path.append(image_packages)
-
 import numpy as np
 import torch
 import transformers
