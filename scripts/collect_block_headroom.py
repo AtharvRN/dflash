@@ -18,7 +18,7 @@ import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from dflash.model import DFlashDraftModel
 from scripts.diagnose_dflash_paired_lengths import atomic_json, run_prompt
-from scripts.block_headroom import select_training_prompts, summarize
+from scripts.block_headroom import markdown_report, select_training_prompts, summarize
 
 
 def sha256(path):
@@ -72,6 +72,7 @@ def main():
         'torch':torch.__version__, 'transformers':transformers.__version__,
         'gpu':torch.cuda.get_device_name(), 'tf32':False,
         'trajectory':'fixed B16; alternative outcomes on identical states, not closed-loop',
+        'fused_feature':'separate fc/hidden_norm replay of latest pre-draft vector, not a same-forward capture',
         'git_commit':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
         'source_hashes':{str(path.relative_to(Path.cwd())):sha256(path) for path in
                          [Path.cwd()/'scripts'/name for name in ('collect_block_headroom.py','block_headroom.py','diagnose_dflash_paired_lengths.py')]},
@@ -146,8 +147,9 @@ def main():
         summary.update({'sample_complete':len(progress_records)==len(selected),
                         'prompt_progress':progress_records,'elapsed_s':time.monotonic()-started})
         atomic_json(args.output_dir/'headroom_summary.json',summary)
+        (args.output_dir/'headroom_report.md').write_text(markdown_report(summary))
         atomic_json(args.output_dir/'receipts.json',receipts)
-        queue([args.output_dir/'headroom_summary.json',args.output_dir/'receipts.json',args.output_dir/'progress.json'])
+        queue([args.output_dir/'headroom_summary.json',args.output_dir/'headroom_report.md',args.output_dir/'receipts.json',args.output_dir/'progress.json'])
         for future in futures:
             future.result()
         atomic_json(args.output_dir/'COMPLETE.json',{'all_backups_verified':True,

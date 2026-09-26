@@ -106,7 +106,7 @@ def exact_frontier(acceptance, costs, targets):
     return result, {'total_budget': best_budget, 'total_accepted': int(dp[best_budget])}
 
 
-def summarize(rows):
+def summarize(rows, by_source=True):
     eligible = [r for r in rows if r['eligible']]
     result = {'states': len(rows), 'eligible_states': len(eligible),
               'scope': 'source-balanced TRAINING development diagnostic, common B16 states; hindsight oracles, not deployed policies or throughput',
@@ -175,7 +175,38 @@ def summarize(rows):
     result['source_results'] = {s: {'states': sum(r['source'] == s for r in eligible),
         'b16_mean_accepted': float(a[[i for i,r in enumerate(eligible) if r['source']==s], blocks.index(16)].mean())}
         for s in sorted({r['source'] for r in eligible})}
+    if by_source:
+        for source in result['source_results']:
+            subset = summarize([r for r in rows if r['source'] == source], by_source=False)
+            result['source_results'][source].update({k:subset[k] for k in ('prompts','frontiers','b16_variance','argmax_set_switching')})
     return result
+
+
+def markdown_report(result):
+    lines=['# Actual block-size headroom diagnostic', '', result['scope'], '',
+           f"States: {result['states']}; eligible: {result['eligible_states']}.", '']
+    if not result['eligible_states']:
+        return '\n'.join(lines)+'\n'
+    lines += [f"Prompts with eligible states: {result['prompts']}. Mean B16 accepted drafts: {result['mean_b16_accepted']:.4f}.", '',
+              '| Retention target | Global budget / retention | Prompt-oracle budget / retention | Cycle-oracle budget / retention | Cycle budget reduction vs prompt |',
+              '| --- | --- | --- | --- | --- |']
+    for i in range(len(result['frontiers']['global']['points'])):
+        points=[result['frontiers'][name]['points'][i] for name in ('global','per_prompt','per_cycle')]
+        display=[f"{p['mean_budget']:.3f} / {100*p['retention']:.2f}%" if p['feasible'] else 'infeasible' for p in points]
+        reduction=1-points[2]['mean_budget']/points[1]['mean_budget']
+        lines.append(f"| {100*points[0]['target_retention']:.0f}% | {' | '.join(display)} | {100*reduction:.2f}% |")
+    lines += ['', 'Budgets count proposed draft tokens (B−1). Ratios use summed accepted tokens and budgets. Exact integer choices may overshoot the retention target.', '',
+              '| Source | Eligible states | Mean B16 A | Prompt budget at 96% | Cycle budget at 96% |',
+              '| --- | --- | --- | --- | --- |']
+    for source, sub in result['source_results'].items():
+        if 'frontiers' in sub:
+            pp=sub['frontiers']['per_prompt']['points'][2]
+            cp=sub['frontiers']['per_cycle']['points'][2]
+            lines.append(f"| {source} | {sub['states']} | {sub['b16_mean_accepted']:.3f} | {pp['mean_budget']:.3f} | {cp['mean_budget']:.3f} |")
+    lines += ['', '## Checks and limits', '',
+              '```json', json.dumps(result['checks'],indent=2), '```', '',
+              'These oracles see true outcomes from the analyzed sample. They do not demonstrate that causal inputs can predict the choices. Prompt-level results use sampled shared B16 states, not independent full-response rollouts. Timing and throughput were not measured. Source-balanced training diagnostics are not held-out generalization results. Canonical disagreements, if nonzero, require numerical investigation.', '']
+    return '\n'.join(lines)
 
 
 def main():
@@ -185,6 +216,7 @@ def main():
     rows = [r for path in sorted(args.run.glob('prompt_*.json')) for r in json.loads(path.read_text())['states']]
     result = summarize(rows)
     (args.run / 'headroom_summary.json').write_text(json.dumps(result, indent=2)+'\n')
+    (args.run / 'headroom_report.md').write_text(markdown_report(result))
     print(json.dumps({k:v for k,v in result.items() if k not in ('cycle_order','prompt_order','frontiers')}, indent=2))
 
 
