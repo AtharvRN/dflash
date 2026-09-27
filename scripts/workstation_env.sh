@@ -2,6 +2,12 @@
 export DFLASH_REPO=/home/zekaili/atharv/dflash
 export DFLASH_ROOT=/data/scratch/zekaili/atharv/dflash
 export HF_HOME="$DFLASH_ROOT/hf"
+export DFLASH_DATA_ROOT="$DFLASH_ROOT/data/dflashv2_data"
+export DFLASH_RUN_ROOT="$DFLASH_ROOT/runs"
+export DFLASH_WORK_ROOT="$DFLASH_ROOT/work"
+export DFLASH_TARGET_MODEL="$HF_HOME/hub/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c"
+export DFLASH_DRAFT_MODEL="$HF_HOME/hub/models--z-lab--Qwen3-4B-DFlash-b16/snapshots/b74e3a329c4d963783143b1e970d95b002be72bd"
+export PYTHON="$DFLASH_ROOT/envs/main/bin/python"
 export UV_CACHE_DIR="$DFLASH_ROOT/uv-cache"
 export TRITON_CACHE_DIR="$DFLASH_ROOT/triton-cache"
 export TORCHINDUCTOR_CACHE_DIR="$DFLASH_ROOT/inductor-cache"
