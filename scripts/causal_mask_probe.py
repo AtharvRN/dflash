@@ -25,7 +25,11 @@ def main():
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--prompts-per-source', type=int, default=4)
     p.add_argument('--states-per-prompt', type=int, default=4)
+    p.add_argument('--blocks', type=int, nargs='+', default=[4, 8, 12, 16, 20])
     args = p.parse_args()
+    blocks = sorted(set(args.blocks))
+    if 16 not in blocks or min(blocks) < 2:
+        p.error('Blocks must include B16 and all be at least B2')
     if args.output.exists():
         raise RuntimeError('Refusing an existing output directory')
     used = subprocess.check_output(['nvidia-smi', f'--id={args.gpu}',
@@ -62,7 +66,6 @@ def main():
             selected.extend(states[i] for i in idx)
     args.output.mkdir(parents=True)
     models = json.loads((Path(os.environ['DFLASH_ROOT'])/'models.json').read_text())
-    blocks = [4, 8, 12, 16, 20]
     atomic_json(args.output/'config.json', {'models': models, 'blocks': blocks,
         'selection': [[s['prompt_id'], s['cycle']] for s in selected],
         'input': str(args.input), 'seed': 927, 'torch': torch.__version__,
@@ -90,7 +93,7 @@ def main():
             del prefill
             # Independent greedy continuation is the common acceptance reference.
             canonical, cc, token = [], copy.deepcopy(tc), ids[:, -1:]
-            for _ in range(19):
+            for _ in range(max(blocks)-1):
                 out = target(token, past_key_values=cc, use_cache=True, logits_to_keep=1)
                 token = out.logits[:, -1].argmax(-1, keepdim=True)
                 canonical.append(int(token))
