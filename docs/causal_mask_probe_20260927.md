@@ -31,3 +31,38 @@ Script: `scripts/causal_mask_probe.py`. Four-state smoke output:
 `/data/scratch/zekaili/atharv/dflash/runs/causal_mask_smoke_20260927`.
 Main output: `/data/scratch/zekaili/atharv/dflash/runs/causal_mask_16p_20260927`.
 State results are saved individually; `summary.json` is written only at completion.
+
+## Completed results
+
+64/64 states eligible, 16 prompts, zero disagreements with the independent
+greedy target acceptance check across 640 outcomes.
+
+| B (including anchor) | Bidirectional mean A | Causal mean A |
+| --- | ---: | ---: |
+| 4 | 2.09375 | 1.96875 |
+| 8 | 4.203125 | 3.609375 |
+| 12 | 5.75 | 4.90625 |
+| 16 | 7.078125 | 5.65625 |
+| 20 | 4.421875 | 6.109375 |
+
+Paired causal-minus-bidirectional mean A at B16: -1.421875, prompt bootstrap
+95% interval [-2.140625, -0.78125]. At B20: +1.6875, interval
+[0.546875, 2.8125]. Descriptive 10,000 prompt resamples, seed 927; not a
+generalization claim or training-seed interval.
+
+Causal attention had zero acceptance regressions across 256 adjacent-block
+comparisons; bidirectional had 38. Causal token prefixes were identical for
+B4->B8, B8->B12, B12->B16. For B16->B20, 15/64 causal token prefixes changed,
+all strictly after the first rejection, with unchanged acceptance for those
+15 states. Shape-dependent numerical effects are a hypothesis, not established
+by this test; do not claim exact token-prefix invariance. Bidirectional B16->B20
+had 60 prefix changes and 28 acceptance regressions; 12/15 fully accepted B16
+states regressed, versus 0/11 for causal drafting's own fully accepted subset.
+
+44/64 original saved B16 token-and-label outcomes were reproduced exactly.
+Use only the newly recomputed paired comparison; historical replay differences
+may involve hardware and full-prefix versus incremental numerical effects.
+
+Conclusion: the post-hoc mask trades B16 acceptance for more stable acceptance
+across lengths. Causal B20 still accepts fewer tokens than original B16 while
+proposing more. It is not an efficiency win demonstrated by this experiment.
