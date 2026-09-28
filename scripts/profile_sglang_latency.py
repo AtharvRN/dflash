@@ -5,6 +5,7 @@ import argparse
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import fcntl
+import getpass
 import hashlib
 import json
 import os
@@ -246,6 +247,7 @@ def main():
                           "--shm-size", "8g", "--cpus", "12", "--user", f"{os.getuid()}:{os.getgid()}",
                           "-v", f"{repo}:{repo}:ro", "-v", f"{ROOT}:{ROOT}:ro", "-v", f"{stage}:{stage}:rw",
                           "-e", "OMP_NUM_THREADS=4", "-e", "MKL_NUM_THREADS=4", "-e", "TOKENIZERS_PARALLELISM=false",
+                          "-e", "LOGNAME=" + getpass.getuser(),
                           "-e", "NVIDIA_TF32_OVERRIDE=0",
                           "-e", "HF_HUB_OFFLINE=1", "-e", "PYTHONDONTWRITEBYTECODE=1",
                           "-e", f"HF_HOME={ROOT}/hf", "-e", f"XDG_CACHE_HOME={cache}",
