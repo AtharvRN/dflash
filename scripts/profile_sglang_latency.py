@@ -244,6 +244,7 @@ def main():
                 base = f"http://127.0.0.1:{port}"
                 container = "atharv-dflash-profile-" + hashlib.sha256(str(stage).encode()).hexdigest()[:12]
                 launch = ["docker", "run", "--name", container, "--network", "host", "--gpus", "device="+gpu["uuid"],
+                          "--workdir", str(stage),
                           "--shm-size", "8g", "--cpus", "12", "--user", f"{os.getuid()}:{os.getgid()}",
                           "-v", f"{repo}:{repo}:ro", "-v", f"{ROOT}:{ROOT}:ro", "-v", f"{stage}:{stage}:rw",
                           "-e", "OMP_NUM_THREADS=4", "-e", "MKL_NUM_THREADS=4", "-e", "TOKENIZERS_PARALLELISM=false",
