@@ -38,7 +38,10 @@ def span(name):
     ACTIVE["stack"].append(index)
     start.record()
     begin = time.perf_counter_ns()
-    annotation = torch.profiler.record_function("DFLASH/" + name) if MODE == "trace" else nullcontext()
+    annotation_name = "DFLASH/" + name
+    if name.endswith("_cycle"):
+        annotation_name += f"|B={ACTIVE['block_size']}|C={ACTIVE['batch_size']}|cycle={ACTIVE['cycle']}"
+    annotation = torch.profiler.record_function(annotation_name) if MODE == "trace" else nullcontext()
     try:
         with annotation:
             yield
@@ -86,6 +89,7 @@ def install(module):
     (ROOT / f"hook_{os.getpid()}.json").write_text(json.dumps({
         "worker_source_sha256": hashlib.sha256(source.encode()).hexdigest(),
         "source_path": module.__file__, "mode": MODE, "torch": torch.__version__,
+        "instrumentation_source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "timing": "CUDA events on current stream; no per-stage synchronization",
     }, indent=2))
     original_init = cls.__init__
