@@ -212,10 +212,16 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--max-seconds", type=int, default=5400)
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--target-only", action="store_true",
+                        help="Non-speculative target control; clean runs only")
     args = parser.parse_args()
     if args.output.exists():
         raise ValueError("Preserve prior evidence: output must be new")
-    if any(b < 2 or b > 16 for b in args.blocks):
+    if args.target_only:
+        if args.modes != ["clean"]:
+            raise ValueError("Target-only control uses clean throughput mode")
+        args.blocks = [1]
+    elif any(b < 2 or b > 16 for b in args.blocks):
         raise ValueError("This experiment uses the original B16-trained drafter, B2--16")
     lock = (ROOT / f"gpu_{args.gpu}_actual_block.lock").open("a")
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -280,6 +286,12 @@ def main():
                            "--max-total-tokens", "131072", "--context-length", "4096",
                            "--cuda-graph-max-bs", str(max(args.concurrency)), "--disable-radix-cache",
                            "--disable-piecewise-cuda-graph"]
+                if args.target_only:
+                    for flag in ("--speculative-algorithm", "--speculative-draft-model-path",
+                                 "--speculative-dflash-block-size", "--speculative-num-draft-tokens",
+                                 "--speculative-draft-attention-backend"):
+                        i = launch.index(flag)
+                        del launch[i:i+2]
                 atomic_json(stage / "launch.json", launch)
                 atomic_json(stage / "control.json", {"label": "startup"})
                 with log_path.open("w") as log:

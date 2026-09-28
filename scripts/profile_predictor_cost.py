@@ -79,6 +79,7 @@ def main():
             for name, fn in [("frozen_100k", old_decision), ("actual_seed_913", new_decision)]:
                 expected = fn().clone()
                 eager = measure(fn)
+                eager_readback = measure(lambda: fn().cpu().tolist())
                 stream = torch.cuda.Stream()
                 stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(stream):
@@ -93,13 +94,19 @@ def main():
                 if not torch.equal(expected, observed):
                     raise ValueError("Graph/eager policy disagreement")
                 graphed = measure(graph.replay)
+                def replay_and_readback():
+                    graph.replay()
+                    return observed.cpu().tolist()
+                graphed_readback = measure(replay_and_readback)
                 results.append({"model": name, "batch_size": count, "eager": eager, "cuda_graph": graphed,
+                                "eager_with_cpu_lengths": eager_readback,
+                                "cuda_graph_with_cpu_lengths": graphed_readback,
                                 "selected_B": expected.cpu().tolist()})
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps({"results": results, "torch": torch.__version__,
         "gpu": torch.cuda.get_device_name(), "tf32": False, "weights_dtype": "FP32", "input_dtype": "FP16",
         "checkpoint_sha256": {str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in [old_path, new_path]},
-        "scope": "GPU-resident feature cast, trained MLP, and integer decision only; no feature gather, CPU transfer, ragged packing, KV bookkeeping or integrated-serving claim",
+        "scope": "GPU-resident feature cast, trained MLP and integer decision, plus separately labeled synchronous CPU-length readback; no feature gather, ragged packing, KV bookkeeping or integrated-serving claim",
         "seed_choice": "913 fixed in advance, not selected by performance; same architecture across seeds"}, indent=2))
     print(args.output)
 
