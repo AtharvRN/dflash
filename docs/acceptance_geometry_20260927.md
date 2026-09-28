@@ -174,3 +174,21 @@ See `report.md` in the output directory for all five figure sets, and
 `summary.json`, `probe_predictions.npz`, and `plot_coordinates.npz` for the
 machine-readable evidence. Saved decoded recent-text snippets are local research
 artifacts; no manually labeled semantic states were introduced.
+
+## Acceptance-group presentation
+
+`scripts/plot_fused_acceptance_groups.py` renders the same saved fused-vector
+coordinates explicitly grouped by exact observed acceptance, without recomputing
+PCA/t-SNE or averaging vectors. Output: `outputs/fused_acceptance_groups_20260927`.
+
+- `fused_acceptance_groups_overlay.png/.pdf`: discrete color/legend for A=0..15.
+- `fused_pca_by_acceptance.png/.pdf`: 16 panels, one acceptance group per panel.
+- `fused_tsne_by_acceptance.png/.pdf`: the same grouping in the joint t-SNE map.
+
+All panels share axes and coordinates. Gray points are other acceptance groups;
+colored points are the group's individual cycles. These remain the original
+2,766 sampled rows, at most four per prompt, not all 20,970 rows. They are the
+collected 2,560-dimensional last fused vectors, L2-normalized before train-fitted
+PCA; t-SNE uses the first 50 PCs. Neither text-probe inputs nor predictions are
+plotted. Labels/prompt IDs are checked against the saved original observations,
+and the source coordinate checksum is recorded in `grouping_metadata.json`.
