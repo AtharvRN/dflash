@@ -185,6 +185,21 @@ def gpu_telemetry(index):
     return command(["nvidia-smi", f"--id={index}", "--query-gpu="+fields, "--format=csv"])
 
 
+def choose_http_port():
+    # SGLang derives additional ports from HTTP. Linux's arbitrary ephemeral
+    # range can place the derived gRPC port beyond 65535.
+    candidates = list(range(18000, 30000))
+    random.SystemRandom().shuffle(candidates)
+    for port in candidates:
+        with socket.socket() as sock:
+            try:
+                sock.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError("No available HTTP port in the bounded serving range")
+
+
 def wait_ready(base, container, log_path, timeout=720):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -250,9 +265,7 @@ def main():
                 stage.mkdir()
                 cache = shared_cache
                 log_path = stage / "server.log"
-                with socket.socket() as sock:
-                    sock.bind(("127.0.0.1", 0))
-                    port = sock.getsockname()[1]
+                port = choose_http_port()
                 base = f"http://127.0.0.1:{port}"
                 container = "atharv-dflash-profile-" + hashlib.sha256(str(stage).encode()).hexdigest()[:12]
                 launch = ["docker", "run", "--name", container, "--network", "host", "--gpus", "device="+gpu["uuid"],
