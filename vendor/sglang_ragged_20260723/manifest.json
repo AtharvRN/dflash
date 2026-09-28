@@ -1,0 +1,126 @@
+{
+  "base_archive_sha256": "6a9bf54b833d01e7e6630df5e7b6632fc5b75b66b2f804a1b6a606ad33d0a138",
+  "base_commit": "e5add3ba0f20d46b5bcb7a9a356df7cb102c49ae",
+  "deployed_comparison": {
+    "dflash_prepare_block.py": {
+      "deployed_sha256": "40bd09d6e27f68638bd184b4466c8986a9f2069b23599b207e84aa7d6b1e8f29",
+      "parent_sha256": "40bd09d6e27f68638bd184b4466c8986a9f2069b23599b207e84aa7d6b1e8f29"
+    },
+    "dflash_worker_v2.py": {
+      "deployed_sha256": "1b41f6021209a8245234486c51c3a11e8eeb148ab32353d18bc0fd71bc488806",
+      "parent_sha256": "51d664402745488282cc0ccff8e2a2ac98094e88ebdb91517764232995b16fb6"
+    }
+  },
+  "format": 1,
+  "limitations": [
+    "greedy ragged path only",
+    "draft CUDA graphs disabled in recovered worker",
+    "not a claim of bitwise identity to the old live pod"
+  ],
+  "overlay": {
+    "python/sglang/srt/arg_groups/speculative_hook.py": {
+      "provenance": "historical_worktree_verbatim",
+      "sha256": "62aca44182dc4423eff3a7032861f40b06cf7c173f27aef8d30663a6c3e5852b",
+      "source": "/Users/atharvramesh/Projects/sglang-dflash-pr23000/python/sglang/srt/arg_groups/speculative_hook.py"
+    },
+    "python/sglang/srt/layers/attention/flashinfer_backend.py": {
+      "provenance": "historical_worktree_verbatim",
+      "sha256": "f4407f5d9a8c1a75239116548f12ca6dbe39aba0206c2673dff1b09788ed643b",
+      "source": "/Users/atharvramesh/Projects/sglang-dflash-pr23000/python/sglang/srt/layers/attention/flashinfer_backend.py"
+    },
+    "python/sglang/srt/layers/attention/triton_backend.py": {
+      "provenance": "historical_worktree_verbatim",
+      "sha256": "e70d90bd7ae51a5850daf74cd93b720fb84ba305eac76a171a9f8b1f6d0b24d0",
+      "source": "/Users/atharvramesh/Projects/sglang-dflash-pr23000/python/sglang/srt/layers/attention/triton_backend.py"
+    },
+    "python/sglang/srt/managers/scheduler_components/batch_result_processor.py": {
+      "provenance": "historical_worktree_verbatim",
+      "sha256": "730edc125418981c2641ec610d34cb23a93a543f27fe4d0dde3ec667a8c4d5b6",
+      "source": "/Users/atharvramesh/Projects/sglang-dflash-pr23000/python/sglang/srt/managers/scheduler_components/batch_result_processor.py"
+    },
+    "python/sglang/srt/managers/utils.py": {
+      "provenance": "historical_worktree_verbatim",
+      "sha256": "41aa08042ee838584087af277adb81e801f6555d53c63e2699afb84601240af6",
+      "source": "/Users/atharvramesh/Projects/sglang-dflash-pr23000/python/sglang/srt/managers/utils.py"
+    },
+    "python/sglang/srt/model_executor/forward_batch_info.py": {
+      "provenance": "historical_worktree_verbatim",
+      "sha256": "51aa06885ebff1deb89a088f1dd2d6776e3633de3916c75ec9c206e3759fb3ce",
+      "source": "/Users/atharvramesh/Projects/sglang-dflash-pr23000/python/sglang/srt/model_executor/forward_batch_info.py"
+    },
+    "python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py": {
+      "provenance": "historical_worktree_verbatim",
+      "sha256": "0b8d73083f3cfb229287a8e41efb3835edec72a9e34f46966ec6725763e3a5dd",
+      "source": "/Users/atharvramesh/Projects/sglang-dflash-pr23000/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py"
+    },
+    "python/sglang/srt/server_args.py": {
+      "provenance": "historical_worktree_verbatim",
+      "sha256": "33c7b6b5ee47c361521c45b14e8bceb05272c5c48e74d68ae48188c46ca0ef0c",
+      "source": "/Users/atharvramesh/Projects/sglang-dflash-pr23000/python/sglang/srt/server_args.py"
+    },
+    "python/sglang/srt/speculative/dflash_info.py": {
+      "provenance": "historical_worktree_verbatim",
+      "sha256": "8ed0f424dbafc55ff7dba69e210e4f49a3150da84949a7014c164f3559fd0193",
+      "source": "/Users/atharvramesh/Projects/sglang-dflash-pr23000/python/sglang/srt/speculative/dflash_info.py"
+    },
+    "python/sglang/srt/speculative/dflash_postdraft_policy.py": {
+      "provenance": "historical_worktree_verbatim",
+      "sha256": "27bf417125b1b52f2df65585b94e9d09ba0a0079d9cd40ec45db994ffbbae18d",
+      "source": "/Users/atharvramesh/Projects/sglang-dflash-pr23000/python/sglang/srt/speculative/dflash_postdraft_policy.py"
+    },
+    "python/sglang/srt/speculative/dflash_predraft_entropy.py": {
+      "provenance": "historical_worktree_verbatim",
+      "sha256": "21d674100c181a26038d49435f3d41808bb40421b7558d5f9a949fd6b1af7c75",
+      "source": "/Users/atharvramesh/Projects/sglang-dflash-pr23000/python/sglang/srt/speculative/dflash_predraft_entropy.py"
+    },
+    "python/sglang/srt/speculative/dflash_worker.py": {
+      "provenance": "historical_worktree_verbatim",
+      "sha256": "31061b4a10d739c92f847ff3668091006ddf9abc3b4f416e9392ab3ce378734c",
+      "source": "/Users/atharvramesh/Projects/sglang-dflash-pr23000/python/sglang/srt/speculative/dflash_worker.py"
+    },
+    "python/sglang/srt/speculative/dflash_worker_v2.py": {
+      "provenance": "historical_worktree_verbatim",
+      "sha256": "51d664402745488282cc0ccff8e2a2ac98094e88ebdb91517764232995b16fb6",
+      "source": "/Users/atharvramesh/Projects/sglang-dflash-pr23000/python/sglang/srt/speculative/dflash_worker_v2.py"
+    },
+    "python/sglang/srt/speculative/spec_info.py": {
+      "provenance": "historical_worktree_verbatim",
+      "sha256": "bd53ce57e9fb7079dda68d3227cdf7f7be7f30ea7f652533251e68bdd0b214c6",
+      "source": "/Users/atharvramesh/Projects/sglang-dflash-pr23000/python/sglang/srt/speculative/spec_info.py"
+    },
+    "python/sglang/srt/speculative/triton_ops/dflash_accept_bonus.py": {
+      "parent_worktree_sha256": "422ffbd00b54913f3d9c14d2596ffd79e51800b6565dc0de78603a36dbd6fdce",
+      "provenance": "saved_deployed_kernel_verbatim",
+      "sha256": "b1407cf35e5099f1be18608848a190ad06dab54d6df88dc577b08bc4c72ea708",
+      "source": "/Users/atharvramesh/Projects/dflash-fresh-zlab-main/.tmp_sglang_opt/current_pod/dflash_accept_bonus.py"
+    },
+    "python/sglang/srt/speculative/triton_ops/dflash_prepare_block.py": {
+      "provenance": "historical_worktree_verbatim",
+      "sha256": "40bd09d6e27f68638bd184b4466c8986a9f2069b23599b207e84aa7d6b1e8f29",
+      "source": "/Users/atharvramesh/Projects/sglang-dflash-pr23000/python/sglang/srt/speculative/triton_ops/dflash_prepare_block.py"
+    }
+  },
+  "scope": "Python runtime only; no benchmark code, data, models or environment",
+  "source_diff_sha256": "e683db758f2bd0a89a8f15a8b25b7945df705d71020af967838edc005a5bfb46",
+  "source_root": "/Users/atharvramesh/Projects/sglang-dflash-pr23000",
+  "source_status": [
+    " M benchmark/dflash_speedup_suite/README.md",
+    " M benchmark/dflash_speedup_suite/run_concurrency_sweep.py",
+    " M python/sglang/srt/arg_groups/speculative_hook.py",
+    " M python/sglang/srt/layers/attention/flashinfer_backend.py",
+    " M python/sglang/srt/layers/attention/triton_backend.py",
+    " M python/sglang/srt/managers/scheduler_components/batch_result_processor.py",
+    " M python/sglang/srt/managers/utils.py",
+    " M python/sglang/srt/model_executor/forward_batch_info.py",
+    " M python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py",
+    " M python/sglang/srt/server_args.py",
+    " M python/sglang/srt/speculative/dflash_info.py",
+    " M python/sglang/srt/speculative/dflash_worker.py",
+    " M python/sglang/srt/speculative/dflash_worker_v2.py",
+    " M python/sglang/srt/speculative/spec_info.py",
+    " M python/sglang/srt/speculative/triton_ops/dflash_prepare_block.py",
+    "?? benchmark/dflash_speedup_suite/run_standard_dflashv2_benchmark.py",
+    "?? python/sglang/srt/speculative/dflash_postdraft_policy.py",
+    "?? python/sglang/srt/speculative/dflash_predraft_entropy.py"
+  ]
+}
