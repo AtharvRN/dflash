@@ -250,7 +250,9 @@ def main():
                           "-e", "HF_HUB_OFFLINE=1", "-e", "PYTHONDONTWRITEBYTECODE=1",
                           "-e", f"HF_HOME={ROOT}/hf", "-e", f"XDG_CACHE_HOME={cache}",
                           "-e", f"TRITON_CACHE_DIR={cache}/triton", "-e", f"TORCHINDUCTOR_CACHE_DIR={cache}/inductor",
-                          "-e", f"CUDA_CACHE_PATH={cache}/cuda", "-e", f"FLASHINFER_WORKSPACE_DIR={cache}/flashinfer"]
+                          "-e", f"CUDA_CACHE_PATH={cache}/cuda", "-e", f"FLASHINFER_WORKSPACE_BASE={cache}/flashinfer",
+                          "-e", f"SGLANG_CACHE_DIR={cache}/sglang", "-e", f"SGLANG_DG_CACHE_DIR={cache}/deep_gemm",
+                          "-e", f"TORCH_HOME={cache}/torch", "-e", f"TORCH_EXTENSIONS_DIR={cache}/extensions"]
                 if mode != "clean":
                     launch += ["-e", f"PYTHONPATH={repo}/scripts/sglang_profile_hook",
                                "-e", "DFLASH_COMPONENT_PROFILE=" + mode, "-e", f"DFLASH_PROFILE_DIR={stage}"]
