@@ -79,6 +79,7 @@ def main():
                        "--speculative-dflash-dynamic-block-size", "--speculative-dflash-dynamic-block-arms",
                        ",".join(map(str, range(2, 17))), "--speculative-dflash-dynamic-warmup-batches", "1000000",
                        "--host", "127.0.0.1", "--port", str(port), "--tp-size", "1", "--dtype", "bfloat16",
+                       "--random-seed", "934",
                        "--attention-backend", args.backend, "--speculative-draft-attention-backend", args.backend,
                        "--mem-fraction-static", "0.60", "--max-running-requests", "8",
                        "--max-total-tokens", "32768", "--context-length", "4096", "--cuda-graph-max-bs", "8",

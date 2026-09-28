@@ -8,6 +8,7 @@ to restore all suffix KV writes before normal decoding continues.
 from __future__ import annotations
 
 from functools import wraps
+import copy
 import hashlib
 import json
 import os
@@ -84,6 +85,11 @@ def audited_forward(runner, role):
         should_check = (fb.forward_mode.is_target_verify() and
                         getattr(spec, "draft_token_lens", None) is not None and
                         fb.batch_size > 1 and checked < LIMIT)
+        # DFlash's fused residual RMSNorm mutates the input-embedding buffer.
+        # Preserve PRE-forward inputs; references made from fb afterwards are
+        # not same-state controls, even though token IDs/KV prefix are identical.
+        saved_embeds = (fb.input_embeds.detach().clone()
+                        if should_check and fb.input_embeds is not None else None)
         out = original(fb, *args, **kwargs)
         if not should_check:
             return out
@@ -98,13 +104,17 @@ def audited_forward(runner, role):
                   "batch_size": fb.batch_size, "real_lengths": real, "physical_lengths": physical,
                   "prefix_lengths": fb.seq_lens.tolist(), "graph_used": bool(out.can_run_graph),
                   "reference": "independent actual-B, same committed KV prefix", "requests": []}
+        reference_inputs = copy.copy(fb)
+        if saved_embeds is not None:
+            record["input_embedding_mutation"] = compare(saved_embeds, fb.input_embeds)
+            reference_inputs.input_embeds = saved_embeds
         # Test all requests, in reverse order to expose hidden batch-order state.
         offsets = [0]
         for size in physical:
             offsets.append(offsets[-1]+size)
         try:
             for i in reversed(range(fb.batch_size)):
-                view = batch_view(fb, [i], real, physical)
+                view = batch_view(reference_inputs, [i], real, physical)
                 ref = original(view)
                 begin, end = offsets[i], offsets[i]+real[i]
                 row = {"row": i, "block_size": real[i],
@@ -115,7 +125,7 @@ def audited_forward(runner, role):
             if out.can_run_graph:
                 # Identical physical layout: isolate graph replay from ragged
                 # vs single-request floating-point shape effects.
-                view = batch_view(fb, list(range(fb.batch_size)), physical, physical)
+                view = batch_view(reference_inputs, list(range(fb.batch_size)), physical, physical)
                 ref = original(view)
                 record["same_batch_eager_hidden"] = compare(actual_hidden, ref.logits_output.hidden_states)
                 if actual_logits is not None:
@@ -124,6 +134,8 @@ def audited_forward(runner, role):
             # Single-request shadows reuse the same suffix slots. Re-execute the
             # original batch to restore the actual batched KV and graph buffers.
             fb.forward_metadata_ready = False
+            if saved_embeds is not None:
+                fb.input_embeds = saved_embeds.clone()
             restore_kwargs = dict(kwargs)
             restore_kwargs.pop("skip_attn_backend_init", None)
             restored = original(fb, *args, **restore_kwargs)
