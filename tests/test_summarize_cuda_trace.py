@@ -24,3 +24,17 @@ def test_launch_correlation_and_nested_stage():
     assert out["stage_gpu_sum_ms_per_cycle"] == {"DFLASH/target_forward": .015}
     assert out["gpu_activities_outside_selected_roots_or_unattributed"] == 1
     assert out["cycle_activity"][0]["gaps_inside_envelope_ms"] == .002
+
+
+def test_driver_launch_is_attributed_and_zero_correlation_is_not():
+    root = {"ph":"X", "cat":"user_annotation", "pid":1,"tid":2,"ts":0,"dur":100,
+            "name":"DFLASH/decode_cycle|B=16|C=64|cycle=10"}
+    launch = {"ph":"X", "cat":"cuda_driver", "pid":1,"tid":2,"ts":20,"dur":2,
+              "name":"cuLaunchKernel", "args":{"correlation":123}}
+    kernel = {"ph":"X", "cat":"kernel", "pid":0,"tid":7,"ts":25,"dur":10,
+              "name":"example_gemm", "args":{"correlation":123}}
+    result = analyze([root, launch, kernel,
+                      dict(launch, args={"correlation":0}),
+                      dict(kernel, args={"correlation":0})], 64)
+    assert result["attributed_full_batch_decode_gpu_activity_ms"] == .01
+    assert result["gpu_activities_outside_selected_roots_or_unattributed"] == 1

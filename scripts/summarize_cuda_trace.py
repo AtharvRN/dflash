@@ -41,7 +41,7 @@ def analyze(events, batch_size):
     roots = [e for e in ranges if e["name"].startswith("DFLASH/decode_cycle|") and f"|C={batch_size}|" in e["name"]]
     if not roots:
         raise ValueError("No annotated full-batch decode cycles in trace")
-    runtime = [e for e in events if e.get("cat") == "cuda_runtime" and e.get("ph") == "X"]
+    runtime = [e for e in events if e.get("cat") in {"cuda_runtime", "cuda_driver"} and e.get("ph") == "X"]
     # Each correlation identifies the host launch, including cudaGraphLaunch.
     owners = {}
     cpu_api = defaultdict(float)
@@ -56,10 +56,11 @@ def analyze(events, batch_size):
                  and root["ts"] <= r["ts"] and r["ts"] <= t < r["ts"]+r["dur"] <= root["ts"]+root["dur"]+1]
         stage = min(inner, key=lambda r:r["dur"])["name"].split("|")[0] if inner else "DFLASH/decode_cycle"
         corr = event.get("args", {}).get("correlation")
-        if corr is not None:
+        if corr not in (None, 0):
             owners[corr] = (root["name"], stage)
-        cpu_api[event["name"]] += event["dur"]
+        cpu_api[event["cat"] + "/" + event["name"]] += event["dur"]
     kernels, stages, categories, activity = defaultdict(float), defaultdict(float), defaultdict(float), defaultdict(list)
+    stage_kernels = defaultdict(lambda: defaultdict(float))
     all_gpu_us, attributed_us, unmatched_count = 0.0, 0.0, 0
     cuda_categories = Counter()
     for event in events:
@@ -77,6 +78,7 @@ def analyze(events, batch_size):
         attributed_us += duration
         kernels[event["name"]] += duration
         stages[stage] += duration
+        stage_kernels[stage][event["name"]] += duration
         category = kernel_category(event["name"]) if cat == "kernel" else cat
         categories[category] += duration
         activity[root].append((event["ts"], event["ts"]+duration))
@@ -98,6 +100,9 @@ def analyze(events, batch_size):
             "attributed_full_batch_decode_gpu_activity_ms": attributed_us/1000,
             "gpu_activities_outside_selected_roots_or_unattributed": unmatched_count,
             "stage_gpu_sum_ms_per_cycle": {k:v/1000/n for k,v in sorted(stages.items())},
+            "stage_top_kernels": {stage: [{"name": k, "ms_per_cycle": v/1000/n}
+                                          for k,v in sorted(values.items(), key=lambda kv:-kv[1])[:10]]
+                                  for stage, values in sorted(stage_kernels.items())},
             "kernel_category_gpu_sum_ms_per_cycle": {k:v/1000/n for k,v in sorted(categories.items())},
             "cpu_cuda_api_ms_per_cycle": {k:v/1000/n for k,v in sorted(cpu_api.items(),key=lambda kv:-kv[1])},
             "top_kernels": [{"name": k, "total_ms": v/1000, "ms_per_cycle": v/1000/n}
@@ -105,7 +110,7 @@ def analyze(events, batch_size):
             "cycle_activity": per_cycle,
             "limitations": ["Only launch-correlated GPU activities inside annotated C-matched decode roots are attributed.",
                             "The entire trace may also contain prefill and lower-batch decode; its total is not the selected-cycle denominator.",
-                            "CPU API time overlaps GPU execution. Do not add it to GPU duration sums.",
+                            "CPU API time overlaps GPU execution; runtime/driver APIs may also nest. Do not add these durations.",
                             "GPU envelope excludes leading/trailing gaps; kernel category labels are heuristics, exact names retained.",
                             "Instrumented trace timing is not clean serving throughput."]}
 
@@ -122,7 +127,7 @@ def main():
     result = analyze(data["traceEvents"], args.batch_size)
     result["source_trace"] = str(args.trace)
     args.output.write_text(json.dumps(result, indent=2, sort_keys=True))
-    print(json.dumps({k:v for k,v in result.items() if k not in {"top_kernels", "cycle_activity"}}, indent=2))
+    print(json.dumps({k:v for k,v in result.items() if k not in {"top_kernels", "stage_top_kernels", "cycle_activity"}}, indent=2))
 
 
 if __name__ == "__main__":
