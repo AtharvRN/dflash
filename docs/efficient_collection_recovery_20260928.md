@@ -174,3 +174,62 @@ exit records if another failure occurs; do not attribute the baseline to this ru
 
 Local replay summary:
 `/Users/atharvramesh/Projects/MLSys/dflash-headroom/outputs/actual_block_predictor_10k_diagnostics_20260928/benchmark/summary.json`
+
+## Diagnostic failure and explicit completion relaunch
+
+The diagnostic collection also stopped, at 2026-09-28 18:51:23 UTC (11:51 PDT),
+with `BrokenProcessPool` / wrapper exit 1. It saved 8,912 eligible training cycles
+(8,956 total states, 1,297 processed prompt receipts). A subsequent read-only
+audit verified all 3,774 config/receipt/shard files and the final metadata hash
+bindings, with zero canonical disagreements. Training never started.
+
+This time the initiating event is visible: worker 654862 recorded SIGTERM at
+18:51:22.389455 UTC, BEFORE the parent's first cleanup termination record at
+18:51:22.529965 UTC. The other three workers recorded SIGTERM after controller
+cleanup began. Their final exit statuses were all -15. No Python/CUDA OOM
+exception was recorded, and the shared-cgroup `oom_kill` counter remained 17.
+The sender of the first SIGTERM remains unidentified. The roughly 32-minute
+duration repeats earlier failures; it does not establish a specific scheduler,
+timeout, user action or resource policy as the cause. No automatic retries or
+changes to system limits were introduced.
+
+SSH later timed out before authentication; DNS and GitHub TCP controls worked.
+SSH was reachable again at the user's next check. No SSH configuration was
+changed, and these observations do not establish a cause for the access outage.
+
+The user explicitly requested another relaunch. Its source is the full 8,912-row
+diagnostic cache, leaving 1,088 eligible rows to the training target. The existing
+four-hour cumulative collection bound has 8,647.3257 seconds remaining. The same
+source/input audit, matched replay gate, diagnostics, first-10k selection and
+three-seed training pipeline apply. Previous runs remain untouched.
+
+- New root: `/data/scratch/zekaili/atharv/dflash/runs/actual_block_predictor_10k_finish_20260928`
+- Temporary cache: `/tmp/actual_block_predictor_10k_finish_20260928_cache`
+- Source cache: `/data/scratch/zekaili/atharv/dflash/runs/actual_block_predictor_10k_diagnostics_20260928/cache`
+- tmux session: `dflash-finish-20260928`
+- Deployment commit at launch: `ca09995` (numerical/diagnostic code unchanged from `46d1d71`).
+
+GPU 4 had no listed GPU processes or open device users at preflight, but reported
+100% utilization with zero allocated memory. No device reset or other-job action
+was performed. After the replay began, the GPU reported normal single-worker
+activity (53% utilization, 10,189 MiB allocated) and the first replayed states
+matched.
+
+### Completion relaunch verified
+
+All 95 replay states matched exactly at each setting. The 1/2/4-worker rates were
+0.97085 / 1.66730 / 1.80965 eligible cycles/s; four workers were selected by the
+unchanged gate. Its sampled mean utilization was 98.41%, peak GPU memory 41,559
+MiB. This is collection throughput, not a predictor or serving result.
+
+Collection resumed at 2026-09-28 21:05:20 UTC. At 21:07:01 UTC it had durably
+saved 9,069 eligible cycles: 8,912 preserved plus 157 new. All 3,774 source files
+were rechecked unchanged at the old location and byte-identical in the new cache
+(source configuration stored as `recovery_source_config.json`). Four workers
+(916179, 916187, 916191, 916196) were active, GPU 4 sampled at 100% with 42,187 MiB
+allocated, and there were no controller failure/signal events or wrapper exit
+file. Training had not yet started; it remains gated on complete collection and
+the original audit. The underlying first-SIGTERM sender is still unresolved.
+
+Local replay summary:
+`/Users/atharvramesh/Projects/MLSys/dflash-headroom/outputs/actual_block_predictor_10k_finish_20260928/benchmark/summary.json`
