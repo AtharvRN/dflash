@@ -129,7 +129,7 @@ Diagnostics are stored on durable scratch, outside the numerical dataset cache.
 The benchmark binds both driver and diagnostic-module hashes. Incomplete or
 failed collection still blocks training.
 
-Planned new run:
+New diagnostic run:
 `/data/scratch/zekaili/atharv/dflash/runs/actual_block_predictor_10k_diagnostics_20260928`
 
 Important files beneath that root:
@@ -144,4 +144,33 @@ Important files beneath that root:
 Local validation: 37 targeted tests pass, including normal spawned execution,
 Python exceptions, caught SIGTERM, and a disposable two-worker SIGKILL test that
 distinguishes the killed worker from the peer terminated during executor cleanup.
-Launch and GPU replay results are pending at the time of this code amendment.
+The same 37 tests also passed on the workstation before launch.
+
+### Diagnostic restart verification
+
+Implementation/deployment commit: `46d1d71`. The new wrapper launched in tmux
+`dflash-diagnostics-20260928` on GPU 4. The instrumented matched replay again
+passed every state/feature comparison for all 95 states at each worker count:
+
+| Workers | Eligible cycles/s | Timed seconds | Mean GPU utilization | Sampled peak MiB |
+|---|---:|---:|---:|---:|
+| 1 | 1.01734 | 93.381 | 56.85% | 10,805 |
+| 2 | 1.68828 | 56.270 | 94.80% | 20,872 |
+| 4 | 1.81820 | 52.250 | 98.51% | 41,559 |
+
+Four workers were selected by the unchanged rule. Collection started at
+2026-09-28 18:19:24 UTC, with models ready at 18:19:35 UTC. Verified all 2,267
+recovery source files remained unchanged and their copied bytes matched (source
+config preserved separately). At 18:20:34 UTC, durable progress reached 5,508
+eligible cycles / 5,536 total states across 789 processed prompt receipts:
+5,408 preserved + 100 new eligible cycles. GPU 4 sampled at 100%, 42,345 MiB.
+Worker PIDs were 654862, 654871, 654877 and 654882; all four were starting new
+prompts and writing diagnostic events. Training remains pending collection/audit.
+
+The tmux session's shared cgroup already had `oom_kill=17` at collection startup;
+it was still 17 at the above progress check. This is a historical shared-cgroup
+counter, NOT a diagnosis of either previous failure. Compare deltas and worker
+exit records if another failure occurs; do not attribute the baseline to this run.
+
+Local replay summary:
+`/Users/atharvramesh/Projects/MLSys/dflash-headroom/outputs/actual_block_predictor_10k_diagnostics_20260928/benchmark/summary.json`
