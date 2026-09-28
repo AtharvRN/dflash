@@ -61,6 +61,8 @@ def main():
     cache = args.root / "runs/policy_granularity_20260927/cache"
     feature_paths = sorted(cache.glob("prompt_*_fused.npy"))
     features = np.concatenate([np.load(p, allow_pickle=False) for p in feature_paths[:32]])[:128]
+    if features.shape != (128, 2560):
+        raise ValueError(f"Expected 128 latest fused vectors, got {features.shape}")
     results = []
     with torch.inference_mode():
         for count in [1, 16, 32, 64, 128]:
