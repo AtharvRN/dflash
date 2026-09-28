@@ -45,21 +45,21 @@ def test_shadow_forward_preserves_inplace_embedding_inputs(tmp_path, monkeypatch
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
-    def view(fb, rows, lengths, physical):
-        offsets = [0]
-        for n in physical:
-            offsets.append(offsets[-1]+n)
-        ids = [offsets[i]+j for i in rows for j in range(lengths[i])]
-        return SimpleNamespace(input_embeds=fb.input_embeds[ids].clone())
-
-    monkeypatch.setattr(module, "batch_view", view)
-
     def original(fb, *args, **kwargs):
         fb.input_embeds.add_(10)
         return SimpleNamespace(logits_output=SimpleNamespace(hidden_states=fb.input_embeds.clone(), next_token_logits=None),
                                can_run_graph=False)
 
-    fb = SimpleNamespace(input_embeds=torch.ones(5, 4), batch_size=2,
+    # The perturbation control also changes token IDs outside the protected row.
+    def view(fb, rows, lengths, physical):
+        offsets = [0]
+        for n in physical:
+            offsets.append(offsets[-1]+n)
+        ids = [offsets[i]+j for i in rows for j in range(lengths[i])]
+        return SimpleNamespace(input_embeds=fb.input_embeds[ids].clone(), input_ids=fb.input_ids[ids].clone())
+
+    monkeypatch.setattr(module, "batch_view", view)
+    fb = SimpleNamespace(input_embeds=torch.ones(5, 4), input_ids=torch.arange(5), batch_size=2,
                          forward_mode=SimpleNamespace(is_target_verify=lambda: True),
                          spec_info=SimpleNamespace(draft_token_lens=torch.tensor([2, 3]), graph_draft_token_lens=None),
                          seq_lens=torch.tensor([12, 34]))
@@ -68,3 +68,6 @@ def test_shadow_forward_preserves_inplace_embedding_inputs(tmp_path, monkeypatch
     records = [json.loads(x) for x in next(tmp_path.glob("audit_*.jsonl")).read_text().splitlines()]
     assert records[0]["restored_hidden"]["bitwise_equal"]
     assert all(row["hidden"]["bitwise_equal"] for row in records[0]["requests"])
+    assert records[0]["isolation_hidden"]["bitwise_equal"]
+    tied = torch.ones(16, 64)
+    assert module.compare(tied, tied, logits=True)["top1_mismatches"] == 0

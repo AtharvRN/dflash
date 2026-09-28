@@ -34,8 +34,12 @@ def summarize(root):
             "block_sizes": sorted(set(b for r in rows for b in r["real_lengths"])),
             "independent_hidden": aggregate([s["hidden"] for r in rows for s in r["requests"]]),
             "independent_logits": aggregate([s["logits"] for r in rows for s in r["requests"] if "logits" in s]),
+            "independent_draft_tokens": {
+                "mismatches": sum(s.get("draft_tokens", {}).get("mismatches", 0) for r in rows for s in r["requests"]),
+                "tokens": sum(s.get("draft_tokens", {}).get("tokens", 0) for r in rows for s in r["requests"])},
         }
-        for field in ("same_batch_eager_hidden", "same_batch_eager_logits", "restored_hidden", "restored_logits"):
+        for field in ("same_batch_eager_hidden", "same_batch_eager_logits", "restored_hidden", "restored_logits",
+                      "isolation_hidden", "isolation_logits"):
             result[key][field] = aggregate([r[field] for r in rows if field in r])
     result["limits"] = ["not a complete correctness certificate", "not a throughput benchmark",
                         "no independent target-only transcript comparison yet",

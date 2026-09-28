@@ -38,12 +38,15 @@ def compare(actual, reference, logits=False):
               "bitwise_equal": bool(torch.equal(actual, reference))}
     if logits:
         top = a.topk(2, dim=-1)
+        actual_top1 = a.argmax(-1)
         ref = b.argmax(-1)
-        mismatch = top.indices[:, 0] != ref
+        # topk is not the verifier's argmax tie-breaking rule. Comparing topk's
+        # first index with argmax falsely reports differences for equal tensors.
+        mismatch = actual_top1 != ref
         result.update({"top1_mismatches": int(mismatch.sum()), "tokens": len(ref),
                        "mismatch_positions": mismatch.nonzero().flatten().tolist(),
                        "mismatch_top1_gaps": (top.values[:, 0]-top.values[:, 1])[mismatch].tolist(),
-                       "actual_top1_on_mismatch": top.indices[:, 0][mismatch].tolist(),
+                       "actual_top1_on_mismatch": actual_top1[mismatch].tolist(),
                        "reference_top1_on_mismatch": ref[mismatch].tolist()})
     return result
 
@@ -74,7 +77,7 @@ def batch_view(fb, rows, lengths, physical):
         input_embeds=fb.input_embeds.index_select(0, indices) if fb.input_embeds is not None else None)
 
 
-def audited_forward(runner, role):
+def audited_forward(runner, role, project=None):
     original = runner.forward
     checked = 0
 
@@ -104,6 +107,9 @@ def audited_forward(runner, role):
                   "batch_size": fb.batch_size, "real_lengths": real, "physical_lengths": physical,
                   "prefix_lengths": fb.seq_lens.tolist(), "graph_used": bool(out.can_run_graph),
                   "reference": "independent actual-B, same committed KV prefix", "requests": []}
+        graph_runner = getattr(runner, "decode_cuda_graph_runner", None)
+        record["captured_batch_size"] = (getattr(graph_runner, "bs", None) if out.can_run_graph else None)
+        record["input_tokens"] = int(fb.input_ids.numel())
         reference_inputs = copy.copy(fb)
         if saved_embeds is not None:
             record["input_embedding_mutation"] = compare(saved_embeds, fb.input_embeds)
@@ -112,6 +118,13 @@ def audited_forward(runner, role):
         offsets = [0]
         for size in physical:
             offsets.append(offsets[-1]+size)
+        if project is not None:
+            projection = torch.tensor([offsets[i]+j for i in range(fb.batch_size) for j in range(1, real[i])],
+                                      dtype=torch.int64, device=actual_hidden.device)
+            actual_draft_ids = project(actual_hidden.index_select(0, projection)).clone()
+            draft_offsets = [0]
+            for size in real:
+                draft_offsets.append(draft_offsets[-1]+size-1)
         try:
             for i in reversed(range(fb.batch_size)):
                 view = batch_view(reference_inputs, [i], real, physical)
@@ -121,15 +134,35 @@ def audited_forward(runner, role):
                        "hidden": compare(actual_hidden[begin:end], ref.logits_output.hidden_states)}
                 if actual_logits is not None:
                     row["logits"] = compare(actual_logits[begin:end], ref.logits_output.next_token_logits, logits=True)
+                if project is not None:
+                    ref_ids = project(ref.logits_output.hidden_states[1:]).clone()
+                    actual_ids = actual_draft_ids[draft_offsets[i]:draft_offsets[i+1]]
+                    row["draft_tokens"] = {"tokens": len(ref_ids),
+                                           "mismatches": int((actual_ids != ref_ids).sum())}
                 record["requests"].append(row)
-            if out.can_run_graph:
-                # Identical physical layout: isolate graph replay from ragged
-                # vs single-request floating-point shape effects.
-                view = batch_view(reference_inputs, list(range(fb.batch_size)), physical, physical)
-                ref = original(view)
-                record["same_batch_eager_hidden"] = compare(actual_hidden, ref.logits_output.hidden_states)
-                if actual_logits is not None:
-                    record["same_batch_eager_logits"] = compare(actual_logits, ref.logits_output.next_token_logits, logits=True)
+            # Identical physical layout isolates graphs from shape effects and
+            # supplies a matched reference for cross-request attention isolation.
+            view = batch_view(reference_inputs, list(range(fb.batch_size)), physical, physical)
+            ref = original(view)
+            record["same_batch_eager_hidden"] = compare(actual_hidden, ref.logits_output.hidden_states)
+            if actual_logits is not None:
+                record["same_batch_eager_logits"] = compare(actual_logits, ref.logits_output.next_token_logits, logits=True)
+            protected = checked % fb.batch_size
+            first, last = offsets[protected], offsets[protected]+real[protected]
+            protected_hidden = ref.logits_output.hidden_states[first:last].clone()
+            protected_logits = (ref.logits_output.next_token_logits[first:last].clone()
+                                if actual_logits is not None else None)
+            perturb = batch_view(reference_inputs, list(range(fb.batch_size)), physical, physical)
+            other = torch.ones_like(perturb.input_ids, dtype=torch.bool)
+            other[offsets[protected]:offsets[protected+1]] = False
+            perturb.input_ids[other] = (perturb.input_ids[other]+101) % 10000
+            if perturb.input_embeds is not None:
+                perturb.input_embeds[other] *= -1
+            changed = original(perturb)
+            record["isolation_protected_row"] = protected
+            record["isolation_hidden"] = compare(protected_hidden, changed.logits_output.hidden_states[first:last])
+            if protected_logits is not None:
+                record["isolation_logits"] = compare(protected_logits, changed.logits_output.next_token_logits[first:last], logits=True)
         finally:
             # Single-request shadows reuse the same suffix slots. Re-execute the
             # original batch to restore the actual batched KV and graph buffers.
@@ -148,6 +181,8 @@ def audited_forward(runner, role):
         # in the report and require diagnosis, never silently called parity.
         if any(r["hidden"]["relative_l2"] > 0.05 for r in record["requests"]):
             raise AssertionError("Large same-state packed-vs-independent discrepancy; inspect audit")
+        if not record["isolation_hidden"]["bitwise_equal"]:
+            raise AssertionError("Changing other requests changed the protected request; inspect isolation audit")
         return restored
 
     return forward
@@ -161,7 +196,11 @@ def install(module):
     @wraps(original_init)
     def initialize(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
-        self.draft_model_runner.forward = audited_forward(self.draft_model_runner, "draft")
+        def project(hidden):
+            return self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=hidden, lm_head=self.target_worker.model_runner.model.lm_head)
+
+        self.draft_model_runner.forward = audited_forward(self.draft_model_runner, "draft", project)
         self.target_worker.model_runner.forward = audited_forward(self.target_worker.model_runner, "target")
         emit({"kind": "installation", "worker": module.__file__,
               "worker_sha256": hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest(),
