@@ -26,6 +26,8 @@ def main():
     parser.add_argument("--modes", nargs="+", choices=["eager", "graph"], default=["eager", "graph"])
     parser.add_argument("--audit-forwards", type=int, default=8)
     parser.add_argument("--pattern", choices=["rotating", "fixed16"], default="rotating")
+    parser.add_argument("--deterministic", action="store_true",
+                        help="Use SGLang's existing batch-invariant mode as a correctness control, not a timing configuration")
     args = parser.parse_args()
     if args.output.exists():
         raise ValueError("Preserve previous evidence: output must be new")
@@ -88,6 +90,8 @@ def main():
                        "--cuda-graph-bs", "1", "2", "4", "8", "--disable-radix-cache", "--disable-piecewise-cuda-graph"]
             if mode == "eager":
                 launch += ["--disable-cuda-graph"]
+            if args.deterministic:
+                launch += ["--enable-deterministic-inference"]
             atomic_json(stage / "launch.json", launch)
             with (stage / "server.log").open("x") as log:
                 proc = subprocess.Popen(launch, stdout=log, stderr=subprocess.STDOUT)
