@@ -11,7 +11,6 @@ from concurrent.futures import ProcessPoolExecutor
 import copy
 import hashlib
 import json
-import multiprocessing as mp
 import os
 from pathlib import Path
 import shutil
@@ -20,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from types import SimpleNamespace
 
 import numpy as np
@@ -27,6 +27,11 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.audit_block_headroom import sha256, validate_states
 from scripts.collect_policy_granularity import atomic_json, CHECKPOINT_SHA
+from scripts.worker_diagnostics import (DiagnosticSpawnContext, controller_event,
+    process_resources, worker_event)
+
+
+DIAGNOSTICS_SOURCE = Path(__file__).with_name("worker_diagnostics.py")
 
 
 def inventory(root):
@@ -131,6 +136,7 @@ _WORKER = None
 def initialize_worker(config, gpu, warmup_row, ready, barrier):
     global _WORKER
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    worker_event("model_loading", gpu=gpu)
     import torch
     import transformers
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -165,6 +171,8 @@ def initialize_worker(config, gpu, warmup_row, ready, barrier):
     warm.reverse_check_states = warm.canonical_check_states = 0
     run_prompt(warm, warmup_row, target, draft, tokenizer, _WORKER[-1], 0)
     torch.cuda.synchronize()
+    worker_event("models_ready", resources=process_resources(),
+                 peak_allocated_mib=torch.cuda.max_memory_allocated()/2**20)
     ready.put({"pid": os.getpid(), "model_and_warmup_peak_mib": torch.cuda.max_memory_allocated()/2**20})
     barrier.wait(timeout=180)
 
@@ -174,21 +182,31 @@ def worker_prompt(row, count_before):
     import torch
     options, target, draft, tokenizer, policies = _WORKER
     started = time.monotonic()
-    batch, progress = run_prompt(options, row, target, draft, tokenizer, policies, count_before)
-    for state, _ in batch:
-        state["group"] = "train"
-    torch.cuda.synchronize()
-    return batch, progress, {"worker_pid": os.getpid(), "elapsed_s": time.monotonic()-started,
-                             "peak_allocated_mib": torch.cuda.max_memory_allocated()/2**20}
+    worker_event("prompt_started", task={"prompt_id": int(row["manifest_index"]),
+                                         "count_before": count_before}, resources=process_resources())
+    try:
+        batch, progress = run_prompt(options, row, target, draft, tokenizer, policies, count_before)
+        for state, _ in batch:
+            state["group"] = "train"
+        torch.cuda.synchronize()
+    except BaseException as exc:
+        worker_event("prompt_exception", error=repr(exc), traceback=traceback.format_exc(),
+                     resources=process_resources())
+        raise
+    execution = {"worker_pid": os.getpid(), "elapsed_s": time.monotonic()-started,
+                 "peak_allocated_mib": torch.cuda.max_memory_allocated()/2**20}
+    worker_event("prompt_finished", **execution, states=len(batch), resources=process_resources())
+    return batch, progress, execution
 
 
 def ready_ping():
     return os.getpid()
 
 
-def start_pool(workers, gpu, config, warmup_row):
+def start_pool(workers, gpu, config, warmup_row, diagnostics):
     require_idle(gpu)
-    ctx = mp.get_context("spawn")
+    ctx = DiagnosticSpawnContext(diagnostics)
+    controller_event(diagnostics, "pool_starting", workers=workers, gpu=gpu)
     ready, barrier = ctx.Queue(), ctx.Barrier(workers)
     pool = ProcessPoolExecutor(max_workers=workers, mp_context=ctx, initializer=initialize_worker,
         initargs=(config, gpu, warmup_row, ready, barrier))
@@ -197,9 +215,12 @@ def start_pool(workers, gpu, config, warmup_row):
         metadata = [ready.get(timeout=180) for _ in range(workers)]
         for future in checks:
             future.result(timeout=180)
-    except BaseException:
+    except BaseException as exc:
+        controller_event(diagnostics, "pool_startup_failed", tuple((pool._processes or {}).values()),
+                         error=repr(exc), traceback=traceback.format_exc())
         pool.shutdown(wait=True, cancel_futures=True)
         raise
+    controller_event(diagnostics, "pool_ready", tuple((pool._processes or {}).values()))
     return pool, metadata
 
 
@@ -235,7 +256,9 @@ def benchmark(args):
     args.output.mkdir(parents=True)
     results = []
     for workers in (1, 2, 4):
-        pool, worker_metadata = start_pool(workers, args.gpu, config, by_id[cohort[0][0]])
+        diagnostics = (args.diagnostics or args.output/"diagnostics")/f"workers_{workers}"
+        pool, worker_metadata = start_pool(workers, args.gpu, config, by_id[cohort[0][0]], diagnostics)
+        processes = tuple(pool._processes.values())
         samples, stop = [], threading.Event()
         def sample_gpu():
             while not stop.is_set():
@@ -258,11 +281,14 @@ def benchmark(args):
                 print("BENCH_PROMPT", workers, pid, rows, flush=True)
         except Exception as exc:
             error = repr(exc)
+            controller_event(diagnostics, "benchmark_failed", processes, error=error,
+                             traceback=traceback.format_exc())
         finally:
             elapsed = time.monotonic()-started
             stop.set()
             monitor.join(timeout=3)
             pool.shutdown(wait=True, cancel_futures=True)
+            controller_event(diagnostics, "pool_closed", processes, error=error)
         if not samples:
             raise RuntimeError("No GPU memory measurements")
         result = {"workers": workers, "prompts": len(cohort), "rows": rows, "eligible": eligible,
@@ -279,7 +305,8 @@ def benchmark(args):
     summary = {"source": str(args.source), "source_config_sha256": sha256(args.source/"config.json"),
         "source_audit": audit, "cohort_prompt_ids": [p for p, _ in cohort], "results": results,
         "selected_workers": selected, "sampler_sha256": sha256("scripts/diagnose_dflash_paired_lengths.py"),
-        "driver_sha256": sha256(__file__), "scope": "same GPU and matched prompts; collection throughput only, not serving speedup",
+        "driver_sha256": sha256(__file__), "diagnostics_sha256": sha256(DIAGNOSTICS_SOURCE),
+        "scope": "same GPU and matched prompts; collection throughput only, not serving speedup",
         "selection": "exact replay, <85% memory, >=10% gain; fewest workers within 5% of fastest eligible setting"}
     atomic_json(args.output/"summary.json", summary)
     print("BENCH_COMPLETE", json.dumps({"selected_workers": selected, "results": results}), flush=True)
@@ -295,6 +322,20 @@ def verified_copy(source, destination, digest=None):
     temporary.replace(destination)
 
 
+def recovery_elapsed(source):
+    """Repeated recovery consumes one original time allowance, not a new one."""
+    elapsed = []
+    for name in ("progress.json", "collection_summary.json"):
+        if (source/name).exists():
+            value = float(json.loads((source/name).read_text())["elapsed_s"])
+            if not np.isfinite(value) or value < 0:
+                raise ValueError("Invalid prior collection elapsed time")
+            elapsed.append(value)
+    if not elapsed:
+        raise ValueError("Missing prior collection elapsed time")
+    return max(elapsed)
+
+
 def collect(args):
     original, receipts, rows, progress, files, audit = inventory(args.source)
     messages = selected_messages(original)
@@ -302,6 +343,7 @@ def collect(args):
     if (bench["source_config_sha256"] != sha256(args.source/"config.json") or
             bench["sampler_sha256"] != sha256("scripts/diagnose_dflash_paired_lengths.py") or
             bench["driver_sha256"] != sha256(__file__) or
+            bench["diagnostics_sha256"] != sha256(DIAGNOSTICS_SOURCE) or
             bench["selected_workers"] != choose_workers(bench["results"])):
         raise ValueError("Benchmark does not bind to this recovery/source implementation")
     workers = bench["selected_workers"]
@@ -325,21 +367,25 @@ def collect(args):
     verified_copy(args.source/"config.json", args.output/"recovery_source_config.json")
     backup([args.output/"recovery_source_config.json"])
     config = copy.deepcopy(original)
+    diagnostics = args.diagnostics or args.backup.parent/"diagnostics"/"collection"
     config.update({"output": str(args.output), "backup": str(args.backup), "workers": workers,
         "execution": "independent single-request prompt workers on one GPU, same kernels/shapes per request",
         "recovery": {"source": str(args.source), "audit": audit, "source_files": files,
             "benchmark": str(args.benchmark), "benchmark_sha256": sha256(args.benchmark)},
-        "original_commit": original["commit"], "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-        "efficient_driver_sha256": sha256(__file__)})
+        "original_commit": original.get("original_commit", original["commit"]),
+        "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+        "efficient_driver_sha256": sha256(__file__), "diagnostics_sha256": sha256(DIAGNOSTICS_SOURCE),
+        "diagnostics_directory": str(diagnostics)})
     atomic_json(args.output/"config.json", config)
     backup([args.output/"config.json"])
     atomic_json(args.output/"recovery_audit.json", audit)
     backup([args.output/"recovery_audit.json"])
-    prior_elapsed = json.loads((args.source/"progress.json").read_text())["elapsed_s"]
+    prior_elapsed = recovery_elapsed(args.source)
     seconds_left = max(0, original["max_seconds"]-prior_elapsed)
     interrupted = []
     def handle_signal(number, frame):
         interrupted.append({"signal": number, "unix_time": time.time()})
+        controller_event(diagnostics, "controller_signal", number=number)
         print("STOP_REQUESTED: finish pending prompts and preserve evidence", number, flush=True)
     for number in (signal.SIGTERM, signal.SIGINT):
         signal.signal(number, handle_signal)
@@ -349,7 +395,8 @@ def collect(args):
     if eligible >= original["training_rows"] or not seconds_left:
         raise ValueError("No missing rows or remaining collection time")
     started = time.monotonic()
-    pool, metadata = start_pool(workers, args.gpu, config, messages[next_prompt])
+    pool, metadata = start_pool(workers, args.gpu, config, messages[next_prompt], diagnostics)
+    processes = tuple(pool._processes.values())
     print("RECOVERED_MODELS_READY", json.dumps({"workers": workers, "preserved_eligible": eligible,
         "preserved_prompts": len(receipts), "remaining_time_bound_s": seconds_left, "workers_ready": metadata}), flush=True)
     pending = deque()
@@ -404,12 +451,18 @@ def collect(args):
                 "gpu": gpu_state(args.gpu), "latest": status, "execution": execution}
             atomic_json(args.output/"progress.json", latest)
             backup([args.output/"progress.json"])
+            controller_event(diagnostics, "prompt_committed", prompt_id=pid, eligible=eligible)
             print(json.dumps(latest), flush=True)
     except BaseException as exc:
         fatal = repr(exc)
+        controller_event(diagnostics, "collection_failed", processes, error=fatal,
+                         traceback=traceback.format_exc(), eligible=eligible,
+                         uncommitted_prompt_ids=[int(r["manifest_index"]) for r, _ in pending],
+                         current_prompt_id=int(row["manifest_index"]) if "row" in locals() else None)
         raise
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
+        controller_event(diagnostics, "pool_closed", processes, error=fatal, eligible=eligible)
         summary = {"sample_complete": eligible >= original["training_rows"] and fatal is None and not interrupted,
             "prompts": len(receipts), "states": len(rows), "target_training_rows": original["training_rows"],
             "eligible_states": eligible, "elapsed_s": prior_elapsed+time.monotonic()-started,
@@ -418,7 +471,8 @@ def collect(args):
             "canonical_comparisons": sum(r["canonical_checked"] for r in rows),
             "reverse_checked_states": sum(r["reverse_order_checked"] for r in rows),
             "prompt_progress": progress, "signals": interrupted, "fatal_error": fatal,
-            "preserved_eligible": initial_eligible, "workers": workers}
+            "preserved_eligible": initial_eligible, "workers": workers,
+            "diagnostics_directory": str(diagnostics)}
         atomic_json(args.output/"receipts.json", receipts)
         atomic_json(args.output/"collection_summary.json", summary)
         backup([args.output/"receipts.json", args.output/"collection_summary.json"])
@@ -439,6 +493,7 @@ def main():
     p.add_argument("--backup", type=Path)
     p.add_argument("--benchmark", type=Path)
     p.add_argument("--benchmark-prompts", type=int, default=12)
+    p.add_argument("--diagnostics", type=Path, help="Durable task-scoped worker logs and resource snapshots")
     args = p.parse_args()
     if args.mode == "collect" and (args.backup is None or args.benchmark is None):
         p.error("Recovery requires --backup and --benchmark")

@@ -87,3 +87,61 @@ The original interrupted directory remains unchanged.
 
 Local benchmark artifact:
 /Users/atharvramesh/Projects/MLSys/dflash-headroom/outputs/actual_block_predictor_10k_recovered_20260928/benchmark/summary.json
+
+## Second failure and diagnostic restart
+
+The recovered run stopped at 2026-09-28 09:08:27 UTC (02:08:27 PDT), exit 1,
+after a worker disappeared and `ProcessPoolExecutor` raised `BrokenProcessPool`.
+The application log does not identify the signal, sender or an OOM. The account
+cannot see system kernel journal entries. The semaphore warning followed the
+worker failure and is not established as its cause. No training started.
+
+Read-only verification found 775 prompt receipts, 5,436 saved states and 5,408
+eligible training cycles. All 2,267 receipt/config/shard hashes and alignment
+checks passed, as did the three final metadata hash bindings. There were zero
+canonical disagreements. The resumed portion added 3,507 eligible cycles at
+approximately 1.84 cycles/s with four workers; the final GPU sample showed 100%
+utilization and 44,007 MiB used. These are collection measurements only.
+
+On the user's explicit request, add diagnostics and restart from this latest
+verified cache, not the original 1,901-row prefix. Use a new run directory and
+preserve both previous attempts. The collection/training protocol is unchanged.
+The wrapper accepts `SOURCE_CACHE` and repeats the matched 1/2/4-worker replay
+gate with the instrumented code before appending. The original four-hour
+collection allowance remains cumulative across attempts: use the larger saved
+progress/summary elapsed time, not a fresh four-hour budget.
+
+Diagnostics in `scripts/worker_diagnostics.py` use the same standard spawned
+processes and executor. Each worker writes a durable stdout/stderr/crash log and
+JSONL lifecycle/task events. Events include active prompt identity, host RSS,
+resource limits, and accessible Linux cgroup-v2 memory/OOM/pid counters. Parent
+events record exit codes BEFORE executor cleanup terminates peers, then final
+joined exit statuses; this distinguishes an already-dead worker from cleanup
+SIGTERMs. SIGTERM/SIGINT/SIGHUP are logged with a stack dump and retain their
+signal exit status. Fatal native faults use Python faulthandler. SIGKILL cannot
+be caught in the child, and exit -9 alone does not prove OOM or identify a sender.
+Cgroup counters can include other processes in a shared cgroup.
+
+Snapshots are tied to startup, prompt boundaries, errors and shutdown; there is
+no background monitoring service, automatic restart loop, or scheduler change.
+The short GPU sampler remains confined to the existing bounded benchmark.
+Diagnostics are stored on durable scratch, outside the numerical dataset cache.
+The benchmark binds both driver and diagnostic-module hashes. Incomplete or
+failed collection still blocks training.
+
+Planned new run:
+`/data/scratch/zekaili/atharv/dflash/runs/actual_block_predictor_10k_diagnostics_20260928`
+
+Important files beneath that root:
+
+- `diagnostics/collection/parent_lifecycle.jsonl`: spawn, pre-cleanup termination, final exit.
+- `diagnostics/collection/controller.jsonl`: controller resources, commits and failure context.
+- `diagnostics/collection/worker_<pid>.jsonl`: task identity, resources and caught signals/errors.
+- `diagnostics/collection/worker_<pid>.log`: worker stdout/stderr and fault stacks.
+- `cache/progress.json`: durable eligible-cycle progress.
+- `pipeline_exit.txt`: final wrapper exit status when the bounded batch ends.
+
+Local validation: 37 targeted tests pass, including normal spawned execution,
+Python exceptions, caught SIGTERM, and a disposable two-worker SIGKILL test that
+distinguishes the killed worker from the peer terminated during executor cleanup.
+Launch and GPU replay results are pending at the time of this code amendment.

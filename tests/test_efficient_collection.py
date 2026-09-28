@@ -7,7 +7,7 @@ import unittest
 import numpy as np
 
 from scripts.audit_block_headroom import sha256
-from scripts.efficient_collection import inventory, choose_workers, compare_replay, verified_copy
+from scripts.efficient_collection import inventory, choose_workers, compare_replay, verified_copy, recovery_elapsed
 
 
 def fixture(root):
@@ -31,6 +31,18 @@ def fixture(root):
 
 
 class EfficientCollectionTests(unittest.TestCase):
+    def test_repeated_recovery_uses_later_cumulative_elapsed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with self.assertRaisesRegex(ValueError, "Missing"):
+                recovery_elapsed(root)
+            (root/"progress.json").write_text(json.dumps({"elapsed_s": 3800}))
+            (root/"collection_summary.json").write_text(json.dumps({"elapsed_s": 3810}))
+            self.assertEqual(recovery_elapsed(root), 3810)
+            (root/"collection_summary.json").write_text(json.dumps({"elapsed_s": -1}))
+            with self.assertRaisesRegex(ValueError, "Invalid"):
+                recovery_elapsed(root)
+
     def test_partial_recovery_needs_no_final_manifest_and_preserves_unknown(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
