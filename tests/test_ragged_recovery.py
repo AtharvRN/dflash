@@ -61,7 +61,7 @@ def test_shadow_forward_preserves_inplace_embedding_inputs(tmp_path, monkeypatch
     monkeypatch.setattr(module, "batch_view", view)
     fb = SimpleNamespace(input_embeds=torch.ones(5, 4), input_ids=torch.arange(5), batch_size=2,
                          forward_mode=SimpleNamespace(is_target_verify=lambda: True),
-                         spec_info=SimpleNamespace(draft_token_lens=torch.tensor([2, 3]), graph_draft_token_lens=None),
+                         spec_info=SimpleNamespace(draft_token_num=3, draft_token_lens=torch.tensor([2, 3]), graph_draft_token_lens=None),
                          seq_lens=torch.tensor([12, 34]))
     result = module.audited_forward(SimpleNamespace(forward=original), "draft")(fb)
     assert torch.equal(result.logits_output.hidden_states, torch.full((5, 4), 11.0))

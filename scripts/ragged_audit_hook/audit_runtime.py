@@ -51,6 +51,17 @@ def compare(actual, reference, logits=False):
     return result
 
 
+def acceptance_summary(tokens, actual_logits, reference_logits):
+    def decision(logits):
+        pred = logits.argmax(-1)
+        accepted = int((tokens[1:] == pred[:-1]).int().cumprod(0).sum())
+        return accepted, int(pred[accepted])
+    actual, reference = decision(actual_logits), decision(reference_logits)
+    return {"actual_A": actual[0], "reference_A": reference[0],
+            "actual_bonus": actual[1], "reference_bonus": reference[1],
+            "same_emitted_tokens": actual == reference}
+
+
 def batch_view(fb, rows, lengths, physical):
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.speculative.dflash_info import DFlashRaggedVerifyInput
@@ -86,7 +97,7 @@ def audited_forward(runner, role, project=None):
         nonlocal checked
         spec = fb.spec_info
         should_check = (fb.forward_mode.is_target_verify() and
-                        getattr(spec, "draft_token_lens", None) is not None and
+                        getattr(spec, "draft_token_num", 0) > 0 and
                         fb.batch_size > 1 and checked < LIMIT)
         # DFlash's fused residual RMSNorm mutates the input-embedding buffer.
         # Preserve PRE-forward inputs; references made from fb afterwards are
@@ -97,9 +108,10 @@ def audited_forward(runner, role, project=None):
         if not should_check:
             return out
         checked += 1
-        real = spec.draft_token_lens.tolist()
-        physical = (spec.graph_draft_token_lens.tolist()
-                    if spec.graph_draft_token_lens is not None else real)
+        lens_tensor = getattr(spec, "draft_token_lens", None)
+        real = lens_tensor.tolist() if lens_tensor is not None else [int(spec.draft_token_num)]*fb.batch_size
+        graph_lens_tensor = getattr(spec, "graph_draft_token_lens", None)
+        physical = graph_lens_tensor.tolist() if graph_lens_tensor is not None else real
         actual_hidden = out.logits_output.hidden_states.detach().clone()
         actual_logits = (out.logits_output.next_token_logits.detach().clone()
                          if out.logits_output.next_token_logits is not None else None)
@@ -134,6 +146,8 @@ def audited_forward(runner, role, project=None):
                        "hidden": compare(actual_hidden[begin:end], ref.logits_output.hidden_states)}
                 if actual_logits is not None:
                     row["logits"] = compare(actual_logits[begin:end], ref.logits_output.next_token_logits, logits=True)
+                    row["acceptance"] = acceptance_summary(
+                        fb.input_ids[begin:end], actual_logits[begin:end], ref.logits_output.next_token_logits)
                 if project is not None:
                     ref_ids = project(ref.logits_output.hidden_states[1:]).clone()
                     actual_ids = actual_draft_ids[draft_offsets[i]:draft_offsets[i+1]]
@@ -147,6 +161,9 @@ def audited_forward(runner, role, project=None):
             record["same_batch_eager_hidden"] = compare(actual_hidden, ref.logits_output.hidden_states)
             if actual_logits is not None:
                 record["same_batch_eager_logits"] = compare(actual_logits, ref.logits_output.next_token_logits, logits=True)
+                record["same_batch_eager_acceptance"] = [acceptance_summary(
+                    fb.input_ids[offsets[i]:offsets[i]+real[i]], actual_logits[offsets[i]:offsets[i]+real[i]],
+                    ref.logits_output.next_token_logits[offsets[i]:offsets[i]+real[i]]) for i in range(fb.batch_size)]
             protected = checked % fb.batch_size
             first, last = offsets[protected], offsets[protected]+real[protected]
             protected_hidden = ref.logits_output.hidden_states[first:last].clone()

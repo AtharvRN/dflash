@@ -25,6 +25,7 @@ def main():
     parser.add_argument("--backend", choices=["flashinfer", "triton"], default="flashinfer")
     parser.add_argument("--modes", nargs="+", choices=["eager", "graph"], default=["eager", "graph"])
     parser.add_argument("--audit-forwards", type=int, default=8)
+    parser.add_argument("--pattern", choices=["rotating", "fixed16"], default="rotating")
     args = parser.parse_args()
     if args.output.exists():
         raise ValueError("Preserve previous evidence: output must be new")
@@ -67,8 +68,9 @@ def main():
                    "SGLANG_CACHE_DIR": str(cache / "sglang"), "SGLANG_DG_CACHE_DIR": str(cache / "deep_gemm"),
                    "TORCH_HOME": str(cache / "torch"), "TORCH_EXTENSIONS_DIR": str(cache / "extensions"),
                    "SGLANG_ENABLE_SPEC_V2": "1", "SGLANG_ENABLE_DFLASH_SPEC_V2": "1",
-                   "SGLANG_DFLASH_FORCE_RAGGED_BLOCK_PATTERN": "2,3,4,7,8,11,15,16",
-                   "DFLASH_RAGGED_AUDIT_DIR": str(stage), "DFLASH_RAGGED_AUDIT_ROTATE": "1",
+                   "SGLANG_DFLASH_FORCE_RAGGED_BLOCK_PATTERN": "16" if args.pattern == "fixed16" else "2,3,4,7,8,11,15,16",
+                   "DFLASH_RAGGED_AUDIT_DIR": str(stage), "DFLASH_RAGGED_AUDIT_ROTATE": "0" if args.pattern == "fixed16" else "1",
+                   "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY": "1",
                    "DFLASH_RAGGED_AUDIT_FORWARDS": str(args.audit_forwards), "SGLANG_DFLASH_TIMING": "0"}
             for k, v in env.items():
                 launch += ["-e", f"{k}={v}"]

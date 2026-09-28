@@ -37,6 +37,12 @@ def summarize(root):
             "independent_draft_tokens": {
                 "mismatches": sum(s.get("draft_tokens", {}).get("mismatches", 0) for r in rows for s in r["requests"]),
                 "tokens": sum(s.get("draft_tokens", {}).get("tokens", 0) for r in rows for s in r["requests"])},
+            "independent_acceptance": {
+                "request_cycles": sum("acceptance" in s for r in rows for s in r["requests"]),
+                "different_emissions": sum(not s["acceptance"]["same_emitted_tokens"] for r in rows for s in r["requests"] if "acceptance" in s)},
+            "same_batch_eager_acceptance": {
+                "request_cycles": sum(len(r.get("same_batch_eager_acceptance", [])) for r in rows),
+                "different_emissions": sum(not s["same_emitted_tokens"] for r in rows for s in r.get("same_batch_eager_acceptance", []))},
         }
         for field in ("same_batch_eager_hidden", "same_batch_eager_logits", "restored_hidden", "restored_logits",
                       "isolation_hidden", "isolation_logits"):
