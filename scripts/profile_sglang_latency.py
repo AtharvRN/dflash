@@ -245,7 +245,11 @@ def main():
                 container = "atharv-dflash-profile-" + hashlib.sha256(str(stage).encode()).hexdigest()[:12]
                 launch = ["docker", "run", "--name", container, "--network", "host", "--gpus", "device="+gpu["uuid"],
                           "--workdir", str(stage),
-                          "--shm-size", "8g", "--cpus", "12", "--user", f"{os.getuid()}:{os.getgid()}",
+                          # This public image has editable Python packages under
+                          # /root; retain its image user. Host code/data are RO,
+                          # and only this stage's output/cache directory is RW.
+                          "--shm-size", "8g", "--cpus", "12", "--cap-drop", "ALL",
+                          "--cap-add", "DAC_OVERRIDE", "--security-opt", "no-new-privileges",
                           "-v", f"{repo}:{repo}:ro", "-v", f"{ROOT}:{ROOT}:ro", "-v", f"{stage}:{stage}:rw",
                           "-e", "OMP_NUM_THREADS=4", "-e", "MKL_NUM_THREADS=4", "-e", "TOKENIZERS_PARALLELISM=false",
                           "-e", "LOGNAME=" + getpass.getuser(),

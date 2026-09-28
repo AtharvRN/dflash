@@ -17,6 +17,10 @@ Original target/draft model snapshot paths and revisions come from `models.json`
 BF16, greedy, thinking-off tokenized inputs, TP1, one explicitly idle GPU. Bind
 HTTP only to localhost. Use an isolated named container; stop only that container.
 No recurring monitor, broad pkill, GPU reset, model training, or cluster access.
+The image retains its built-in user because editable dependencies live under
+`/root`. Host code and model/data mounts are read-only; only the individual run's
+output/cache directory is writable. Drop capabilities except DAC_OVERRIDE and
+disable privilege escalation. Do not mount Docker's socket or unrelated paths.
 
 First measure fixed B8/B12/B16 at concurrency 16/32/64, plus C1 control. These
 profiling grid points do NOT restrict the predictor's integer action space.
