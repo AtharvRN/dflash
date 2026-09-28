@@ -25,10 +25,17 @@ def main():
     parser.add_argument("--backend", choices=["flashinfer", "triton"], default="flashinfer")
     parser.add_argument("--modes", nargs="+", choices=["eager", "graph"], default=["eager", "graph"])
     parser.add_argument("--audit-forwards", type=int, default=8)
+    parser.add_argument("--audit-min-bs", type=int, default=2)
+    parser.add_argument("--concurrency", type=int, choices=[8, 16, 32, 64], default=8)
+    parser.add_argument("--prompts", type=int, default=16)
+    parser.add_argument("--fixed-cap", type=int, default=0,
+                        help="Fixed output length with EOS ignored, for sustained-concurrency stress only")
     parser.add_argument("--pattern", choices=["rotating", "fixed16"], default="rotating")
     parser.add_argument("--deterministic", action="store_true",
                         help="Use SGLang's existing batch-invariant mode as a correctness control, not a timing configuration")
     args = parser.parse_args()
+    if not 2 <= args.audit_min_bs <= args.concurrency or not 0 <= args.fixed_cap <= 256:
+        raise ValueError("Invalid bounded audit/stress settings")
     if args.output.exists():
         raise ValueError("Preserve previous evidence: output must be new")
     lock = (ROOT / f"gpu_{args.gpu}_actual_block.lock").open("a")
@@ -39,7 +46,9 @@ def main():
     source = args.output / "source"
     restore(repo / "vendor/sglang_ragged_20260723", source)
     models = json.loads((ROOT / "models.json").read_text())
-    prompts = load_workload(ROOT / "runs/policy_granularity_20260927/cache")[:16]
+    prompts = load_workload(ROOT / "runs/policy_granularity_20260927/cache")[:args.prompts]
+    if len(prompts) < args.prompts:
+        raise ValueError("Not enough audited development prompts")
     atomic_json(args.output / "workload.json", prompts)
     atomic_json(args.output / "config.json", {"gpu": gpu, "image": IMAGE, "models": models,
                 "code_commit": command(["git", "rev-parse", "HEAD"], cwd=repo).strip(),
@@ -74,6 +83,7 @@ def main():
                    "DFLASH_RAGGED_AUDIT_DIR": str(stage), "DFLASH_RAGGED_AUDIT_ROTATE": "0" if args.pattern == "fixed16" else "1",
                    "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY": "1",
                    "DFLASH_RAGGED_AUDIT_FORWARDS": str(args.audit_forwards), "SGLANG_DFLASH_TIMING": "0"}
+            env["DFLASH_RAGGED_AUDIT_MIN_BATCH"] = str(args.audit_min_bs)
             for k, v in env.items():
                 launch += ["-e", f"{k}={v}"]
             launch += ["--entrypoint", "python", IMAGE, "-m", "sglang.launch_server",
@@ -85,9 +95,11 @@ def main():
                        "--host", "127.0.0.1", "--port", str(port), "--tp-size", "1", "--dtype", "bfloat16",
                        "--random-seed", "934",
                        "--attention-backend", args.backend, "--speculative-draft-attention-backend", args.backend,
-                       "--mem-fraction-static", "0.60", "--max-running-requests", "8",
-                       "--max-total-tokens", "32768", "--context-length", "4096", "--cuda-graph-max-bs", "8",
-                       "--cuda-graph-bs", "1", "2", "4", "8", "--disable-radix-cache", "--disable-piecewise-cuda-graph"]
+                       "--mem-fraction-static", "0.60", "--max-running-requests", str(args.concurrency),
+                       "--max-total-tokens", str(min(131072, args.concurrency*4096)),
+                       "--context-length", "4096", "--cuda-graph-max-bs", str(args.concurrency),
+                       "--cuda-graph-bs", *[str(n) for n in (1, 2, 4, 8, 16, 32, 64) if n <= args.concurrency],
+                       "--disable-radix-cache", "--disable-piecewise-cuda-graph"]
             if mode == "eager":
                 launch += ["--disable-cuda-graph"]
             if args.deterministic:
@@ -103,9 +115,10 @@ def main():
 
                         def send(pair):
                             i, item = pair
-                            cap = [1, 7, 16, 63, 96, 32, 8, 64][i % 8]
+                            cap = args.fixed_cap or [1, 7, 16, 63, 96, 32, 8, 64][i % 8]
                             response = requests.post(base + "/generate", json={"input_ids": item["input_ids"],
-                                "sampling_params": {"temperature": 0, "top_k": 1, "max_new_tokens": cap},
+                                "sampling_params": {"temperature": 0, "top_k": 1, "max_new_tokens": cap,
+                                                    "ignore_eos": bool(args.fixed_cap)},
                                 "return_logprob": False}, timeout=240)
                             response.raise_for_status()
                             data = response.json()
@@ -114,7 +127,7 @@ def main():
                                 raise AssertionError(f"Invalid terminal/output count {count}, cap={cap}")
                             return {"prompt_id": item["prompt_id"], "cap": cap, "response": data}
 
-                        with ThreadPoolExecutor(max_workers=8) as pool:
+                        with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
                             results = list(pool.map(send, enumerate(items)))
                         atomic_json(stage / f"responses_{repeat}.json", results)
                         print(json.dumps({"mode": mode, "repeat": repeat, "responses": len(results)}), flush=True)

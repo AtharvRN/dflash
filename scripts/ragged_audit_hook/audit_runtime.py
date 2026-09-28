@@ -18,6 +18,7 @@ import torch
 
 ROOT = Path(os.environ["DFLASH_RAGGED_AUDIT_DIR"])
 LIMIT = int(os.environ.get("DFLASH_RAGGED_AUDIT_FORWARDS", "12"))
+MIN_BATCH = int(os.environ.get("DFLASH_RAGGED_AUDIT_MIN_BATCH", "2"))
 
 
 def emit(row):
@@ -98,7 +99,7 @@ def audited_forward(runner, role, project=None):
         spec = fb.spec_info
         should_check = (fb.forward_mode.is_target_verify() and
                         getattr(spec, "draft_token_num", 0) > 0 and
-                        fb.batch_size > 1 and checked < LIMIT)
+                        fb.batch_size >= MIN_BATCH and checked < LIMIT)
         # DFlash's fused residual RMSNorm mutates the input-embedding buffer.
         # Preserve PRE-forward inputs; references made from fb afterwards are
         # not same-state controls, even though token IDs/KV prefix are identical.
