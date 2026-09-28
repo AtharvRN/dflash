@@ -19,3 +19,17 @@ def test_distribution_small_samples():
     assert distribution([]) is None
     assert distribution([3])["stdev"] == 0
     assert distribution([3, 1, 2])["median"] == 2
+
+
+def test_repeated_upkeep_nested_and_top_level():
+    names = ["decode_cycle", "draft_and_verify_prepare", "draft_kv_upkeep", "draft_forward",
+             "draft_projection_argmax", "target_verify_prepare", "target_forward",
+             "acceptance_and_target_kv_commit", "draft_kv_upkeep"]
+    times = [21, 9, 1, 4, 2, 1, 8, 2, 1]
+    parents = [None, 0, 1, 1, 1, 1, 0, 0, 0]
+    row = {"spans": [{"name": n, "parent": p, "stream_elapsed_ms": t}
+                     for n, p, t in zip(names, parents, times)]}
+    values, total = decompose(row)
+    assert values["draft_kv_upkeep"] == 2
+    assert values["draft_setup_allocation"] == 1
+    assert sum(values.values()) == total == 21

@@ -12,6 +12,7 @@ from pathlib import Path
 import random
 import socket
 import statistics
+import struct
 import subprocess
 import time
 
@@ -55,18 +56,19 @@ def distribution(values):
 def decompose(record, field="stream_elapsed_ms"):
     spans = record["spans"]
     children = defaultdict(float)
-    names = {}
+    names = defaultdict(list)
     for i, item in enumerate(spans):
         if item["parent"] is not None:
             children[item["parent"]] += item[field]
-        if item["name"] in names:
-            raise ValueError("Unexpected repeated component in one decode cycle")
-        names[item["name"]] = i
+        names[item["name"]].append(i)
     values = {}
     for label, (name, exclusive) in COMPONENTS.items():
-        i = names[name]
-        values[label] = spans[i][field] - (children[i] if exclusive else 0.0)
-    total = spans[names["decode_cycle"]][field]
+        if not names[name]:
+            raise ValueError("Missing component " + name)
+        values[label] = sum(spans[i][field] - (children[i] if exclusive else 0.0) for i in names[name])
+    if len(names["decode_cycle"]) != 1:
+        raise ValueError("Expected one decode-cycle root")
+    total = spans[names["decode_cycle"][0]][field]
     if abs(sum(values.values()) - total) > 1e-5:
         raise ValueError("Non-disjoint component accounting")
     return values, total
@@ -124,10 +126,15 @@ def load_workload(cache):
         if state["group"] != "assessment":
             continue
         ids = state["prefix_token_ids"]
-        if len(ids) != state["prefix_length"]:
+        if len(ids) != state["prefix_length"] + 1:
             raise ValueError("Prefix length mismatch")
-        prompts.append({"prompt_id": pid, "input_ids": ids,
-                        "prefix_sha256": state["prefix_sha256"]})
+        digest = hashlib.sha256(struct.pack(f"<{len(ids)}q", *ids)).hexdigest()
+        if digest != state["prefix_sha256"]:
+            raise ValueError("Saved prefix/anchor hash mismatch")
+        # Saved state includes the known anchor. Prefill only the committed
+        # prompt and let the serving target generate that anchor itself.
+        prompts.append({"prompt_id": pid, "input_ids": ids[:-1], "saved_anchor": ids[-1],
+                        "prefix_with_anchor_sha256": state["prefix_sha256"]})
     random.Random(930).shuffle(prompts)
     if len(prompts) < 64:
         raise ValueError("Need at least 64 audited development prompts")
@@ -239,6 +246,7 @@ def main():
                           "--shm-size", "8g", "--cpus", "12", "--user", f"{os.getuid()}:{os.getgid()}",
                           "-v", f"{repo}:{repo}:ro", "-v", f"{ROOT}:{ROOT}:ro", "-v", f"{stage}:{stage}:rw",
                           "-e", "OMP_NUM_THREADS=4", "-e", "MKL_NUM_THREADS=4", "-e", "TOKENIZERS_PARALLELISM=false",
+                          "-e", "NVIDIA_TF32_OVERRIDE=0",
                           "-e", "HF_HUB_OFFLINE=1", "-e", "PYTHONDONTWRITEBYTECODE=1",
                           "-e", f"HF_HOME={ROOT}/hf", "-e", f"XDG_CACHE_HOME={cache}",
                           "-e", f"TRITON_CACHE_DIR={cache}/triton", "-e", f"TORCHINDUCTOR_CACHE_DIR={cache}/inductor",
