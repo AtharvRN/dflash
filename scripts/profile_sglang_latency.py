@@ -180,6 +180,11 @@ def check_gpu(index):
     return dict(zip(["index", "uuid", "name", "memory_used_mib", "memory_total_mib", "utilization", "driver"], fields))
 
 
+def gpu_telemetry(index):
+    fields = "timestamp,pstate,clocks.sm,clocks.mem,temperature.gpu,power.draw,memory.used,utilization.gpu"
+    return command(["nvidia-smi", f"--id={index}", "--query-gpu="+fields, "--format=csv"])
+
+
 def wait_ready(base, container, log_path, timeout=720):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -216,6 +221,8 @@ def main():
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     gpu = check_gpu(args.gpu)
     args.output.mkdir(parents=True)
+    shared_cache = args.output / "runtime_cache"
+    shared_cache.mkdir()
     repo = Path(__file__).resolve().parents[1]
     prompts = load_workload(ROOT / "runs/policy_granularity_20260927/cache")
     models = json.loads((ROOT / "models.json").read_text())
@@ -235,8 +242,7 @@ def main():
                     raise TimeoutError("Bounded study deadline reached")
                 stage = args.output / f"{mode}_b{block}"
                 stage.mkdir()
-                cache = stage / "runtime_cache"
-                cache.mkdir()
+                cache = shared_cache
                 log_path = stage / "server.log"
                 with socket.socket() as sock:
                     sock.bind(("127.0.0.1", 0))
@@ -251,6 +257,7 @@ def main():
                           "--shm-size", "8g", "--cpus", "12", "--cap-drop", "ALL",
                           "--cap-add", "DAC_OVERRIDE", "--security-opt", "no-new-privileges",
                           "-v", f"{repo}:{repo}:ro", "-v", f"{ROOT}:{ROOT}:ro", "-v", f"{stage}:{stage}:rw",
+                          "-v", f"{cache}:{cache}:rw",
                           "-e", "OMP_NUM_THREADS=4", "-e", "MKL_NUM_THREADS=4", "-e", "TOKENIZERS_PARALLELISM=false",
                           "-e", "LOGNAME=" + getpass.getuser(),
                           "-e", "NVIDIA_TF32_OVERRIDE=0",
@@ -300,7 +307,9 @@ def main():
                                     response.raise_for_status()
                                 count = max(concurrency, 4) if args.smoke else (8 if concurrency == 1 else 6*concurrency)
                                 cap = 32 if args.smoke else args.max_new_tokens
+                                before = gpu_telemetry(args.gpu)
                                 result = run_requests(base, prompts, concurrency, count, cap)
+                                result["gpu_before"], result["gpu_after"] = before, gpu_telemetry(args.gpu)
                                 atomic_json(stage / f"{label}.json", result)
                                 results.append({"label": label, **{k:v for k,v in result.items() if k != "requests"}})
                                 atomic_json(args.output / "progress.json", {"results": results, "elapsed_s": time.monotonic()-started})
