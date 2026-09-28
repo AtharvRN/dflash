@@ -244,7 +244,7 @@ def main():
         "| Policy | Setting | Mean accepted | Mean draft budget | Aggregate ratio | Retention |",
         "|---|---:|---:|---:|---:|---:|"]
     for name, point in results["0.96"].items():
-        setting = f"B{point['setting']+1}" if name == "fixed" else f"alpha={point['setting']:.3f}"
+        setting = f"B{point['setting']+1}" if name == "fixed" else f"alpha={point['setting']:.12g}"
         lines.append(f"| {name} | {setting} | {point['mean_accepted']:.4f} | {point['mean_budget']:.4f} | {point['aggregate_accept_ratio']:.5f} | {100*point['retention']:.3f}% |")
     lines += ["", "## Uncertainty", "", "```json", json.dumps(uncertainty, indent=2), "```", "",
               "## Limitations", ""] + ["- "+s for s in summary["limitations"]]
