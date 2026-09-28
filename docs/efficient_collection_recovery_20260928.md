@@ -65,3 +65,25 @@ pipeline runs unchanged. The frozen baseline and fixed evaluation remain intact.
 - Durable data: recovery run/cache
 - Training results: recovery run/training
 - Single bounded batch: scripts/run_efficient_recovery.sh
+
+## Measured gate and restart
+
+Implementation commit: 14ab486. All 30 targeted tests passed locally and on the
+workstation. GPU 4 benchmarked the same 12 prompts / 95 states at each setting:
+
+| Workers | Eligible cycles/s | Timed seconds | Mean GPU utilization | Sampled peak MiB |
+|---|---:|---:|---:|---:|
+| 1 | 0.97861 | 97.076 | 54.96% | 10,805 |
+| 2 | 1.67474 | 56.725 | 94.39% | 20,872 |
+| 4 | 1.81244 | 52.415 | 98.11% | 41,503 |
+
+All three settings matched every stored record and fused feature exactly.
+Four workers were selected by the predeclared rule: approximately 1.85x the
+single-worker collection rate on this matched sample. This is a small collection
+benchmark, not a serving or predictor speedup. It excludes model load/warmup.
+The single bounded recovery-and-training batch restarted collection on GPU 4
+with the 1,901 eligible rows preserved; final collection/training is still pending.
+The original interrupted directory remains unchanged.
+
+Local benchmark artifact:
+/Users/atharvramesh/Projects/MLSys/dflash-headroom/outputs/actual_block_predictor_10k_recovered_20260928/benchmark/summary.json
