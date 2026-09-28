@@ -24,3 +24,11 @@ def test_short_prefix_is_not_falsely_padded_with_observations():
 
 def test_hash_includes_the_known_anchor():
     assert digest_bytes(np.array([1, 2, 3], dtype=np.int64)) != digest_bytes(np.array([1, 2, 4], dtype=np.int64))
+
+
+def test_survival_score_does_not_invent_failure_after_cap():
+    from scripts.probe_verifier_survival import score_rows
+    score, survival = score_rows(np.full((3, 15), .5), np.array([0, 3, 15]))
+    np.testing.assert_allclose(score['nll'], np.log(2) * np.array([1, 4, 15]))
+    assert np.all(np.diff(survival, axis=1) <= 0)
+    np.testing.assert_allclose(survival[:, 0], .5)
