@@ -6,7 +6,7 @@ The collector never trains or selects a predictor.
 from __future__ import annotations
 
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict
 import hashlib
 import json
 import os
@@ -23,6 +23,37 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.audit_block_headroom import sha256, validate_states
 
 CHECKPOINT_SHA = "84a37d00f61b1c8ae5ecd76e1ad49b4cd00850613e783edf72ecdf875663af35"
+
+
+def select_training_groups(manifest, split_dir, seed, limit):
+    """Uniform canonical training prompts; exclude cross-split exact duplicates."""
+    train = set(map(int, json.loads((Path(split_dir)/"train_prompt_ids.json").read_text())["train_prompt_ids"]))
+    val = set(map(int, json.loads((Path(split_dir)/"val_prompt_ids.json").read_text())["val_prompt_ids"]))
+    if train & val or limit < 1:
+        raise ValueError("Invalid training selection/split")
+    rows, seen, groups = [], set(), defaultdict(set)
+    with Path(manifest).open() as stream:
+        for line in stream:
+            row = json.loads(line)
+            pid = int(row["manifest_index"])
+            if pid in seen:
+                raise ValueError("Duplicate manifest prompt")
+            seen.add(pid)
+            digest = hashlib.sha256(json.dumps(row["messages"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            group = "train" if pid in train else "validation" if pid in val else "other"
+            groups[digest].add(group)
+            if group == "train":
+                rows.append({**row, "group": "train", "content_sha256": digest})
+    unique, eligible = set(), []
+    for row in rows:
+        digest = row["content_sha256"]
+        if groups[digest] == {"train"} and digest not in unique:
+            eligible.append(row)
+            unique.add(digest)
+    random.Random(seed).shuffle(eligible)
+    if len(eligible) < limit:
+        raise ValueError("Insufficient unique canonical training prompts")
+    return eligible[:limit]
 
 
 def select_groups(manifest, pilot_manifest, split_dir, seed, limit=0):
@@ -76,14 +107,19 @@ def main():
     p.add_argument("--max-prompt-tokens", type=int, default=2048)
     p.add_argument("--max-seconds", type=int, default=1800)
     p.add_argument("--seed", type=int, default=928)
+    p.add_argument("--training-rows", type=int, default=0,
+                   help="Training-only mode: stop after this many eligible rows; finish the last prompt")
     args = p.parse_args()
     if args.output.exists() or args.backup.exists():
         raise ValueError("Refusing existing experiment destinations")
-    if min(args.states_per_prompt, args.max_seconds) < 1 or args.max_new_tokens < 32 or args.limit_prompts < 0:
+    if min(args.states_per_prompt, args.max_seconds) < 1 or args.max_new_tokens < 32 or min(args.limit_prompts, args.training_rows) < 0:
         raise ValueError("Invalid limits")
+    if args.training_rows and args.limit_prompts < 1:
+        raise ValueError("Training collection requires an explicit prompt bound")
     if sha256(args.checkpoint) != CHECKPOINT_SHA:
         raise ValueError("Not the agreed frozen 100k MLP checkpoint")
-    selected = select_groups(args.manifest, args.pilot_manifest, args.split_dir, args.seed, args.limit_prompts)
+    selected = (select_training_groups(args.manifest, args.split_dir, args.seed, args.limit_prompts)
+                if args.training_rows else select_groups(args.manifest, args.pilot_manifest, args.split_dir, args.seed, args.limit_prompts))
     used = subprocess.check_output(["nvidia-smi", f"--id={args.gpu}", "--query-gpu=memory.used", "--format=csv,noheader,nounits"], text=True)
     if int(used.strip()) > 1024:
         raise RuntimeError("GPU is occupied; no inference launched")
@@ -106,6 +142,8 @@ def main():
     models = json.loads(args.models.read_text())
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
     config.update({"models": models, "checkpoint_sha256": CHECKPOINT_SHA,
+        "collection_kind": "training" if args.training_rows else "evaluation",
+        "prompt_sampling": "uniform shuffled canonical training prompts, exact cross-split content duplicates excluded" if args.training_rows else "unchanged fixed pilot validation groups",
         "prompt_ids": [int(r["manifest_index"]) for r in selected],
         "prompt_groups": {str(r["manifest_index"]): r["group"] for r in selected},
         "prompt_content_hashes": {str(r["manifest_index"]): r["content_sha256"] for r in selected},
@@ -113,7 +151,7 @@ def main():
         "torch": torch.__version__, "transformers": transformers.__version__,
         "gpu_name": torch.cuda.get_device_name(), "tf32": False, "dtype": "bfloat16", "attention": "sdpa",
         "temperature": 0, "thinking": False,
-        "scope": "actual B2-B16 on common B16 reference states; development evaluation, NOT closed-loop or throughput",
+        "scope": "actual B2-B16 on common B16 reference states; " + ("canonical training data" if args.training_rows else "development evaluation") + ", NOT closed-loop or throughput",
         "feature": "latest pre-draft hidden_norm(fc(target_hidden)); separate causal fusion replay, FP16 storage",
         "request_rule": "use cycle-zero feature even if that outcome row is excluded; never use a later state as the request input",
         "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
@@ -153,6 +191,8 @@ def main():
     started, receipts, rows, progress = time.monotonic(), [], [], []
     print("MODELS_READY", json.dumps(config["group_prompts"]), flush=True)
     for i, row in enumerate(selected):
+        if args.training_rows and sum(r["eligible"] for r in rows) >= args.training_rows:
+            break
         if time.monotonic()-started > args.max_seconds:
             print("TIME_BOUND: preserving partial evidence", flush=True)
             break
@@ -187,7 +227,9 @@ def main():
         atomic_json(args.output/"progress.json", latest)
         backup([args.output/"progress.json"])
         print(json.dumps(latest), flush=True)
-    summary = {"sample_complete": len(receipts) == len(selected), "prompts": len(receipts), "states": len(rows),
+    reached = sum(r["eligible"] for r in rows) >= args.training_rows if args.training_rows else len(receipts) == len(selected)
+    summary = {"sample_complete": reached, "prompts": len(receipts), "states": len(rows),
+        "target_training_rows": args.training_rows,
         "eligible_states": sum(r["eligible"] for r in rows), "elapsed_s": time.monotonic()-started,
         "group_states": dict(Counter(r["group"] for r in rows if r["eligible"])),
         "canonical_disagreements": sum(r["canonical_disagreements"] for r in rows),
