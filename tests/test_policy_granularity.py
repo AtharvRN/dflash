@@ -47,6 +47,14 @@ class GranularityTests(unittest.TestCase):
                 feasible = [p["mean_budget"] for p in curves[name] if p["retention"] >= float(target)-1e-12]
                 self.assertEqual(point["mean_budget"], min(feasible))
 
+    def test_exact_calibration_resolves_near_one_grid_jump(self):
+        s = np.array([[.5**k for k in range(1, 16)]])
+        actual = np.minimum(np.arange(1, 16)[None], 13)
+        grid, _ = select_operating_points(actual, s, s, targets=(.96,))
+        exact, _ = select_operating_points(actual, s, s, targets=(.96,), exact=True)
+        self.assertEqual(grid["0.96"]["request"]["mean_budget"], 15)
+        self.assertEqual(exact["0.96"]["request"]["mean_budget"], 13)
+
     def test_paired_identical_policies_have_zero_difference(self):
         a = np.minimum(np.arange(1, 16)[None], np.array([3, 5, 7, 15])[:, None])
         d = np.full(4, 14)

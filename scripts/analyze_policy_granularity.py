@@ -46,12 +46,33 @@ def metrics(actual, budgets):
         "block_histogram": {str(b): int((budgets == b-1).sum()) for b in range(2, 17)}}
 
 
-def select_operating_points(actual, cycle_s, request_s, targets=(.90, .95, .96, .98, 1.0)):
+def calibration_breakpoints(survival):
+    """Every decision transition of the FP64 alpha rule on calibration inputs.
+
+    Avoid a coarse alpha grid spuriously jumping straight from .999 to B16.
+    No acceptance labels or assessment inputs enter candidate construction.
+    """
+    cumulative = np.asarray(survival, dtype=np.float64).cumsum(1)
+    total = cumulative[:, -1:]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        transitions = cumulative[:, :-1]/total
+    # Find the first representable alpha for which prefix expectation is smaller
+    # than alpha * total, accounting for rounding of that multiplication.
+    for _ in range(4):
+        transitions = np.where(transitions*total <= cumulative[:, :-1],
+                               np.nextafter(transitions, np.inf), transitions)
+    take = np.isfinite(transitions) & (transitions >= .5) & (transitions < 1)
+    if np.any(take & (transitions*total <= cumulative[:, :-1])):
+        raise ValueError("Unresolved numerical alpha transition")
+    return np.unique(np.concatenate((np.linspace(.5, 1, 501), transitions[take])))
+
+
+def select_operating_points(actual, cycle_s, request_s, targets=(.90, .95, .96, .98, 1.0), *, exact=False):
     """Only calibration rows may be passed to this function."""
     curves = {}
     for name, s in (("fixed", None), ("request", request_s), ("cycle", cycle_s)):
         points = []
-        settings = range(1, 16) if name == "fixed" else np.linspace(.5, 1, 501)
+        settings = range(1, 16) if name == "fixed" else (calibration_breakpoints(s) if exact else np.linspace(.5, 1, 501))
         for setting in settings:
             d = np.full(len(actual), setting, dtype=int) if s is None else budgets_from_survival(s, float(setting))
             points.append({"setting": int(setting) if s is None else float(setting), **metrics(actual, d)})
@@ -143,6 +164,8 @@ def main():
     p.add_argument("--cache", type=Path, required=True)
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--exact-calibration-breakpoints", action="store_true",
+                   help="Exploratory grid-resolution sensitivity; preserve the primary analysis separately")
     args = p.parse_args()
     if args.output.exists():
         raise ValueError("Refusing existing analysis destination")
@@ -181,7 +204,7 @@ def main():
     cal, assess = eligible & (group == "calibration"), eligible & (group == "assessment")
     if not cal.any() or not assess.any() or set(prompt[cal]) & set(prompt[assess]):
         raise ValueError("Invalid calibration/assessment partition")
-    selected, cal_curves = select_operating_points(actual[cal], survival[cal], request_s[cal])
+    selected, cal_curves = select_operating_points(actual[cal], survival[cal], request_s[cal], exact=args.exact_calibration_breakpoints)
     args.output.mkdir(parents=True)
     # Persist frozen calibration choices before evaluating any assessment outcomes.
     atomic_json(args.output/"calibration.json", {"selected": selected, "curves": cal_curves})
@@ -202,6 +225,7 @@ def main():
     summary = {"scope": config["scope"], "checkpoint": str(args.checkpoint), "checkpoint_sha256": CHECKPOINT_SHA,
         "checkpoint_training": "100k historical cycle rows; frozen 1,478,415-parameter last-fused MLP, epoch 4",
         "head_inference": "CPU FP32; no PCA or feature normalization; dropout disabled",
+        "calibration_search": "exploratory exact decision breakpoints from calibration inputs" if args.exact_calibration_breakpoints else "preregistered .001 alpha grid",
         "cache": str(args.cache), "cache_config_sha256": sha256(args.cache/"config.json"),
         "counts": {g: {"rows": int(m.sum()), "prompts": len(np.unique(prompt[m]))}
                    for g, m in (("calibration", cal), ("assessment", assess))},

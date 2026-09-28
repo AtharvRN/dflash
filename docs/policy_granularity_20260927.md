@@ -53,3 +53,14 @@ FP32 for offline scoring with dropout disabled. The collector saves a separate
 causal `hidden_norm(fc(latest_target_features))` replay, not a same-forward hook.
 If a material advantage is established, a separate bounded closed-loop test is
 needed before any serving/runtime claim. No recurring monitor is created.
+
+## Post-run calibration-resolution check
+
+The primary .001-grid run completed first and is preserved unchanged. Its
+request policy chose alpha=1: calibration retention at .999 was only 93.58%,
+and alpha=1 forces every request to B16. This identifies a possible grid artifact,
+not proof that request-level information is absent. A separately named exploratory
+analysis enumerates every representable decision transition using calibration
+survival curves only, with unchanged minimum-budget/retention selection. No
+assessment outcomes select thresholds, and no weights or GPU outcomes change.
+This is a post-hoc robustness check, not a replacement for the primary result.
