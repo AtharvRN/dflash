@@ -67,6 +67,10 @@ There is no recurring monitor or automatic restart.
 - One warmup and two measured waves per cell; 256 output tokens, greedy, EOS
   ignored to sustain a bounded stress workload. HTTP wall time includes prefill
   and drain. It is not natural-workload task throughput.
+- C64 uses the first 64 selected prompts; C128 uses all 128. B8/B16 and clean/event
+  comparisons have identical input identities within each C/length cell. The
+  across-C comparison is a nested input cohort, not an identical-request-set
+  concurrency ablation; do not conflate these two comparisons.
 - Same 128 canonical-training message identities for both pairs; model-specific
   tokenizer/chat wrapper, thinking disabled where supported. Truncate only the
   user body to reach the specified total input length. Saved assistant answers
@@ -82,6 +86,9 @@ There is no recurring monitor or automatic restart.
   Instrumentation replaces existing v2 timer boundaries with non-synchronizing
   CUDA events; runtime source is not patched. Existing native scalar syncs
   remain in both configurations. CUDA stream elapsed time is not kernel time.
+  The new hook decomposes the decode worker only. Prefill, client/scheduler work
+  and bookkeeping outside that worker remain included in HTTP wall time but are
+  not separately attributed; this is not a complete end-to-end kernel profile.
 - Report actual full-C occupancy and actual device-side prefix lengths,
   component distributions, graph use, and accepted drafts. A requested C128
   alone is not evidence of full-C128 execution. Cells with fewer than ten
@@ -104,10 +111,11 @@ Free storage after staging: 237,069,504,512 bytes (about 220.8 GiB).
 | Drafter | z-lab/Qwen3-Coder-30B-A3B-DFlash | `98ca0e3e2e6a372f2789d3a5e146566194084317` |
 
 Staging helper: `scripts/prepare_moe_screen_models.py`, first deployed at
-`cc66f84`. Full-screen launch code: `4654d93`. Root:
-`/data/scratch/zekaili/atharv/dflash/runs/fixed_regime_screen_v3_20260928`.
+`cc66f84`. Workspace-adjusted retry code: `8645c2f`. Active retry root:
+`/data/scratch/zekaili/atharv/dflash/runs/fixed_regime_screen_v4_20260928`.
 Launch record and stdout log are the sibling `.launch.json` and `.log` files.
-Launch PID 1957963; PID alone must not be treated as persistent identity.
+Retry launch PID 1992178, deadline 6,600 seconds; PID alone must not be treated
+as persistent identity. Earlier v3 root with PID 1957963 is preserved separately.
 
 Two earlier run directories preserve preparation failures: manifest contained a
 saved assistant answer, then the sampled candidate pool had too few long prompts.
@@ -138,5 +146,37 @@ the supported `SGLANG_FLASHINFER_WORKSPACE_SIZE` setting; graphs stay enabled.
 Dense uses its backend's existing class-specific 512 MiB override. This is
 scratch capacity, not a changed attention algorithm or new runtime source.
 
-No completed high-C result exists at this update. Consult completion markers
-and detailed event summaries, not the existence of a run folder.
+The v4 workspace-adjusted retry also passed its C1/C4 smoke, completed C128-capable
+graph startup, and began clean C64 measurements with graphs enabled. Approximately
+84.3 GiB GPU memory was in use during that stage. No completed B8/B16 comparison
+exists at this update. Consult completion markers and detailed event summaries,
+not the existence of a folder.
+Twenty-two focused CPU/helper tests pass, including phase accounting, exact
+oracle DP, runtime recovery, user-only inputs and neutral greedy parameters.
+
+Event accepted-draft counters describe the internally verified blocks and may
+include terminal-cap overshoot discarded from HTTP output. They are not matched
+retention measurements; HTTP throughput uses actual capped completion counts.
+
+## 5. First completed clean baseline: MoE B16
+
+The v4 **clean MoE B16 stage is complete**. Server logs explicitly show actual
+128-request decode batches with target CUDA graphs, at both tested context
+lengths. This establishes C128 feasibility for this configuration, not C256 or
+longer contexts. Each request returned exactly 256 completion tokens.
+
+| Requested C | Prompt tokens | Output tokens/s, mean ± sample SD | Mean HTTP wave seconds |
+| ---: | ---: | ---: | ---: |
+| 64 | 512 | 1,224.10 ± 1.17 | 13.3846 |
+| 64 | 1,024 | 1,086.46 ± 1.09 | 15.0802 |
+| 128 | 512 | 1,785.47 ± 0.18 | 18.3526 |
+| 128 | 1,024 | 1,542.25 ± 0.01 | 21.2468 |
+
+Two measured waves after a same-cell warmup; these SDs describe only those two
+waves, not a confidence interval or general robustness. Timing includes prefill
+and drain; do not compare against the older v1/different-prompt dense table.
+The separate MoE B16 event stage is next, followed by B8 event/clean runs and the
+dense control. **No adaptive or B8/B16 speedup can be claimed from this table.**
+
+Completed baseline artifacts are also local under
+`outputs/fixed_regime_screen_v4_20260928/moe_b16_clean/`.
