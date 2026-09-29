@@ -73,6 +73,10 @@ class HeadroomTests(unittest.TestCase):
             self.assertEqual(len(selected),8)
             self.assertNotIn(0,[r['manifest_index'] for r in selected])
             self.assertEqual(len({r['source'] for r in selected[:4]}),4)
+            complete=select_training_prompts(manifest,root,None,926)
+            self.assertEqual(len(complete),11)
+            self.assertEqual(len({r['manifest_index'] for r in complete}),11)
+            self.assertNotIn(0,[r['manifest_index'] for r in complete])
 
 
 if __name__=='__main__':

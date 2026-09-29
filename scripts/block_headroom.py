@@ -45,9 +45,14 @@ def select_training_prompts(manifest, split_dir, per_source, seed):
     sources = sorted(pools)
     for source in sources:
         rng.shuffle(pools[source])
-        if len(pools[source]) < per_source:
+        if per_source is not None and len(pools[source]) < per_source:
             raise ValueError(f'Insufficient prompts for {source}')
     # Interleave sources so partial runs do not disproportionately cover one source.
+    # None exposes the whole audited pool for input-length screening, without
+    # changing the existing exactly-N-per-source training selections.
+    if per_source is None:
+        return [pools[source][i] for i in range(max(map(len, pools.values())))
+                for source in sources if i < len(pools[source])]
     return [pools[source][i] for i in range(per_source) for source in sources]
 
 

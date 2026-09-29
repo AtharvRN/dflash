@@ -101,7 +101,7 @@ def make_workload(registries):
     data = ROOT/"data/dflashv2_data"
     manifest = data/"manifests/qwen3_4b_instruct_100k_messages.jsonl"
     split = data/"splits"/SPLIT
-    candidates = select_training_prompts(manifest, split, 6000, 928)
+    candidates = select_training_prompts(manifest, split, None, 928)
     tokenizers = {name: AutoTokenizer.from_pretrained(m["target"]["path"], local_files_only=True,
                                                      trust_remote_code=False) for name, m in registries.items()}
     wrappers = {}
@@ -137,7 +137,7 @@ def make_workload(registries):
     if len(rows) != 128:
         raise ValueError(f"Only {len(rows)} sufficiently long training prompts in {len(candidates)} candidates")
     return {"kind": "controlled-length chat stress; truncated user bodies; ignore EOS; not task accuracy",
-            "selection_seed": 928, "candidate_pool_per_source": 6000,
+            "selection_seed": 928, "candidate_pool": "entire audited canonical training pool, source-interleaved",
             "rows": rows, "source_counts": dict(Counter(r["source"] for r in rows)),
             "manifest_sha256": sha(manifest), "split_sha256": {p.name: sha(p) for p in split.glob("*_prompt_ids.json")},
             "model_revisions": {k: v["target"]["revision"] for k, v in registries.items()}, "wrappers": wrappers}
