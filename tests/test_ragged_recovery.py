@@ -101,3 +101,21 @@ def test_shadow_forward_preserves_inplace_embedding_inputs(tmp_path, monkeypatch
         module.project_without_inference_buffers(worker, torch.ones(257, 4))
     assert not worker.buffer.is_inference()
     worker.buffer.fill_(42)
+
+
+def test_saved_state_comparison_counts_bonus_and_hidden_error(monkeypatch):
+    monkeypatch.syspath_prepend(str(ROOT / "scripts"))
+    spec = importlib.util.spec_from_file_location("saved_state_diagnostic", ROOT / "scripts/diagnose_saved_ragged_state.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    tokens = torch.tensor([4, 1, 2])
+    logits = torch.zeros(3, 5)
+    logits[0, 1], logits[1, 2], logits[2, 3] = 1, 1, 1
+    hidden = torch.ones(3, 2560)
+    report = module.summarize(hidden, logits, tokens, hidden.clone(), logits.clone())
+    assert report["A"] == 2 and report["bonus"] == 3
+    assert report["hidden"]["bitwise_equal"]
+    assert report["top1_mismatches"] == 0
+    changed = hidden.clone()
+    changed[2, 123] = 10
+    assert module.compare(changed, hidden)["max_abs"] == 9

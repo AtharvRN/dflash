@@ -45,8 +45,14 @@ def summarize(root):
                 "different_emissions": sum(not s["same_emitted_tokens"] for r in rows for s in r.get("same_batch_eager_acceptance", []))},
         }
         for field in ("same_batch_eager_hidden", "same_batch_eager_logits", "restored_hidden", "restored_logits",
-                      "isolation_hidden", "isolation_logits"):
+                      "isolation_hidden", "isolation_logits", "independent_repeat_hidden", "independent_repeat_logits",
+                      "worst_row_same_batch_eager_hidden"):
             result[key][field] = aggregate([r[field] for r in rows if field in r])
+        slot_reports = [r["slot_audit"] for r in rows if "slot_audit" in r]
+        result[key]["slot_checks"] = {
+            "forwards": len(slot_reports),
+            "duplicate_output_slots": sum(s["duplicate_output_slots"] for s in slot_reports),
+            "output_overlapping_any_prefix": sum(s["output_overlapping_any_prefix"] for s in slot_reports)}
     result["limits"] = ["not a complete correctness certificate", "not a throughput benchmark",
                         "no independent target-only transcript comparison yet",
                         "inspect top-1 differences even if relative hidden error is small"]
