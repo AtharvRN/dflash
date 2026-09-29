@@ -160,6 +160,36 @@ def backup_file(path, destination):
     temporary.replace(destination)
 
 
+def seed_mapping(original, expanded):
+    """Map immutable original states into a larger nested training selection."""
+    key = lambda r: (r["group"], str(r["prompt_id"]), int(r["cycle"]))
+    lookup = {key(r): i for i, r in enumerate(expanded)}
+    if len(lookup) != len(expanded) or len({key(r) for r in original}) != len(original):
+        raise ValueError("Duplicate state identity")
+    mapping = []
+    for row in original:
+        if key(row) not in lookup:
+            raise ValueError("Original state missing from expansion")
+        idx = lookup[key(row)]
+        if {k: v for k, v in row.items() if k != "row"} != {k: v for k, v in expanded[idx].items() if k != "row"}:
+            raise ValueError("Original state contents changed")
+        mapping.append(idx)
+    original_train = [key(r) for r in original if r["group"] == "train"]
+    expanded_train = [key(r) for r in expanded if r["group"] == "train"]
+    if expanded_train[:len(original_train)] != original_train:
+        raise ValueError("Training subsets are not nested")
+    if {key(r) for r in original if r["group"] != "train"} != {key(r) for r in expanded if r["group"] != "train"}:
+        raise ValueError("Frozen validation membership changed")
+    return np.asarray(mapping, dtype=np.int64)
+
+
+def array_row_digest(array, indices):
+    h = hashlib.sha256()
+    for start in range(0, len(indices), 64):
+        h.update(np.ascontiguousarray(array[indices[start:start + 64]]).tobytes())
+    return h.hexdigest()
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     for key in ("train-cache", "eval-cache", "split-dir", "models", "output", "backup"):
@@ -170,6 +200,7 @@ def main():
     p.add_argument("--layers", type=int, nargs="+", default=[6, 9, 12, 18, 24])
     p.add_argument("--max-seconds", type=int, default=3600)
     p.add_argument("--smoke", action="store_true")
+    p.add_argument("--seed-cache", type=Path, help="Preserve all existing states/features; replay only new training rows")
     args = p.parse_args()
     if args.output.exists() or args.backup.exists() or args.output == args.backup:
         raise ValueError("Use two fresh, separate destinations")
@@ -194,6 +225,23 @@ def main():
     models = json.loads(args.models.read_text())
     if models != ev_config["models"]:
         raise ValueError("Source model identity changed")
+    seed_complete, seed_rows, reuse = None, [], np.array([], dtype=np.int64)
+    if args.seed_cache:
+        seed_complete = json.loads((args.seed_cache / "COMPLETE.json").read_text())
+        if not seed_complete["passed"] or args.smoke:
+            raise ValueError("Expansion requires a completed nonsmoke seed cache")
+        for name, expected in seed_complete["binding"].items():
+            if Path(name).name != name or sha256(args.seed_cache / name) != expected:
+                raise ValueError("Seed cache hash mismatch")
+        seed_config = json.loads((args.seed_cache / "config.json").read_text())
+        if seed_config["smoke"] or seed_config["models"] != models or seed_config["layers"] != args.layers:
+            raise ValueError("Seed collection protocol differs")
+        if any(seed_config[k] != v for k, v in {"dtype": "bfloat16", "attention": "sdpa", "tf32": False}.items()):
+            raise ValueError("Seed numerical protocol differs")
+        seed_rows = json.loads((args.seed_cache / "source_rows.json").read_text())
+        reuse = seed_mapping(seed_rows, rows)
+        if len(reuse) >= len(rows):
+            raise ValueError("Expansion has no new training states")
     for path in (args.output, args.backup):
         path.mkdir(parents=True)
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
@@ -211,6 +259,10 @@ def main():
                    "draft_stat_columns": ["candidate_logprob", "entropy", "candidate_minus_top_logit"],
                    "lens": "untuned target final RMSNorm + original LM head; diagnostic full-vocabulary compute cost NOT free",
                    "scope": "greedy fixed-state offline replay, not throughput or deployed correctness"})
+    config["reused_rows"] = len(reuse)
+    if args.seed_cache:
+        config["seed_completion_sha256"] = sha256(args.seed_cache / "COMPLETE.json")
+        config["seed_row_mapping"] = reuse.tolist()
     atomic_json(args.output / "config.json", config)
     atomic_json(args.output / "source_rows.json", rows)
     for name in ("config.json", "source_rows.json"):
@@ -225,8 +277,11 @@ def main():
     eos = set(eos if isinstance(eos, list) else [eos]) - {None}
     started = time.monotonic()
     # Length sorting changes compute order only; arrays retain immutable row IDs.
-    order = sorted(range(len(rows)), key=lambda i: (rows[i]["prefix_length"], i))
-    shards, parity, completed = [], [], 0
+    reused = set(reuse.tolist())
+    order = sorted((i for i in range(len(rows)) if i not in reused), key=lambda i: (rows[i]["prefix_length"], i))
+    if args.seed_cache and any(rows[i]["group"] != "train" for i in order):
+        raise ValueError("Expansion may only replay new training states")
+    shards, parity, completed = [], [], len(reuse)
     print("MODELS_READY", json.dumps({"groups": config["groups"], "batch_size": args.batch_size}), flush=True)
     with torch.inference_mode():
         for start in range(0, len(order), args.batch_size):
@@ -262,7 +317,8 @@ def main():
             shards.append({"path": name, "sha256": sha256(shard), "row_ids": take})
             completed += len(take)
             progress = {"completed": completed, "planned": len(rows), "elapsed_s": time.monotonic() - started,
-                        "states_per_s": completed / max(time.monotonic() - started, 1),
+                        "newly_replayed": completed - len(reuse), "reused_rows": len(reuse),
+                        "states_per_s": (completed - len(reuse)) / max(time.monotonic() - started, 1),
                         "peak_gpu_gib": torch.cuda.max_memory_allocated() / 2**30}
             atomic_json(args.output / "progress.json", progress)
             backup_file(args.output / "progress.json", args.backup / "progress.json")
@@ -271,11 +327,25 @@ def main():
     # Materialize training arrays only after every durable chunk exists.
     arrays = {}
     seen = np.zeros(len(rows), dtype=np.int64)
+    if args.seed_cache:
+        for name in seed_complete["binding"]:
+            if not name.endswith(".npy"):
+                continue
+            source = np.load(args.seed_cache / name, mmap_mode="r", allow_pickle=False)
+            if source.shape[0] != len(reuse):
+                raise ValueError("Seed array row count mismatch")
+            arrays[Path(name).stem] = np.lib.format.open_memmap(args.output / name, mode="w+",
+                dtype=source.dtype, shape=(len(rows), *source.shape[1:]))
+            for start in range(0, len(reuse), 64):
+                arrays[Path(name).stem][reuse[start:start + 64]] = source[start:start + 64]
+        seen[reuse] = 1
     for receipt in shards:
         path = args.output / receipt["path"]
         if sha256(path) != receipt["sha256"]:
             raise ValueError("Chunk checksum changed")
         with np.load(path, allow_pickle=False) as chunk:
+            if args.seed_cache and set(chunk.files) - {"row_ids"} != set(arrays):
+                raise ValueError("New and frozen feature schemas differ")
             idx = chunk["row_ids"]
             if idx.tolist() != receipt["row_ids"]:
                 raise ValueError("Chunk index mismatch")
@@ -287,9 +357,26 @@ def main():
                 if key not in arrays:
                     arrays[key] = np.lib.format.open_memmap(args.output / f"{key}.npy", mode="w+",
                         dtype=value.dtype, shape=(len(rows), *value.shape[1:]))
+                if value.dtype != arrays[key].dtype or value.shape[1:] != arrays[key].shape[1:]:
+                    raise ValueError("Chunk array dtype/shape mismatch")
                 arrays[key][idx] = value
     if not np.all(seen == 1):
         raise ValueError("Missing/duplicate materialized rows")
+    preservation = {}
+    if args.seed_cache:
+        for key, value in arrays.items():
+            source = np.load(args.seed_cache / f"{key}.npy", mmap_mode="r", allow_pickle=False)
+            if source.dtype != value.dtype or source.shape[1:] != value.shape[1:]:
+                raise ValueError("Frozen array type/shape changed")
+            preservation[key] = {}
+            for group in ("train", "calibration", "assessment"):
+                idx = np.asarray([i for i, r in enumerate(seed_rows) if r["group"] == group])
+                original_digest = array_row_digest(source, idx)
+                if array_row_digest(value, reuse[idx]) != original_digest:
+                    raise ValueError("Frozen array bytes changed")
+                preservation[key][group] = original_digest
+        if sha256(args.seed_cache / "COMPLETE.json") != config["seed_completion_sha256"]:
+            raise ValueError("Seed changed during collection")
     records, terminal = [], []
     for i, row in enumerate(rows):
         accepted = int(arrays["accepted_len"][i])
@@ -299,6 +386,11 @@ def main():
             "accepted_len": accepted, "label_replay_match": accepted == row["old_accepted_len"],
             "anchor_replay_match": bool(arrays["anchor_match"][i]), "replayed_accepted_eos": is_terminal,
             "draft_argmax_matches_saved": int((arrays["draft_argmax"][i] == arrays["candidate_ids"][i]).sum())})
+    if args.seed_cache:
+        original_records = json.loads((args.seed_cache / "rows.json").read_text())
+        for old, idx in zip(original_records, reuse):
+            if {k: v for k, v in old.items() if k != "row"} != {k: v for k, v in records[idx].items() if k != "row"}:
+                raise ValueError("Frozen labels/metadata changed")
     audit = {"passed": not any(terminal), "rows": len(rows), "groups": config["groups"],
              "label_replay_matches": sum(r["label_replay_match"] for r in records),
              "anchor_replay_matches": sum(r["anchor_replay_match"] for r in records),
@@ -306,6 +398,9 @@ def main():
              "fresh_accepted_eos_states": int(sum(terminal)), "batch_single_controls": parity,
              "elapsed_s": time.monotonic() - started, "candidate_identity_preserved": True,
              "source_labels_used_for_training": False, "assessment_membership_unchanged": not args.smoke}
+    audit.update({"reused_rows": len(reuse), "newly_replayed_rows": len(order),
+                  "seed_array_content_bytes_preserved": bool(args.seed_cache),
+                  "seed_array_group_sha256": preservation})
     atomic_json(args.output / "rows.json", records)
     atomic_json(args.output / "chunks.json", shards)
     atomic_json(args.output / "audit.json", audit)
