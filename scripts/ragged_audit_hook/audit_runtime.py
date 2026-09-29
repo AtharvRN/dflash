@@ -19,6 +19,7 @@ import torch
 ROOT = Path(os.environ["DFLASH_RAGGED_AUDIT_DIR"])
 LIMIT = int(os.environ.get("DFLASH_RAGGED_AUDIT_FORWARDS", "12"))
 MIN_BATCH = int(os.environ.get("DFLASH_RAGGED_AUDIT_MIN_BATCH", "2"))
+DIAGNOSTICS = os.environ.get("DFLASH_RAGGED_AUDIT_DIAGNOSTICS") == "1"
 
 
 def emit(row):
@@ -61,6 +62,35 @@ def acceptance_summary(tokens, actual_logits, reference_logits):
     return {"actual_A": actual[0], "reference_A": reference[0],
             "actual_bonus": actual[1], "reference_bonus": reference[1],
             "same_emitted_tokens": actual == reference}
+
+
+def hidden_detail(actual, reference, width=2560):
+    """Localize discrepancies without letting large feature norms hide them."""
+    a, b = actual.float(), reference.float()
+    flat = int((a-b).abs().argmax())
+    position, channel = divmod(flat, a.shape[-1])
+    return {"actual_absmax": float(a.abs().max()),
+            "reference_absmax": float(b.abs().max()),
+            "max_error_position": position, "max_error_channel": channel,
+            "actual_at_max_error": float(a[position, channel]),
+            "reference_at_max_error": float(b[position, channel]),
+            "per_token_relative_l2": ((a-b).norm(dim=-1)/b.norm(dim=-1).clamp_min(1e-12)).tolist(),
+            "feature_groups": [compare(a[:, i:i+width], b[:, i:i+width])
+                               for i in range(0, a.shape[-1], width)]}
+
+
+def slot_audit(runner, fb):
+    """Check the shadow writes cannot overlap any live committed prefix."""
+    table = runner.req_to_token_pool.req_to_token
+    prefixes = torch.cat([table[int(req), :int(n)] for req, n in
+                          zip(fb.req_pool_indices.tolist(), fb.seq_lens.tolist())]).long()
+    output = fb.out_cache_loc.long()
+    report = {"prefix_slots": len(prefixes), "output_slots": len(output),
+              "duplicate_output_slots": len(output)-len(output.unique()),
+              "output_overlapping_any_prefix": int(torch.isin(output, prefixes).sum())}
+    if report["duplicate_output_slots"] or report["output_overlapping_any_prefix"]:
+        raise AssertionError(f"Unsafe shadow/cache slot mapping: {report}")
+    return report
 
 
 def project_without_inference_buffers(worker, hidden):
@@ -137,6 +167,10 @@ def audited_forward(runner, role, project=None):
         if saved_embeds is not None:
             record["input_embedding_mutation"] = compare(saved_embeds, fb.input_embeds)
             reference_inputs.input_embeds = saved_embeds
+        if DIAGNOSTICS:
+            record["slot_audit"] = slot_audit(runner, fb)
+            record["prefix_lengths_cpu"] = fb.seq_lens_cpu.tolist() if fb.seq_lens_cpu is not None else None
+            record["prefix_lengths_sum_field"] = fb.seq_lens_sum
         # Test all requests, in reverse order to expose hidden batch-order state.
         offsets = [0]
         for size in physical:
@@ -148,6 +182,8 @@ def audited_forward(runner, role, project=None):
             draft_offsets = [0]
             for size in real:
                 draft_offsets.append(draft_offsets[-1]+size-1)
+        worst_reference = None
+        worst_error = -1
         try:
             for i in reversed(range(fb.batch_size)):
                 view = batch_view(reference_inputs, [i], real, physical)
@@ -164,6 +200,12 @@ def audited_forward(runner, role, project=None):
                     actual_ids = actual_draft_ids[draft_offsets[i]:draft_offsets[i+1]]
                     row["draft_tokens"] = {"tokens": len(ref_ids),
                                            "mismatches": int((actual_ids != ref_ids).sum())}
+                if DIAGNOSTICS and row["hidden"]["relative_l2"] > worst_error:
+                    worst_error = row["hidden"]["relative_l2"]
+                    worst_reference = (i, ref.logits_output.hidden_states.clone(),
+                                       ref.logits_output.next_token_logits.clone() if actual_logits is not None else None)
+                if DIAGNOSTICS and row["hidden"]["relative_l2"] > 0.05:
+                    row["hidden_detail"] = hidden_detail(actual_hidden[begin:end], ref.logits_output.hidden_states)
                 record["requests"].append(row)
             # Identical physical layout isolates graphs from shape effects and
             # supplies a matched reference for cross-request attention isolation.
@@ -175,11 +217,34 @@ def audited_forward(runner, role, project=None):
                 record["same_batch_eager_acceptance"] = [acceptance_summary(
                     fb.input_ids[offsets[i]:offsets[i]+real[i]], actual_logits[offsets[i]:offsets[i]+real[i]],
                     ref.logits_output.next_token_logits[offsets[i]:offsets[i]+real[i]]) for i in range(fb.batch_size)]
-            protected = checked % fb.batch_size
+            protected = worst_reference[0] if DIAGNOSTICS else checked % fb.batch_size
             first, last = offsets[protected], offsets[protected]+real[protected]
             protected_hidden = ref.logits_output.hidden_states[first:last].clone()
             protected_logits = (ref.logits_output.next_token_logits[first:last].clone()
                                 if actual_logits is not None else None)
+            if DIAGNOSTICS:
+                record["worst_row_same_batch_eager_hidden"] = compare(actual_hidden[first:last], protected_hidden)
+                record["worst_row_same_batch_eager_detail"] = hidden_detail(actual_hidden[first:last], protected_hidden)
+                # Preserve the precise worst case for analysis after a deliberate
+                # failure. This is a bounded local artifact, never training data.
+                if worst_error > 0.05:
+                    req = int(fb.req_pool_indices[protected])
+                    prefix_n = int(fb.seq_lens[protected])
+                    prefix_slots = runner.req_to_token_pool.req_to_token[req, :prefix_n].long()
+                    path = ROOT / f"discrepancy_{role}_{checked}_{os.getpid()}.pt"
+                    payload = {"role": role, "number": checked, "row": protected,
+                               "prefix_length": prefix_n,
+                               "input_ids": fb.input_ids[first:last].cpu(),
+                               "positions": fb.positions[first:last].cpu(),
+                               "actual_hidden": actual_hidden[first:last].cpu(),
+                               "independent_hidden": worst_reference[1].cpu(),
+                               "same_batch_eager_hidden": protected_hidden.cpu(),
+                               "actual_logits": actual_logits[first:last].cpu() if actual_logits is not None else None,
+                               "independent_logits": worst_reference[2].cpu() if worst_reference[2] is not None else None,
+                               "same_batch_eager_logits": protected_logits.cpu() if protected_logits is not None else None,
+                               "prefix_kv": runner.token_to_kv_pool.get_cpu_copy(prefix_slots)}
+                    torch.save(payload, path)
+                    record["discrepancy_artifact"] = str(path)
             perturb = batch_view(reference_inputs, list(range(fb.batch_size)), physical, physical)
             other = torch.ones_like(perturb.input_ids, dtype=torch.bool)
             other[offsets[protected]:offsets[protected+1]] = False
@@ -191,6 +256,11 @@ def audited_forward(runner, role, project=None):
             record["isolation_hidden"] = compare(protected_hidden, changed.logits_output.hidden_states[first:last])
             if protected_logits is not None:
                 record["isolation_logits"] = compare(protected_logits, changed.logits_output.next_token_logits[first:last], logits=True)
+            if DIAGNOSTICS:
+                repeated = original(batch_view(reference_inputs, [protected], real, physical))
+                record["independent_repeat_hidden"] = compare(worst_reference[1], repeated.logits_output.hidden_states)
+                if worst_reference[2] is not None:
+                    record["independent_repeat_logits"] = compare(worst_reference[2], repeated.logits_output.next_token_logits, logits=True)
         finally:
             # Single-request shadows reuse the same suffix slots. Re-execute the
             # original batch to restore the actual batched KV and graph buffers.

@@ -71,6 +71,22 @@ def test_shadow_forward_preserves_inplace_embedding_inputs(tmp_path, monkeypatch
     assert records[0]["isolation_hidden"]["bitwise_equal"]
     tied = torch.ones(16, 64)
     assert module.compare(tied, tied, logits=True)["top1_mismatches"] == 0
+    actual, reference = torch.ones(3, 8), torch.ones(3, 8)
+    actual[2, 5] = 9
+    detail = module.hidden_detail(actual, reference, width=4)
+    assert (detail["max_error_position"], detail["max_error_channel"]) == (2, 5)
+    assert detail["feature_groups"][0]["bitwise_equal"]
+    assert detail["actual_at_max_error"] == 9
+    slots_fb = SimpleNamespace(req_pool_indices=torch.tensor([0, 1]), seq_lens=torch.tensor([2, 2]),
+                               out_cache_loc=torch.tensor([3, 6]))
+    slots_runner = SimpleNamespace(req_to_token_pool=SimpleNamespace(req_to_token=torch.tensor([[1, 2, 3], [4, 5, 6]])))
+    assert module.slot_audit(slots_runner, slots_fb)["output_overlapping_any_prefix"] == 0
+    slots_fb.out_cache_loc[0] = 4
+    try:
+        module.slot_audit(slots_runner, slots_fb)
+        assert False, "Overlapping writes must fail the audit"
+    except AssertionError as error:
+        assert "Unsafe shadow/cache slot mapping" in str(error)
 
     # Shadow projection must not create inference tensors in production caches.
     class Worker:

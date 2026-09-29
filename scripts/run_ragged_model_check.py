@@ -33,6 +33,8 @@ def main():
     parser.add_argument("--pattern", choices=["rotating", "fixed16"], default="rotating")
     parser.add_argument("--deterministic", action="store_true",
                         help="Use SGLang's existing batch-invariant mode as a correctness control, not a timing configuration")
+    parser.add_argument("--diagnostics", action="store_true",
+                        help="Audit slot aliasing, isolate the worst row, and preserve large-discrepancy tensors/KV")
     args = parser.parse_args()
     if not 2 <= args.audit_min_bs <= args.concurrency or not 0 <= args.fixed_cap <= 256:
         raise ValueError("Invalid bounded audit/stress settings")
@@ -84,6 +86,7 @@ def main():
                    "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY": "1",
                    "DFLASH_RAGGED_AUDIT_FORWARDS": str(args.audit_forwards), "SGLANG_DFLASH_TIMING": "0"}
             env["DFLASH_RAGGED_AUDIT_MIN_BATCH"] = str(args.audit_min_bs)
+            env["DFLASH_RAGGED_AUDIT_DIAGNOSTICS"] = "1" if args.diagnostics else "0"
             for k, v in env.items():
                 launch += ["-e", f"{k}={v}"]
             launch += ["--entrypoint", "python", IMAGE, "-m", "sglang.launch_server",
