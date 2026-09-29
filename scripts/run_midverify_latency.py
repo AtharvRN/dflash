@@ -56,9 +56,9 @@ def main():
         'concurrencies': [4] if a.smoke else [64, 128], 'seed': 913, 'target': .99,
         'warmups': 2 if a.smoke else 3, 'repeats': 2 if a.smoke else 12,
         'modes': ['eager', 'graph'], 'max_seconds': a.max_seconds,
-        'cases': ['fixed16', 'fixed8_same_candidates', 'fixed8_redraft', 'target_free', 'target_free_split', 'cascade'],
+        'cases': ['fixed16', 'fixed16_redraft', 'fixed8_same_candidates', 'fixed8_redraft', 'target_free', 'target_free_split', 'cascade'],
         'selection': 'First eligible state of each distinct assessment prompt, canonical order; same 128 states at both C; seed913 fixed in advance, not best-seed selection.',
-        'scope': 'Same-state native SGLang layer/FlashInfer replay, eager or exact-shape manually captured target segments; eager drafter. Not scheduler/HTTP/closed-loop throughput. Full B16 candidates unchanged except explicitly labeled fixed8_redraft; fixed8_same_candidates is post-draft truncation only.',
+        'scope': 'Same-state native SGLang layer/FlashInfer replay, eager or exact-shape manually captured target segments; eager drafter. Not scheduler/HTTP/closed-loop throughput. Saved B16 candidates unchanged except explicitly labeled fixed8_redraft/fixed16_redraft controls; fixed8_same_candidates is post-draft truncation only.',
         'limits': 'Fixed allocated prefix/suffix slots; reservation/free microcost reported separately. No prefill, request scheduling, graph bucket misses, allocator commit or future trajectory cost in replay cycle.',
         'commit': command(['git', 'rev-parse', 'HEAD'], cwd=repo).strip(),
         'bindings': {str(path): sha256(path) for path in (source, cache / 'COMPLETE.json', policies / 'COMPLETE.json', repo / 'scripts/midverify_latency_hook/latency_runtime.py')}}

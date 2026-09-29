@@ -39,7 +39,9 @@ def aggregate(cells):
             'max_hidden_relative_l2': max(r['audit']['hidden']['relative_l2'] for r in rows)}
     for value in result.values():
         prefix = f"c{value['C']}_{value['mode']}_"
-        for ref in ('fixed16', 'fixed8_redraft', 'target_free'):
+        for ref in ('fixed16', 'fixed16_redraft', 'fixed8_redraft', 'target_free'):
+            if prefix+ref not in result:
+                continue
             baseline = result[prefix+ref]
             value['speed_ratio_vs_'+ref] = baseline['ms_per_committed_token']/value['ms_per_committed_token']
         value['retention_vs_same_engine_b16'] = value['accepted_total']/result[prefix+'fixed16']['accepted_total']
@@ -117,9 +119,9 @@ def main():
     from matplotlib import pyplot as plt
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
     names = source['config']['cases']
-    labels = {'fixed16': 'B16', 'fixed8_same_candidates': 'B16 → B8 trim', 'fixed8_redraft': 'Actual B8',
+    labels = {'fixed16': 'Saved B16', 'fixed16_redraft': 'Actual B16', 'fixed8_same_candidates': 'B16 → B8 trim', 'fixed8_redraft': 'Actual B8',
               'target_free': 'Target-free', 'target_free_split': 'Split, no pruning', 'cascade': 'L6 cascade'}
-    colors = ['#64748b', '#94a3b8', '#b0c4d8', '#2a9d8f', '#e9c46a', '#e76f51']
+    colors = ['#64748b', '#758bab', '#94a3b8', '#b0c4d8', '#2a9d8f', '#e9c46a', '#e76f51']
     for ax, c in zip(axes, source['config']['concurrencies']):
         values = [result[f'c{c}_graph_{n}'] for n in names]
         ax.bar(range(len(names)), [r['ms_per_committed_token'] for r in values], color=colors)

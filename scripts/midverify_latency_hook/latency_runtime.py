@@ -306,11 +306,11 @@ class Case:
         stats, draft_top = draft_forward(s, timer, confidence=not case.startswith('fixed'), block_size=draft_size)
         with timer.phase('stage0_probe_and_pack'):
             blocks = s.blocks
-            if case == 'fixed8_redraft':
+            if case.endswith('_redraft'):
                 blocks = blocks.clone()
-                blocks[:, 1:8] = draft_top
+                blocks[:, 1:draft_size] = draft_top
             if case.startswith('fixed'):
-                front = np.full(s.n, 16 if case == 'fixed16' else 8, dtype=np.int32)
+                front = np.full(s.n, 16 if case.startswith('fixed16') else 8, dtype=np.int32)
                 policy, k_gpu = None, cuda(front, torch.int32)
             else:
                 policy = self.policies['cascade' if case == 'cascade' else 'target_free']
@@ -473,6 +473,7 @@ def run(worker, config_path):
                             'prefix_lengths': snapshot.lengths, 'anchor_mismatches': sum(x != int(y) for x, y in zip(snapshot.anchor_top1, snapshot.blocks[:, 0].tolist())),
                             'observations': obs, 'wall_ms': distribution([r['wall_ms'] for r in obs]),
                             'uninstrumented_cycle_ms': distribution(clean[name]),
+                            'uninstrumented_cycle_samples_ms': clean[name],
                             'uninstrumented_ms_per_committed_token': float(np.mean(clean[name])/obs[0]['committed_tokens']),
                             'phase_stream_ms': {key: distribution([r['phases'][key]['stream_ms'] for r in obs]) for key in obs[0]['phases']},
                             'assessment_retention_vs_same_engine_b16': sum(obs[0]['accepted'])/base_sum if base_sum else None,

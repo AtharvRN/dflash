@@ -16,9 +16,9 @@ Current policies use fresh same-engine draft confidence and L6 target features;
 record numerical and policy drift rather than treating offline features as free.
 
 Compare fixed full B16, fixed post-draft B8 truncation (same B16 candidates, not
-actual shorter drafting), actual B8 redrafting, target-free learned trimming, the same target-free
+actual shorter drafting), actual B8/B16 redrafting, target-free learned trimming, the same target-free
 policy with a no-prune L6 split, and the L6 cascade. Prefix tokens are preserved;
-only the explicitly labeled B8 redraft control changes candidates. Measure both eager execution and manually captured
+only the explicitly labeled redraft controls change candidates. Measure both eager execution and manually captured
 exact-shape target graphs, with eager drafting for every case. These graph
 captures use native attention planning and native model layers but are NOT a
 general graph-bucket scheduler integration. Misses must fail, not silently pad.
@@ -47,3 +47,10 @@ diagnostic guard, NOT a general correctness certificate.
 
 No auto-training extension, new trajectory collection, runtime-source edits,
 recurring monitor, other GPU use or subsequent serving integration.
+
+Protocol amendment after the first completed run: the original fixed16 replay
+retains saved candidates while the actual B8 control recomputes them. Add actual
+B16 redrafting in a fresh bounded rerun to make the two actual fixed-width
+controls comparable. Do not change models, states, thresholds or the main
+saved-candidate target-free/cascade comparison. Keep all initial evidence.
+Also retain individual uninstrumented timing samples, not just their summaries.
