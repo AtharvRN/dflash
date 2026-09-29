@@ -49,6 +49,9 @@ def run(runner, artifact, output):
              ("dense_b16", [16]*capacity, "fixed", 0, False),
              ("original_layout_eager", state["physical_lengths"], "original", state["row"], False)]
     if runner.decode_cuda_graph_runner is not None:
+        captured = runner.decode_cuda_graph_runner.capture_bs_by_num_tokens.get(dense_b, [])
+        if dense_bs in captured:
+            cases.append(("dense_matched_rows_graph", [dense_b]*dense_bs, "fixed", 0, True))
         cases.append(("original_layout_graph", state["physical_lengths"], "original", state["row"], True))
     max_bs = max(len(lens) for _, lens, _, _, _ in cases)
     max_block = max(max(lens) for _, lens, _, _, _ in cases)
@@ -91,7 +94,7 @@ def run(runner, artifact, output):
                                num_tokens_per_batch=ntpb, capture_hidden_mode=CaptureHiddenMode.FULL)
             if metadata == "fixed":
                 spec = DFlashVerifyInput(**spec_kwargs)
-                spec.disable_cuda_graph = True
+                spec.disable_cuda_graph = not allow_graph
             else:
                 semantic = state["real_lengths"] if metadata == "original" else lengths
                 spec = DFlashRaggedVerifyInput(**spec_kwargs,
@@ -114,6 +117,7 @@ def run(runner, artifact, output):
             row = {"batch_size": batch, "physical_lengths": lengths, "focus": focus,
                    "query_tokens": total, "graph_used": bool(result.can_run_graph),
                    "captured_batch_size": runner.decode_cuda_graph_runner.bs if allow_graph else None,
+                   "real_target_argmax": logits.argmax(-1).tolist(),
                    "acceptance": acceptance_summary(state["input_ids"], logits, state["actual_logits"])}
             for name in ("actual", "independent", "same_batch_eager"):
                 row[f"vs_saved_{name}_hidden"] = compare(hidden, state[f"{name}_hidden"])
@@ -122,7 +126,7 @@ def run(runner, artifact, output):
             row["vs_single_hidden"] = compare(hidden, base["hidden"])
             row["vs_single_detail"] = hidden_detail(hidden, base["hidden"])
             row["vs_single_logits"] = compare(logits, base["logits"], logits=True)
-            if label == "ragged_uniform_matched_rows":
+            if label in ("ragged_uniform_matched_rows", "dense_matched_rows_graph"):
                 row["vs_dense_same_shape_hidden"] = compare(hidden, tensors["dense_matched_rows"]["hidden"])
                 row["vs_dense_same_shape_logits"] = compare(logits, tensors["dense_matched_rows"]["logits"], logits=True)
             reports[label] = row
@@ -145,5 +149,6 @@ def run(runner, artifact, output):
     torch.save(tensors, output / "fixture_outputs.pt")
     (output / "FIXTURE.json").write_text(json.dumps({"artifact": str(artifact), "reports": reports,
         "original_execution_rows": execution_rows, "uniform_shape": [dense_bs, dense_b],
+        "real_input_ids": state["input_ids"].tolist(), "capture_reason": state.get("capture_reason"),
         "prefix_unchanged": prefix_unchanged, "pool_sizes_before": before, "pool_sizes_after": after,
         "limits": "One preserved prefix repeated across requests; not the full original batch or a throughput test."}, indent=2)+"\n")
