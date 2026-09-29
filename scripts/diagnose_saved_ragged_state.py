@@ -42,11 +42,28 @@ def summarize(hidden, logits, tokens, reference_hidden=None, reference_logits=No
     return result
 
 
+def replay_queries(state, batch, block, device):
+    """Preserve every real query; add only causally subsequent dummy queries."""
+    import torch
+    real = len(state["input_ids"])
+    if batch < 1 or not real <= block <= 32:
+        raise ValueError("Invalid replay query shape")
+    positions = torch.arange(state["prefix_length"], state["prefix_length"]+block,
+                             device=device)
+    if not torch.equal(positions[:real].cpu(), state["positions"].cpu()):
+        raise ValueError("Saved positions must immediately follow the committed prefix")
+    ids = torch.zeros(block, device=device, dtype=torch.long)
+    ids[:real] = state["input_ids"].to(device)
+    return ids[None].expand(batch, -1), positions[None].expand(batch, -1)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--shape-batch-size", type=int, default=90)
+    parser.add_argument("--shape-block-size", type=int, default=0,
+                        help="Append causal dummy queries in the batched control to match an exact execution-row count")
     parser.add_argument("--gpu", type=int, default=4)
     args = parser.parse_args()
     if args.output.exists() or not 2 <= args.shape_batch_size <= 128:
@@ -70,6 +87,10 @@ def main():
     state = torch.load(args.artifact, map_location="cpu", weights_only=True)
     if state["role"] != "target" or len(state["prefix_kv"]) != 36:
         raise ValueError("Expected the pinned Qwen3-4B target state")
+    real = len(state["input_ids"])
+    shape_block = args.shape_block_size or real
+    if not real <= shape_block <= 32:
+        raise ValueError("Padded block must preserve the real prefix and be <=32")
     digest = hashlib.sha256()
     with args.artifact.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024*1024), b""):
@@ -77,11 +98,12 @@ def main():
     config = {"artifact": str(args.artifact), "artifact_sha256": digest.hexdigest(),
               "gpu": gpu, "torch": torch.__version__, "transformers": transformers.__version__,
               "model": models["target"], "shape_batch_size": args.shape_batch_size,
+              "shape_block_size": shape_block,
               "prefix_length": state["prefix_length"], "tokens": state["input_ids"].tolist(),
               "hidden_tuple_indices": [2, 10, 18, 26, 34],
               "bf16_reduced_precision_reduction": torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
               "code_commit": command(["git", "rev-parse", "HEAD"]).strip(),
-              "limits": "Same saved BF16 prefix; not recomputed FP32 prefix, not an SGLang parity certificate."}
+              "limits": "Same saved BF16 prefix; not recomputed FP32 prefix, not an SGLang parity certificate. Padded queries are causal target-only dummies, not new draft candidates."}
     atomic_json(args.output / "config.json", config)
     started = time.monotonic()
     outputs, summary = {}, {}
@@ -91,7 +113,7 @@ def main():
             attn_implementation="sdpa", local_files_only=True).eval().cuda()
         for dtype in (torch.bfloat16, torch.float32):
             model.to(dtype=dtype)
-            for batch in (1, args.shape_batch_size):
+            for batch, block in ((1, real), (args.shape_batch_size, shape_block)):
                 label = f"{str(dtype).split('.')[-1]}_c{batch}"
                 cache = DynamicCache()
                 for layer, chunks in enumerate(state["prefix_kv"]):
@@ -103,17 +125,17 @@ def main():
                     cache.update(k, v, layer)
                 if cache.get_seq_length() != state["prefix_length"]:
                     raise AssertionError("Saved prefix cache length mismatch")
-                ids = state["input_ids"].cuda()[None].expand(batch, -1)
-                positions = state["positions"].cuda()[None].expand(batch, -1)
+                ids, positions = replay_queries(state, batch, block, "cuda")
                 mask = torch.ones((batch, state["prefix_length"]+ids.shape[1]), device="cuda", dtype=torch.long)
                 with torch.inference_mode():
                     out = model(input_ids=ids, attention_mask=mask, position_ids=positions,
                                 past_key_values=cache, use_cache=True, output_hidden_states=True)
-                    hidden = torch.cat([out.hidden_states[i][0] for i in config["hidden_tuple_indices"]], dim=-1).cpu()
-                    logits = out.logits[0].cpu()
+                    hidden = torch.cat([out.hidden_states[i][0, :real] for i in config["hidden_tuple_indices"]], dim=-1).cpu()
+                    logits = out.logits[0, :real].cpu()
                     identical_replicas = all(torch.equal(out.logits[i], out.logits[0]) for i in range(batch))
                 outputs[label] = {"hidden": hidden, "logits": logits}
                 summary[label] = {
+                    "batch_size": batch, "block_size": block, "real_queries_per_request": real,
                     "vs_saved_packed": summarize(hidden, logits, state["input_ids"], state["actual_hidden"], state["actual_logits"]),
                     "vs_saved_independent": summarize(hidden, logits, state["input_ids"], state["independent_hidden"], state["independent_logits"]),
                     "replicas_bitwise_equal_logits": identical_replicas}

@@ -122,6 +122,18 @@ def test_saved_state_comparison_counts_bonus_and_hidden_error(monkeypatch):
     changed = hidden.clone()
     changed[2, 123] = 10
     assert module.compare(changed, hidden)["max_abs"] == 9
+    state = {"input_ids": tokens, "positions": torch.arange(42, 45), "prefix_length": 42}
+    ids, positions = module.replay_queries(state, batch=48, block=12, device="cpu")
+    assert ids.shape == positions.shape == (48, 12)
+    assert torch.equal(ids[:, :3], tokens[None].expand(48, -1))
+    assert not ids[:, 3:].any()
+    assert torch.equal(positions[0], torch.arange(42, 54))
+    state["positions"] += 1
+    try:
+        module.replay_queries(state, batch=1, block=3, device="cpu")
+        assert False, "Replay must not silently change real positions"
+    except ValueError as error:
+        assert "Saved positions" in str(error)
 
 
 def test_outlier_fixture_matches_executed_not_only_real_token_rows():
