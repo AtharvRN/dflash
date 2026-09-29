@@ -66,10 +66,11 @@ What the evidence currently supports:
    in the recovered engine.** Conditional gain calculations are planning aids,
    not results. No claim of a strong MLSys contribution is justified yet.
 
-As of the latest execution check, all bounded GPU diagnostics have completed,
-GPU 4 is free, and no task server or recurring monitor remains running. The next
-work is numerical-contract/output validation and same-engine component profiling,
-not another undirected predictor sweep.
+September 28 follow-up: the matched-assessment CPU oracle is now complete, and a
+bounded GPU-4-only dense/MoE fixed-width screen has been launched. See
+[matched oracle and MoE screen](matched_oracle_and_moe_screen_20260928.md) for
+the new scope, pinned models, run paths and status caveats. The earlier numerical
+diagnostics are complete; no recurring monitor or predictor sweep was started.
 
 ## 2. Evidence and comparability rules
 
@@ -637,6 +638,24 @@ difference −0.032 percentage points has interval [−1.885, +1.755]; both poli
 slightly miss 96% assessment retention. This remains common-state development
 evidence, not throughput, closed-loop performance or a BlockPilot comparison.
 
+### 9.1 Matched assessment oracle, added September 28
+
+The exact budget oracle was recomputed on these same 1,416 assessment cycles /
+187 prompts, not the older 871-state diagnostic. Prediction/outcome/prompt-order
+bindings were reverified, including equality with the six trained heads' saved
+assessment arrays. Existing calibration-selected settings remain unchanged.
+
+At >=96% aggregate retention, request/cycle hindsight mean **proposed budgets**
+are 10.7331/6.4633; ratios are 0.58843/0.97716, both at 0.960064 retention.
+The frozen primary cycle MLP still uses budget 11.7083 at that same retained
+accepted-token total. At 100% retention the oracle budgets are 12.3948/6.7804.
+Thus the cycle oracle's 96% **mean B is 7.4633**, including the anchor.
+
+These are minimum-token-work hindsight bounds, not latency-optimal policies,
+learnability guarantees or throughput ceilings. The request oracle also sees
+future sampled outcomes. Detailed audited tables, including the separate
+exact-calibration sensitivity, are linked in the new screen note above.
+
 ## 10. New actual-block predictor: collection, recovery and results
 
 ### 10.1 Question and exact model
@@ -1120,6 +1139,13 @@ Recorded references in that older repo:
 
 ### 14.3 Next executable sequence
 
+The user has now authorized a narrower regime screen before the integration
+sequence below: matched CPU oracles (completed), then fixed B8/B16 at C64/C128
+and controlled 512/1,024-token prompts on dense and MoE pairs in the recovered
+v2 engine. Separate clean/event processes and low-C model smokes are required.
+This does not authorize training another predictor or launching a hybrid. The
+following remains the longer-term sequence, contingent on measured headroom.
+
 1. Preserve the current numerical fixtures and define the comparison contract:
    same runtime/backend/dtype/graph mode, token-level decisions as well as hidden
    errors. Extend target-only transcript and allocator/lifecycle checks without
@@ -1219,14 +1245,16 @@ or all runtime dependencies.
 
 ## 16. Current handoff
 
-The newest concrete result is the fixed-width graph reproduction of the
-output-changing case in section 12.6. This advances the correctness investigation
-without claiming universal parity or modifying the historical engine. All task
-GPU jobs have stopped normally or after their deliberate capture assertion;
-the source evidence is preserved and no monitor is active.
+The newest completed analysis is the matched-state oracle in section 9.1. A
+bounded dense/MoE fixed-width screen is launched on GPU 4, with C1/C4 model
+smokes before C64/C128; see the dedicated screen note for durable paths and
+completion markers. No recurring monitor is active. The earlier fixed-width
+graph reproduction in section 12.6 remains a numerical diagnosis, not universal
+parity. The recovered source evidence is unchanged.
 
 The project has real cycle-level signal and actual-block datasets, but the
 present predictor gain is small and the strong-paper outcome remains unachieved.
-The most useful next result is a trustworthy **same-engine, output-validated
-cost/benefit measurement of genuine packed adaptive execution**. That result
-will tell us whether further predictor work has enough systems headroom to matter.
+The immediate question is whether a supported MoE/high-concurrency regime has
+a meaningfully steeper fixed-width cost curve. Favorable measurements would
+justify matched MoE acceptance headroom and then **same-engine, output-validated
+packed adaptive execution**. The 4B oracle must not be presented as MoE headroom.

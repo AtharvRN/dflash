@@ -148,7 +148,9 @@ def wave(base, items, model, length, cap):
     start = time.perf_counter()
     response = requests.post(base+"/generate", json={
         "input_ids": [row["input_ids"][model][str(length)] for row in items],
-        "sampling_params": {"temperature": 0, "top_k": 1, "max_new_tokens": cap, "ignore_eos": True},
+        "sampling_params": {"temperature": 0, "top_k": 1, "top_p": 1, "min_p": 0,
+                            "repetition_penalty": 1, "frequency_penalty": 0, "presence_penalty": 0,
+                            "max_new_tokens": cap, "ignore_eos": True},
         "return_logprob": False}, timeout=900)
     response.raise_for_status()
     elapsed = time.perf_counter()-start
@@ -165,6 +167,9 @@ def wave(base, items, model, length, cap):
 
 def serve(args, model, registry, block, mode, workload, gpu, source, cache, smoke=False):
     repo = Path(__file__).resolve().parents[1]
+    current_gpu = check_gpu(args.gpu)
+    if current_gpu["uuid"] != gpu["uuid"]:
+        raise RuntimeError("GPU identity changed between stages")
     stage = args.output/f"{model}_b{block}_{'smoke' if smoke else mode}"
     stage.mkdir()
     max_c = 4 if smoke else 128
@@ -185,6 +190,10 @@ def serve(args, model, registry, block, mode, workload, gpu, source, cache, smok
         "SGLANG_DG_CACHE_DIR": str(cache/"deep_gemm"), "TORCH_HOME": str(cache/"torch"),
         "TORCH_EXTENSIONS_DIR": str(cache/"extensions"), "SGLANG_ENABLE_SPEC_V2": "1",
         "SGLANG_ENABLE_DFLASH_SPEC_V2": "1", "SGLANG_DFLASH_TIMING": "0"}
+    if model == "moe":
+        # C128/B16 requires ~510 MiB for one FlashInfer graph temporary alone.
+        # Qwen3Moe is not covered by the backend's Qwen3-dense 512 MiB override.
+        env["SGLANG_FLASHINFER_WORKSPACE_SIZE"] = str(1024**3)
     if mode == "events" and not smoke:
         env.update(PYTHONPATH=f"{repo}/scripts/sglang_v2_profile_hook:{source}/python",
                    DFLASH_V2_PROFILE="1", DFLASH_V2_PROFILE_DIR=str(stage))

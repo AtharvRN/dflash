@@ -118,7 +118,7 @@ def main():
              **{name: result["0.96"] for name, result in hindsight.items()}}
     for name, point in table.items():
         lines.append(f"| {name} | {point['mean_accepted']:.4f} | {point['mean_budget']:.4f} | {point['aggregate_accept_ratio']:.5f} | {point['retention']:.5f} |")
-    lines += ["", "The 96% cycle oracle uses mean block size **7.4633**, including the anchor. This is a token-work bound, not a measured or rigorous throughput ceiling.", "",
+    lines += ["", f"The 96% cycle oracle uses mean block size **{hindsight['cycle_hindsight']['0.96']['mean_block']:.4f}**, including the anchor. This is a token-work bound, not a measured or rigorous throughput ceiling.", "",
               "At 100% aggregate retention, cycle/request hindsight mean budgets are "+
               f"{hindsight['cycle_hindsight']['1.0']['mean_budget']:.4f} / {hindsight['request_hindsight']['1.0']['mean_budget']:.4f}.", ""]
     lines += ["- "+s for s in summary["limits"]]
