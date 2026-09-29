@@ -1246,8 +1246,8 @@ or all runtime dependencies.
 ## 16. Current handoff
 
 This section records the September 28 handoff; see the dated addendum in
-sections 17–18 for the later completed intermediate-target probe pilot and
-controlled data/update scaling study.
+sections 17–19 for the later intermediate-target probe pilot, controlled
+data/update scaling study, and confidence-first cascade test.
 
 The newest completed analysis at that handoff was the matched-state oracle in section 9.1. A
 bounded dense/MoE fixed-width screen is launched on GPU 4, with C1/C4 model
@@ -1333,3 +1333,49 @@ Training loss continues falling while calibration loss rises; more data reduces
 but does not eliminate overfitting. The improvement argues against declaring
 an intrinsic information limit from the 2k pilot, but still does not justify
 segmented-engine integration or an automatic larger sweep.
+
+## 19. September 29 addendum: confidence-first L6 cascade
+
+The subsequently authorized bounded complementarity test is complete. See
+[full protocol, audits, results and paths](midverify_cascade_20260929.md).
+No new data, target/drafter forward passes or fine-tuning, engine changes,
+or recurring monitor. Same 9,999 training / 342 calibration / 1,416 assessment
+states, all frozen. Only L6 is used.
+
+First trim with draft candidate logprob to K0 query rows; then an L6 probe may
+shorten this to K1 <= K0. Joint exact threshold calibration minimizes
+`[6*K0+30*K1]/36` at 96% or 99% accepted-token retention. Both target-free learned
+controls get the same two-threshold search, with cost K1 because both decisions
+are available before target verification. All lengths remain integers 1–16.
+
+Three feature ablations, seeds 913/914/915: confidence-only (641 parameters),
+candidate-confidence (328,321), and target-candidate-confidence (983,681).
+Same 128-wide GELU MLP, dropout 0.05, masked BCE, AdamW 3e-4 and 1,024-update budget.
+Nine models, 18 calibration-selected checkpoints. Also evaluate the frozen
+target-only L6 heads under the new cascade policy, with no weight changes.
+
+| Calibration target | Policy | Assessment retention | Full-depth-equivalent work rows |
+| --- | --- | ---: | ---: |
+| 96% | Calibration-chosen target-free controls | 94.805% | 8.895 |
+| 96% | Confidence-first L6 fusion cascade | 95.012% | 8.787 |
+| 99% | Calibration-chosen target-free controls | 98.395% | 10.666 |
+| 99% | Confidence-first L6 fusion cascade | 98.209% | 9.999 |
+
+These are three-seed means, not ensembles. The 96% setting offers only about
+1.22% work reduction; two seed-specific paired work intervals span zero. At 99%,
+work falls 6.25%, with 0.186pp lower retention. Each seed's paired work-saving
+interval excludes zero, but retention equivalence is not established. All
+values are offline work proxies, not latency/throughput; target-feature head
+overfitting, unmatched parameter counts and calibration uncertainty remain.
+
+Forty focused tests, CPU smoke, all 18 exact checkpoint reloads and the 26-file
+remote completion audit passed. Main launch commit `db47d71`; GPU4 completed in
+19.14 seconds excluding initial source audit and was idle afterward. The initial
+SSH connection reset started no run, verified before retry. Reports and plots
+are copied under `outputs/midverify_cascade_20260929`.
+
+Current finding: evidence of modest complementary target signal, especially
+at the higher-retention point, not yet a matched-retention systems win. No
+automatic 100k collection or segmented-engine integration. A further gate would
+be retention-controlled confirmation versus the strongest target-free controls,
+followed only then by bounded overhead and actual-forward checks.

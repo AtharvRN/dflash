@@ -224,3 +224,9 @@ Local copied artifacts:
 - [Optimization/overfitting plot](/Users/atharvramesh/Projects/MLSys/dflash-headroom/outputs/midverify_scaling_10k_20260929/training/optimization_L6.png)
 - [Machine-readable results and all paired intervals](/Users/atharvramesh/Projects/MLSys/dflash-headroom/outputs/midverify_scaling_10k_20260929/training/summary.json)
 - [Generated compact report](/Users/atharvramesh/Projects/MLSys/dflash-headroom/outputs/midverify_scaling_10k_20260929/training/report.md)
+
+Subsequent user-authorized follow-up: the bounded
+[confidence-first L6 cascade test](midverify_cascade_20260929.md) is complete.
+It reuses this cache without collection and evaluates target information beyond
+confidence/candidate-only controls. Gains are modest and retention differs;
+no online integration was launched.

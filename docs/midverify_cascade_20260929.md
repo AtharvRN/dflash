@@ -1,4 +1,4 @@
-# Confidence-first / L6 correction: bounded preregistered test
+# Confidence-first / L6 correction: protocol and completed results
 
 Authorized 2026-09-29 after the controlled 2k/5k/9,999 scaling study. Question:
 does intermediate target computation add useful information beyond already
@@ -92,5 +92,137 @@ development data, not an untouched paper test. No automatic integration follows.
 
 CPU unit tests and a bounded three-model CPU smoke precede the main GPU run.
 Use only the idle authorized GPU4, checking immediately before allocation.
-Fresh durable run destination, max runtime1,800 seconds, no overwrite or monitor.
+Fresh durable run destination, max runtime 1,800 seconds, no overwrite or monitor.
 Models/data remain under `/data/scratch/zekaili/atharv/dflash`; deploy via git.
+
+## Completed execution (2026-09-29)
+
+Implementation/launch commit: `db47d71`. Forty focused tests passed, including
+exact joint calibration versus brute force, float32 threshold transitions,
+prefix availability/no resurrection, cost accounting and target-free feature
+independence. The three-model CPU smoke passed six checkpoint reloads.
+
+The initial SSH launch connection reset. Read-only inspection established that
+no job or run directory had started and GPU4 was idle before retry. Successful
+main launch parent PID 3422004; all nine models / 18 selected checkpoints completed
+with exit code 0. Training/scoring/reporting took 19.14 seconds, excluding initial source
+hash verification. No new data or target/drafter forward passes were collected.
+
+All 18 checkpoint reloads reproduce calibration and assessment scores exactly.
+All 26 completion-bound files (including checkpoints) passed a fresh remote
+checksum audit. The eight downloaded bound report/score/plot/metadata files
+passed local verification. Raw confidence scores and both frozen operating
+points reproduce the preceding run exactly. GPU4 was verified at 0 MiB / 0% after
+completion. No integration, additional sweep or recurring monitor was started.
+
+Models actually fitted: confidence-only 3-128-1 (641 parameters),
+candidate-confidence 2563-128-1 (328,321 parameters), and
+target-candidate-confidence 7683-128-1 (983,681 parameters), three seeds each.
+All use GELU/dropout 0.05 and the preregistered masked BCE/update budget.
+
+## Primary assessment results
+
+Arithmetic means across three separately fitted seeds, not an ensemble or
+best-seed selection. Raw confidence is one frozen policy. Retention is measured
+on assessment; it is not forced to equal the calibration constraint. Work is
+full-depth-equivalent target query rows, not measured latency or throughput.
+
+| Calibration target | Policy | Assessment retention | Front rows K0 | Final rows K1 | Work proxy | Work/committed |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 96% | Raw confidence | 95.248% | 9.049 | 9.049 | 9.049 | 1.2446 |
+| 96% | Learned confidence | 94.805% | 9.107 | 8.896 | 8.896 | 1.2284 |
+| 96% | Candidate + confidence | 95.220% | 9.049 | 9.027 | 9.027 | 1.2418 |
+| 96% | Confidence → frozen target-only L6 | 94.966% | 9.202 | 8.812 | 8.877 | 1.2240 |
+| 96% | Confidence → target/candidate/confidence L6 | 95.012% | 9.069 | 8.730 | 8.787 | 1.2110 |
+| 99% | Raw confidence | 98.809% | 11.030 | 11.030 | 11.030 | 1.4696 |
+| 99% | Learned confidence | 98.649% | 11.208 | 10.866 | 10.866 | 1.4497 |
+| 99% | Candidate + confidence | 98.395% | 11.030 | 10.666 | 10.666 | 1.4262 |
+| 99% | Confidence → frozen target-only L6 | 98.495% | 11.119 | 10.079 | 10.252 | 1.3697 |
+| 99% | Confidence → target/candidate/confidence L6 | 98.209% | 11.119 | 9.775 | 9.999 | 1.3393 |
+
+"Fused" in the generated plot means the new fusion of L6 target features,
+candidate vector and confidence statistics, NOT the earlier DFlash fused-context
+vector. No DFlash fused-context input was used in this experiment.
+
+### Compare against the stronger target-free alternatives
+
+At 96%, calibration chooses learned confidence for seeds 913/914 and
+candidate-confidence for 915. Their mean assessment is 94.805% retention and
+8.895 work rows. The L6 cascade gives 95.012% and 8.787: about 1.22% less work,
+with 0.207 percentage points higher mean retention. This is a small effect:
+paired work-delta 95% intervals cross zero for seeds 913/914; seed 915 has a clear
+work reduction but lower retention than its own selected reference. Do not
+describe this as a robust matched-retention win across seeds.
+
+At 99%, calibration chooses candidate-confidence for every seed. Its mean is
+98.395% retention and 10.666 work rows. The L6 cascade gives 98.209% and 9.999:
+about 6.25% less work, with 0.186 percentage points lower retention. Work per
+committed token falls from 1.4262 to 1.3393 (about 6.10%). Both remain proxies.
+
+Paired whole-prompt bootstrap 95% intervals for the relative work saving versus
+the corresponding candidate-confidence reference are:
+
+- Seed 913: 5.50–7.74%.
+- Seed 914: 5.17–7.32%.
+- Seed 915: 4.96–7.00%.
+
+Each retention-delta interval spans zero, but the lower endpoints allow losses
+of about 0.55–0.83 percentage points. Thus this does NOT establish retention
+equivalence or noninferiority. The work intervals condition on the fitted
+policies and do not capture calibration/model-selection uncertainty.
+
+Against raw confidence alone, cascade work savings are 2.90% at the 96%-calibrated
+point and 9.35% at the 99%-calibrated point, with retention lower by 0.236pp and
+0.601pp respectively. Reporting only those savings would overstate the added
+value of target computation relative to the stronger learned target-free heads.
+
+### Optimization and diagnostic findings
+
+The L6 fusion checkpoints selected at 96% are updates 320/704/320; at 99%,
+320/192/320. Their calibration BCE rises with prolonged training even as train
+BCE falls. The tiny confidence-only model selects updates 1024/1024/1024 at 96%
+and 1024/960/960 at 99%, so this remains a fixed-budget comparison, not proof that
+every architecture is converged or that all target-free possibilities are exhausted.
+
+Assessment masked BCE at the 99%-selected checkpoints averages 0.2050 for
+confidence-only, 0.2442 for candidate-confidence, and 0.2409 for L6 fusion. The
+policy/work advantage does not imply universally better probability prediction.
+Hidden width is matched, not parameter count, so this is not a complete
+capacity-controlled information-theoretic test.
+
+An oracle second-stage boundary after the frozen raw-confidence prefix would
+use 7.568 work rows at exactly 95.248% retention, or 8.093 rows at exactly 98.809%.
+These bounds preserve the reference accepted tokens and include front-layer
+work, but assume clairvoyance and zero probe/compaction overhead. They are not
+achieved by the learned cascade and not bounds on measured latency.
+
+## Interpretation / handoff
+
+The cascade is more promising than paying for full-width L6 processing before
+any trimming. These results suggest complementary target-side signal at the
+higher-retention operating point, but its incremental estimated-work benefit
+over learned target-free controls is modest, with a retention tradeoff.
+
+This test does not yet establish a same-retention gain or an online speedup,
+and does not justify a large integration or 100k collection automatically. If
+continued, the next gate is retention-controlled confirmation against the
+strongest target-free controls (including fresh prompt-level evaluation), then
+a bounded overhead/segmented-forward feasibility check—not another architecture
+or data sweep by default. No such follow-up has been launched.
+
+## Full paths
+
+Remote:
+`/data/scratch/zekaili/atharv/dflash/runs/midverify_cascade_20260929`
+
+- `training/`: config, normalization, all 18 checkpoints, frozen scores,
+  calibration histories, paired intervals, completion hashes and plots.
+- `training.log`, `exit.txt`: execution evidence.
+- CPU smoke: `/data/scratch/zekaili/atharv/dflash/runs/midverify_cascade_smoke_20260929`.
+
+Local reports:
+
+- [Policy comparison plot](/Users/atharvramesh/Projects/MLSys/dflash-headroom/outputs/midverify_cascade_20260929/training/cascade_comparison.png)
+- [Learning curves](/Users/atharvramesh/Projects/MLSys/dflash-headroom/outputs/midverify_cascade_20260929/training/learning_curves.png)
+- [All metrics, thresholds and paired intervals](/Users/atharvramesh/Projects/MLSys/dflash-headroom/outputs/midverify_cascade_20260929/training/summary.json)
+- [Generated report](/Users/atharvramesh/Projects/MLSys/dflash-headroom/outputs/midverify_cascade_20260929/training/report.md)
