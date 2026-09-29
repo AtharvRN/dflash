@@ -103,3 +103,23 @@ def prompt_bootstrap(accepted, kept, prompt_ids, layer=0, draws=1000, seed=929):
             "mean_kept_rows_ci95": ci(sample[:, 2] / sample[:, 3]),
             "row_layer_work_per_committed_token_ci95": ci(sample[:, 4] / sample[:, 5]),
             "resamples": draws, "unit": "whole prompts; calibration decisions held fixed"}
+
+
+def ideal_work_at_progress(mean_accepted, layer, depth=36):
+    """Lower bound at a specified accepted-token count on unchanged candidates.
+
+    Each accepted token needs one retained query row, plus one anchor row per
+    state. This allows clairvoyance and arbitrary integer K in [1,16]. It is
+    a row-layer-work bound only: it is NOT a lower bound on measured latency.
+    """
+    if not 0 <= mean_accepted <= 15 or not 0 <= layer <= depth or depth <= 0:
+        raise ValueError("Invalid progress/depth")
+    return (layer * 16 + (depth - layer) * (mean_accepted + 1)) / depth
+
+
+def break_even_oracle_depth(mean_accepted, mean_kept_rows, depth=36):
+    if not 0 <= mean_accepted <= 15 or not mean_accepted + 1 <= mean_kept_rows <= 16:
+        raise ValueError("Control violates retained-prefix work bound")
+    if mean_accepted == 15:
+        return float(depth)
+    return depth * (mean_kept_rows - mean_accepted - 1) / (15 - mean_accepted)

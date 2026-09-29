@@ -86,3 +86,23 @@ Related mechanisms reviewed:
 - https://arxiv.org/html/2604.20503v1 (FASER, token-wise early exiting).
 - https://arxiv.org/html/2402.11131 (Speculative Streaming, parallel tree pruning).
 - https://arxiv.org/html/2605.16786v1 (Lever, predictor-based verification pruning).
+
+## Verified smoke and launch
+
+Implementation commit: `e6d7a01`. The 28 focused unit/regression tests passed
+on the workstation's existing environment (4.45 seconds).
+
+`runs/midverify_probe_smoke_20260929` completed collection and ten one-epoch
+smoke trainings. All 24 fresh acceptance labels and 24 anchors matched the
+saved originals. Six batched-versus-single numerical controls had zero target
+argmax differences. Hidden relative L2 differences were approximately
+0.6–1.7%, so this is **not** bitwise parity. Replayed draft argmax agreed with
+98.33% of saved candidate IDs; this validates why the recomputed confidence
+baseline must be explicitly labelled as replayed.
+
+The full `runs/midverify_probe_2k_20260929` pipeline was launched on the idle
+authorized GPU4, UUID `GPU-2b489243-113f-1e33-ee0b-e4d28423e006`, parent PID
+3070962. Early progress: 456/3,758 states, 37.2 states/s, GPU utilization 86%
+and 11,455 MiB device memory. These are collection performance observations,
+not speculative-decoding throughput. Final audit/results are pending at this
+entry; a running process is not a completed experiment.

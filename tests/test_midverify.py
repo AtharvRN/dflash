@@ -79,3 +79,16 @@ def test_candidate_conditioned_head_and_features():
     assert torch.isfinite(x).all()
     for kind in ("linear", "mlp128"):
         assert build_probe(kind, width=8)(x).shape == (2, 15, 1)
+
+
+def test_matched_progress_oracle_and_break_even_depth():
+    from dflash.midverify import ideal_work_at_progress, break_even_oracle_depth
+    assert ideal_work_at_progress(6, 0) == 7
+    assert ideal_work_at_progress(6, 12) == 10
+    assert ideal_work_at_progress(6, 36) == 16
+    depth = break_even_oracle_depth(6, 9)
+    assert depth == 8
+    assert ideal_work_at_progress(6, depth) == 9
+    assert break_even_oracle_depth(15, 16) == 36
+    with pytest.raises(ValueError):
+        break_even_oracle_depth(6, 6)
