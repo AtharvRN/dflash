@@ -323,7 +323,10 @@ def install(module):
     def initialize(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
         if os.environ.get("DFLASH_SAVED_TARGET_FIXTURE"):
-            from saved_state_fixture import run
+            if os.environ.get("DFLASH_SAVED_FIXTURE_EXTENDED") == "1":
+                from saved_outlier_fixture import run
+            else:
+                from saved_state_fixture import run
             run(self.target_worker.model_runner, Path(os.environ["DFLASH_SAVED_TARGET_FIXTURE"]), ROOT)
         def project(hidden):
             return project_without_inference_buffers(self, hidden)

@@ -41,7 +41,11 @@ def main():
                         help="Skip redundant draft shadows when investigating target verification")
     parser.add_argument("--saved-target-fixture", type=Path,
                         help="Run only the B7 saved-state numerical fixture; no request workload")
+    parser.add_argument("--extended-fixture", action="store_true",
+                        help="Replay a version-2 outlier with matched execution rows and original graph layout")
     args = parser.parse_args()
+    if args.extended_fixture and not args.saved_target_fixture:
+        raise ValueError("Extended fixture requires a saved target state")
     if not 2 <= args.audit_min_bs <= args.concurrency or not 0 <= args.fixed_cap <= 256:
         raise ValueError("Invalid bounded audit/stress settings")
     if args.output.exists():
@@ -97,6 +101,7 @@ def main():
             env["DFLASH_RAGGED_AUDIT_ROLES"] = "target" if args.audit_target_only else "draft,target"
             if args.saved_target_fixture:
                 env["DFLASH_SAVED_TARGET_FIXTURE"] = str(args.saved_target_fixture)
+                env["DFLASH_SAVED_FIXTURE_EXTENDED"] = "1" if args.extended_fixture else "0"
             for k, v in env.items():
                 launch += ["-e", f"{k}={v}"]
             launch += ["--entrypoint", "python", IMAGE, "-m", "sglang.launch_server",

@@ -122,3 +122,14 @@ def test_saved_state_comparison_counts_bonus_and_hidden_error(monkeypatch):
     changed = hidden.clone()
     changed[2, 123] = 10
     assert module.compare(changed, hidden)["max_abs"] == 9
+
+
+def test_outlier_fixture_matches_executed_not_only_real_token_rows():
+    spec = importlib.util.spec_from_file_location("outlier_fixture", ROOT / "scripts/ragged_audit_hook/saved_outlier_fixture.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    state = {"input_ids": [1]*15, "packed_input_tokens": 630, "packed_batch_size": 63,
+             "captured_batch_size": 64, "graph_used": True, "num_tokens_per_batch": 10}
+    assert module.uniform_shape(state, 64) == ((40, 16), 640)
+    state.update(input_ids=[1]*7, graph_used=False)
+    assert module.uniform_shape(state, 64) == ((63, 10), 630)
