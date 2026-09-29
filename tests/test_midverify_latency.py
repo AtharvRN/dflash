@@ -37,3 +37,21 @@ def test_state_selection_has_no_label_filter_and_no_duplicate_prompts():
     source[2]['draft_ids'] = [99] * 15
     with pytest.raises(ValueError, match='changed'):
         select_states(rows, source, 3)
+
+
+def test_latency_aggregation_uses_total_tokens_not_mean_of_ratios():
+    from scripts.summarize_midverify_latency import aggregate
+    cells = []
+    for case in ('fixed16', 'fixed8_redraft', 'target_free'):
+        for elapsed, committed in ((10., 10), (20., 30)):
+            cells.append({'C': 4, 'mode': 'graph', 'case': case, 'rows': 4,
+                'observations': [{'committed_tokens': committed}],
+                'uninstrumented_cycle_ms': {'mean': elapsed, 'stdev': .1},
+                'mean_front': 8., 'mean_end': 8., 'phase_stream_ms': {},
+                'anchor_mismatches': 0, 'audit': {'top1_differences': 0,
+                    'acceptance_differences': 0, 'bonus_differences': 0,
+                    'hidden': {'relative_l2': 0.}}})
+    r = aggregate(cells)['c4_graph_target_free']
+    assert r['ms_per_committed_token'] == .75
+    assert r['retention_vs_same_engine_b16'] == 1
+    assert r['speed_ratio_vs_fixed16'] == 1
