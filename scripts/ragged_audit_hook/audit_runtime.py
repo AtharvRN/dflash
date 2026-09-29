@@ -63,6 +63,16 @@ def acceptance_summary(tokens, actual_logits, reference_logits):
             "same_emitted_tokens": actual == reference}
 
 
+def project_without_inference_buffers(worker, hidden):
+    # The audit runs *inside* the draft-forward inference_mode context, whereas
+    # the normal worker projects afterwards, outside it. Growing its persistent
+    # projection buffers inside inference_mode would poison their next normal
+    # out= update. Keep these test-created buffers ordinary no-grad tensors.
+    with torch.inference_mode(False), torch.no_grad():
+        return worker._greedy_sample_from_vocab_parallel_head(
+            hidden_states=hidden, lm_head=worker.target_worker.model_runner.model.lm_head)
+
+
 def batch_view(fb, rows, lengths, physical):
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.speculative.dflash_info import DFlashRaggedVerifyInput
@@ -215,8 +225,7 @@ def install(module):
     def initialize(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
         def project(hidden):
-            return self._greedy_sample_from_vocab_parallel_head(
-                hidden_states=hidden, lm_head=self.target_worker.model_runner.model.lm_head)
+            return project_without_inference_buffers(self, hidden)
 
         self.draft_model_runner.forward = audited_forward(self.draft_model_runner, "draft", project)
         self.target_worker.model_runner.forward = audited_forward(self.target_worker.model_runner, "target")

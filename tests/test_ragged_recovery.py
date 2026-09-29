@@ -71,3 +71,17 @@ def test_shadow_forward_preserves_inplace_embedding_inputs(tmp_path, monkeypatch
     assert records[0]["isolation_hidden"]["bitwise_equal"]
     tied = torch.ones(16, 64)
     assert module.compare(tied, tied, logits=True)["top1_mismatches"] == 0
+
+    # Shadow projection must not create inference tensors in production caches.
+    class Worker:
+        target_worker = SimpleNamespace(model_runner=SimpleNamespace(model=SimpleNamespace(lm_head=None)))
+
+        def _greedy_sample_from_vocab_parallel_head(self, hidden_states, lm_head):
+            self.buffer = torch.empty(hidden_states.shape[0], dtype=torch.long)
+            return self.buffer.zero_()
+
+    worker = Worker()
+    with torch.inference_mode():
+        module.project_without_inference_buffers(worker, torch.ones(257, 4))
+    assert not worker.buffer.is_inference()
+    worker.buffer.fill_(42)
