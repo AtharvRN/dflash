@@ -129,10 +129,10 @@ class Snapshot:
                 target_hidden=out.hidden_states, cache_loc=slots, positions=pos)
         torch.cuda.synchronize()
 
-    def fb(self, lens, noise=False):
+    def fb(self, lens, noise=False, blocks=None):
         lens = np.asarray(lens, dtype=np.int32)
         idx = cuda(packed_indices(lens), torch.long)
-        tokens = self.blocks
+        tokens = self.blocks if blocks is None else blocks
         if noise:
             tokens = torch.full_like(tokens, int(self.worker._mask_token_id))
             tokens[:, 0] = self.blocks[:, 0]
@@ -260,18 +260,18 @@ class Policy:
         return torch.minimum(front, k), q
 
 
-def draft_forward(snapshot, timer, confidence=True):
+def draft_forward(snapshot, timer, confidence=True, block_size=16):
     with timer.phase('draft_setup_and_metadata'):
-        fb, _ = snapshot.fb(np.full(snapshot.n, 16, dtype=np.int32), noise=True)
+        fb, _ = snapshot.fb(np.full(snapshot.n, block_size, dtype=np.int32), noise=True)
         snapshot.draft.attn_backend.init_forward_metadata(fb)
     with timer.phase('draft_transformer'):
         with forward_context(ForwardContext(attn_backend=snapshot.draft.attn_backend)):
             output = snapshot.draft.model(fb.input_ids, fb.positions, fb, input_embeds=fb.input_embeds)
     with timer.phase('draft_projection_and_confidence'):
-        h = output.hidden_states.reshape(snapshot.n, 16, -1)[:, 1:].reshape(-1, 2560)
+        h = output.hidden_states.reshape(snapshot.n, block_size, -1)[:, 1:].reshape(-1, 2560)
         weight = snapshot.runner.model.lm_head.weight[:snapshot.runner.model.config.vocab_size]
         logits = (h @ weight.T).float()
-        predictions = logits.argmax(-1).reshape(snapshot.n, 15)
+        predictions = logits.argmax(-1).reshape(snapshot.n, block_size-1)
         stats = None
         if confidence:
             logprob = logits.log_softmax(-1)
@@ -302,8 +302,13 @@ class Case:
         s, timer, case = self.s, Timer(timed), self.case
         torch.cuda.synchronize()
         begin = time.perf_counter()
-        stats, draft_top = draft_forward(s, timer, confidence=not case.startswith('fixed'))
+        draft_size = 8 if case == 'fixed8_redraft' else 16
+        stats, draft_top = draft_forward(s, timer, confidence=not case.startswith('fixed'), block_size=draft_size)
         with timer.phase('stage0_probe_and_pack'):
+            blocks = s.blocks
+            if case == 'fixed8_redraft':
+                blocks = blocks.clone()
+                blocks[:, 1:8] = draft_top
             if case.startswith('fixed'):
                 front = np.full(s.n, 16 if case == 'fixed16' else 8, dtype=np.int32)
                 policy, k_gpu = None, cuda(front, torch.int32)
@@ -316,7 +321,7 @@ class Case:
                 if case != 'cascade':
                     k_gpu, _ = policy.end(torch.cat([e, conf], -1), k_gpu)
                 front = k_gpu.cpu().numpy()
-            fb, front_idx = s.fb(front)
+            fb, front_idx = s.fb(front, blocks=blocks)
         if case in ('cascade', 'target_free_split'):
             state = self.segment(0, fb, 0, 6, timer)
             with timer.phase('stage1_probe'):
@@ -335,7 +340,7 @@ class Case:
                 end = end_gpu.cpu().numpy()
                 gather = cuda(compact_indices(front, end), torch.long)
                 compact = tuple(x.index_select(0, gather) for x in state)
-                final_fb, final_idx = s.fb(end)
+                final_fb, final_idx = s.fb(end, blocks=blocks)
             result = self.segment(1, final_fb, 6, 36, timer, compact)
         else:
             end, end_gpu, final_fb, final_idx = front, k_gpu, fb, front_idx
@@ -344,7 +349,7 @@ class Case:
             top1 = torch.full((s.n*16,), -1, device='cuda', dtype=torch.long)
             top1[final_idx] = result[2]
             top1 = top1.reshape(s.n, 16)
-            match = (top1[:, :15] == s.blocks[:, 1:]) & (torch.arange(15, device='cuda')[None] < end_gpu[:, None]-1)
+            match = (top1[:, :15] == blocks[:, 1:]) & (torch.arange(15, device='cuda')[None] < end_gpu[:, None]-1)
             accepted = match.int().cumprod(1).sum(1).int()
             committed = accepted+1
             bonus = top1.gather(1, accepted.long()[:, None]).squeeze(1)
@@ -362,7 +367,8 @@ class Case:
         # These copies/diagnostics are OUTSIDE cycle timing.
         self.last = {'front': front.tolist(), 'end': end.tolist(), 'accepted': accepted.tolist(),
             'bonus': bonus.tolist(), 'top1': top1.tolist(), 'new_seq_lens': new_seq_lens.tolist(),
-            'draft_top1_changed_positions': int((draft_top != s.blocks[:, 1:]).sum()),
+            'candidate_blocks': blocks.tolist(),
+            'draft_top1_changed_positions': int((draft_top != s.blocks[:, 1:draft_size]).sum()),
             'mean_front': float(np.mean(front)), 'mean_end': float(np.mean(end)),
             'committed_tokens': int(committed.sum()), 'wall_ms': wall_ms, 'phases': phases,
             'row_layer_proxy': float(np.mean((6*np.asarray(front)+30*np.asarray(end))/36)) if case == 'cascade' else float(np.mean(end))}
@@ -378,12 +384,12 @@ def correctness(case):
     locations = case.last_fb.out_cache_loc
     pool = case.s.runner.token_to_kv_pool
     kv = [(i, pool.get_key_buffer(i)[locations].clone(), pool.get_value_buffer(i)[locations].clone()) for i in (0, 5, 35)]
-    fb, idx = case.s.fb(np.asarray(case.last['end'], dtype=np.int32))
+    fb, idx = case.s.fb(np.asarray(case.last['end'], dtype=np.int32), blocks=cuda(case.last['candidate_blocks'], torch.long))
     case.s.runner.attn_backend.init_forward_metadata(fb)
     ref_h, ref_aux, ref_top = target_range(case.s.runner, fb, 0, 36)
     dense = np.full((case.s.n, 16), -1, dtype=np.int64)
     dense.reshape(-1)[idx.cpu().numpy()] = ref_top.cpu().numpy()
-    ref_a, ref_b = accepted_from_top1(case.s.blocks.cpu().numpy(), dense, case.last['end'])
+    ref_a, ref_b = accepted_from_top1(case.last['candidate_blocks'], dense, case.last['end'])
     report = {'hidden': difference(final_h, ref_h), 'draft_features': difference(final_aux, ref_aux),
         'top1_differences': int((final_top != dense).sum()),
         'acceptance_differences': int((np.array(case.last['accepted']) != ref_a).sum()),
@@ -438,6 +444,11 @@ def run(worker, config_path):
                         cases[name] = (current, audit)
                         print(json.dumps({'stage': 'ready', 'C': concurrency, 'offset': offset,
                             'mode': mode, 'case': name, 'audit': audit, 'lengths': current.last['end']}), flush=True)
+                    unsplit, split = cases['target_free'][0], cases['target_free_split'][0]
+                    split_control = difference(split.last_hidden, unsplit.last_hidden)
+                    atomic_json(output/f'split_control_c{concurrency}_offset{offset}_{mode}.json', split_control)
+                    if not split_control['bitwise']:
+                        raise AssertionError('Matched no-prune split differs from unsplit in the same execution mode')
                     observations = {name: [] for name in cases}
                     clean = {name: [] for name in cases}
                     rng = random.Random(929+concurrency+offset)

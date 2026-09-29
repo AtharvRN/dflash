@@ -16,9 +16,9 @@ Current policies use fresh same-engine draft confidence and L6 target features;
 record numerical and policy drift rather than treating offline features as free.
 
 Compare fixed full B16, fixed post-draft B8 truncation (same B16 candidates, not
-actual shorter drafting), target-free learned trimming, the same target-free
-policy with a no-prune L6 split, and the L6 cascade. All candidates and prefix
-tokens are preserved. Measure both eager execution and manually captured
+actual shorter drafting), actual B8 redrafting, target-free learned trimming, the same target-free
+policy with a no-prune L6 split, and the L6 cascade. Prefix tokens are preserved;
+only the explicitly labeled B8 redraft control changes candidates. Measure both eager execution and manually captured
 exact-shape target graphs, with eager drafting for every case. These graph
 captures use native attention planning and native model layers but are NOT a
 general graph-bucket scheduler integration. Misses must fail, not silently pad.
