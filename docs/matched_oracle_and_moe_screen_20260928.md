@@ -175,8 +175,39 @@ longer contexts. Each request returned exactly 256 completion tokens.
 Two measured waves after a same-cell warmup; these SDs describe only those two
 waves, not a confidence interval or general robustness. Timing includes prefill
 and drain; do not compare against the older v1/different-prompt dense table.
-The separate MoE B16 event stage is next, followed by B8 event/clean runs and the
-dense control. **No adaptive or B8/B16 speedup can be claimed from this table.**
+The separate MoE B16 event stage is also complete, followed in the bounded queue
+by B8 event/clean runs and the dense control. **No adaptive or B8/B16 speedup can
+be claimed from this table.**
 
 Completed baseline artifacts are also local under
 `outputs/fixed_regime_screen_v4_20260928/moe_b16_clean/`.
+
+## 6. Completed MoE B16 decode-worker timing
+
+Saved component summaries were recomputed locally from all event records and
+matched exactly. Values below are means pooled across the two measured waves,
+using **only actual full-concurrency cycles**. Every included target verification
+used a CUDA graph; the drafter remains eager. Units: CUDA-stream elapsed ms.
+
+| Component | C64 / prompt 512 | C64 / prompt 1,024 | C128 / prompt 512 | C128 / prompt 1,024 |
+| --- | ---: | ---: | ---: | ---: |
+| Runtime fixed-block choice | 0.0087 | 0.0088 | 0.0088 | 0.0086 |
+| Draft setup | 0.1984 | 0.1971 | 0.2001 | 0.2003 |
+| Draft transformer | 5.3316 | 5.8579 | 8.8519 | 9.8466 |
+| Draft vocabulary projection | 1.8294 | 1.8418 | 3.4981 | 3.5041 |
+| Verify preparation | 0.4683 | 0.4753 | 0.7206 | 0.7530 |
+| Target verify incl. logits | 73.5025 | 75.6074 | 91.4556 | 97.2880 |
+| Acceptance/bonus | 0.4586 | 0.4588 | 0.8636 | 0.8635 |
+| Draft KV materialization | 0.7186 | 0.7229 | 0.8018 | 0.7981 |
+| Other within worker | 0.4587 | 0.4875 | 0.4460 | 0.4625 |
+| Total worker cycle | **82.9748** | **85.6576** | **106.8465** | **113.7247** |
+| Full-batch cycles | 36 | 42 | 36 | 42 |
+| Mean actual committed prefix | 542.68 | 1,056.23 | 541.41 | 1,055.12 |
+
+These are disjoint worker phases; host-call durations are separately saved and
+must not be added to GPU-stream durations. No claim about expert-kernel versus
+attention-kernel attribution follows from the target-forward span alone. Actual
+prefix lengths include generated text and differ from the initial prompt length.
+
+Local detailed evidence:
+`outputs/fixed_regime_screen_v4_20260928/moe_b16_events/{component_summary.json,cycles_577.jsonl,hook_577.json,COMPLETE.json}`.
