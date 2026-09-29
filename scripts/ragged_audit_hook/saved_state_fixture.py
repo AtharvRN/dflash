@@ -6,7 +6,8 @@ from types import SimpleNamespace
 import torch
 
 
-@torch.inference_mode()
+@torch.inference_mode(False)
+@torch.no_grad()
 def run(runner, artifact, output):
     from audit_runtime import compare, hidden_detail, acceptance_summary
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode, CaptureHiddenMode
