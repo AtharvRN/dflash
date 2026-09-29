@@ -106,3 +106,98 @@ authorized GPU4, UUID `GPU-2b489243-113f-1e33-ee0b-e4d28423e006`, parent PID
 and 11,455 MiB device memory. These are collection performance observations,
 not speculative-decoding throughput. Final audit/results are pending at this
 entry; a running process is not a completed experiment.
+
+## Completed results (2026-09-29)
+
+The full pipeline completed with exit code zero. Collection/audit took 186.6
+seconds (capture itself 176.5 seconds); all 30 probes trained in 9.1 seconds.
+GPU4 was subsequently verified idle. No segmented-target implementation,
+additional GPU job, larger collection or recurring monitor was launched.
+
+Final data: 2,000 train states / 263 prompts, 342 calibration / 47 prompts,
+1,416 assessment / 187 prompts. All original fixed assessment rows retained.
+Fresh same-forward labels were used throughout. Original labels agree in
+3,722/3,758 states (20 train, 4 calibration, 12 assessment disagreements).
+Anchors agree in 3,719 states. Recomputed draft argmax matches 97.784% of saved
+candidate IDs. No fresh accepted-EOS state was found. All eight batch/single
+controls agree on accepted length, although one had two posterior argmax
+differences after the first rejection; this is not bitwise equality. Maximum
+controlled hidden relative L2 difference was 2.58%.
+
+### Corrected scoring is authoritative
+
+A final audit found a NumPy weak-scalar promotion edge case: applying a Python
+float `nextafter` threshold to float32 scores could round back to an exact tie.
+Calibration already used float64; checkpoint and threshold selection were
+unaffected. Commit `6548729` makes inference comparisons float64 too. The
+original data, weights and reports were preserved; frozen scores were rescored
+into **`assessment_fp64`**. Fourteen of 210 policy/retention points changed,
+at most four assessment decisions each. The primary table below and the
+confidence baseline did not change at the displayed precision. Thirty focused
+tests passed after adding an exact float32-threshold regression test.
+
+Use these authoritative artifacts under
+`/data/scratch/zekaili/atharv/dflash/runs/midverify_probe_2k_20260929`:
+
+- `cache/COMPLETE.json`, `cache/audit.json`: immutable collection audit.
+- `training/`: immutable original training histories and all 30 checkpoints.
+- `assessment_fp64/summary.json`, `assessment_fp64/report.md`: corrected
+  assessment, unchanged calibration settings, all seeds and bootstrap intervals.
+- `assessment_fp64/retention_vs_work.png` and `retention_vs_kept.png`: corrected plots.
+- `matched_progress_and_sensitivity_fp64/`: matched-progress oracle and replay
+  stability checks. `matched_progress_bound/` is the earlier bound-only output.
+
+Small reports, frozen scores and plots are also saved beneath local
+`/Users/atharvramesh/Projects/MLSys/dflash-headroom/outputs/midverify_probe_2k_20260929`.
+Large captured vectors and checkpoints remain on the workstation.
+
+### Calibration-96% operating points
+
+MLP entries are arithmetic means across seeds913/914/915, not selected best
+seeds. Assessment retentions differ; these are calibration-matched operating
+points, not exactly matched assessment retention. All use the same B16
+candidates and fresh labels. Assessment mean B16 accepted length is 6.5840.
+
+| Policy | Assessment retention | Kept query rows | Equivalent full-depth rows |
+| --- | ---: | ---: | ---: |
+| Replayed draft candidate logprob | 95.25% | 9.049 | 9.049 |
+| Replayed draft entropy | 95.32% | 9.507 | 9.507 |
+| MLP after L6 | 95.86% | 11.283 | 12.069 |
+| MLP after L9 | 95.15% | 10.794 | 12.095 |
+| MLP after L12 | 95.14% | 10.540 | 12.360 |
+| MLP after L18 | 95.98% | 10.554 | 13.277 |
+| MLP after L24 | 95.21% | 9.655 | 13.885 |
+
+Draft logprob's aggregate accept ratio is 0.7791 at 0.95248 assessment
+retention. This is **post-draft fixed-candidate trimming**, not achievement of
+the earlier pre-draft 70% target, and not directly comparable to historical
+task tables. Its retention prompt-bootstrap 95% interval is [0.9420, 0.9626].
+
+The learned probes do not justify segmented-engine integration on this pilot:
+later layers reduce kept rows somewhat, but the early full-width layer cost
+outweighs that benefit. This finding does not establish an information limit
+or rule out different training, features, models or workloads.
+
+### Matched-progress ideal bound
+
+For unchanged candidates, `sum(K) >= N + sum(A_trim)`. Thus at a specified
+accepted-token total a clairvoyant probe has minimum row-layer work
+`[16*L + (36-L)*(1+mean(A_trim))]/36`. This is a work bound, **not a latency bound**.
+
+At exactly the draft-logprob control's 95.248% assessment retention, a perfect
+L12 decision costs at least 10.181 full-depth-equivalent rows, versus the
+control's 9.049. The break-even depth is 7.33 layers: a decision after eight
+or more completed layers cannot beat that control in this proxy, even with a
+perfect probe and free compaction. At 98.809% retention the break-even depth
+increases to 14.94 layers; the bound is operating-point dependent.
+
+The comparison survives replay-stability checks without retraining or
+recalibration. Among the 1,033 assessment states where all 15 saved candidates
+also match the recomputed drafter argmax, the frozen confidence control has
+96.47% retention / 10.486 work rows; the L12 MLP seed mean has 95.68% /
+13.027. These subsets are secondary diagnostics, not replacements for the
+full assessment set.
+
+**Decision:** no large integration or scaling job on these results. Preserve
+post-draft confidence as the strong matched control; any revisited mid-target
+proposal must beat it after accounting for the early full-width computation.

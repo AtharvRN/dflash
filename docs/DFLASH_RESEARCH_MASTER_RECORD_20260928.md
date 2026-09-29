@@ -1245,7 +1245,10 @@ or all runtime dependencies.
 
 ## 16. Current handoff
 
-The newest completed analysis is the matched-state oracle in section 9.1. A
+This section records the September 28 handoff; see the dated addendum in
+section 17 for the later completed intermediate-target probe pilot.
+
+The newest completed analysis at that handoff was the matched-state oracle in section 9.1. A
 bounded dense/MoE fixed-width screen is launched on GPU 4, with C1/C4 model
 smokes before C64/C128; see the dedicated screen note for durable paths and
 completion markers. No recurring monitor is active. The earlier fixed-width
@@ -1258,3 +1261,35 @@ The immediate question is whether a supported MoE/high-concurrency regime has
 a meaningfully steeper fixed-width cost curve. Favorable measurements would
 justify matched MoE acceptance headroom and then **same-engine, output-validated
 packed adaptive execution**. The 4B oracle must not be presented as MoE headroom.
+
+## 17. September 29 addendum: intermediate-target probe pilot
+
+The bounded feasibility test is complete, not running. See
+[the full protocol, audit, results and paths](midverify_probe_pilot_20260929.md).
+No serving-engine changes, larger collection or recurring monitor were launched.
+
+Frozen saved B16 candidates were replayed on Qwen3-4B. The dataset contains
+2,000 training cycles (263 prompts), unchanged 342 calibration cycles (47
+prompts), and unchanged 1,416 assessment cycles (187 prompts). Capture layers
+6/9/12/18/24; train candidate-conditioned linear and 128-wide MLP probes,
+three seeds each. Fresh labels and hidden states come from the same forward.
+
+At calibration-96% settings, the replayed post-draft candidate-logprob control
+achieves 95.25% assessment retention with 9.049 full-depth-equivalent work rows.
+The L12 MLP seed mean achieves 95.14% with 12.360 work rows; the L24 MLP achieves
+95.21% with 13.885. These are work proxies, NOT throughput measurements. The
+comparison does not support integrating this pilot into SGLang.
+
+A matched-progress clairvoyant L12 probe needs at least 10.181 work rows at
+the confidence control's exact accepted-token total. Break-even depth in this
+proxy is only 7.33 layers at that operating point. This is not a universal
+hardware/latency ceiling; at higher retention it changes. The control remains
+stronger in diagnostic subsets with stable replayed candidate identities.
+
+Use `outputs/midverify_probe_2k_20260929/assessment_fp64` for authoritative
+metrics/plots and `matched_progress_and_sensitivity_fp64` for the bound and
+replay checks. Original `training` checkpoints/history are preserved. A
+float32 threshold-comparison edge case was fixed by CPU rescoring; checkpoint
+and calibration selection did not change. Final focused tests: 30 passed.
+The detailed note reports all numerical drift and the replayed-confidence
+baseline limitation. No pre-draft 70%-ratio or online-speedup claim follows.
