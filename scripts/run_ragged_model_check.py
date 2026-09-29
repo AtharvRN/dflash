@@ -35,6 +35,10 @@ def main():
                         help="Use SGLang's existing batch-invariant mode as a correctness control, not a timing configuration")
     parser.add_argument("--diagnostics", action="store_true",
                         help="Audit slot aliasing, isolate the worst row, and preserve large-discrepancy tensors/KV")
+    parser.add_argument("--capture-severe-outlier", action="store_true",
+                        help="Investigation ONLY: report smaller discrepancies but stop/save at >50% hidden L2; NOT a correctness pass")
+    parser.add_argument("--audit-target-only", action="store_true",
+                        help="Skip redundant draft shadows when investigating target verification")
     parser.add_argument("--saved-target-fixture", type=Path,
                         help="Run only the B7 saved-state numerical fixture; no request workload")
     args = parser.parse_args()
@@ -88,7 +92,9 @@ def main():
                    "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY": "1",
                    "DFLASH_RAGGED_AUDIT_FORWARDS": str(args.audit_forwards), "SGLANG_DFLASH_TIMING": "0"}
             env["DFLASH_RAGGED_AUDIT_MIN_BATCH"] = str(args.audit_min_bs)
-            env["DFLASH_RAGGED_AUDIT_DIAGNOSTICS"] = "1" if args.diagnostics else "0"
+            env["DFLASH_RAGGED_AUDIT_DIAGNOSTICS"] = "1" if args.diagnostics or args.capture_severe_outlier else "0"
+            env["DFLASH_RAGGED_OUTLIER_CAPTURE"] = "1" if args.capture_severe_outlier else "0"
+            env["DFLASH_RAGGED_AUDIT_ROLES"] = "target" if args.audit_target_only else "draft,target"
             if args.saved_target_fixture:
                 env["DFLASH_SAVED_TARGET_FIXTURE"] = str(args.saved_target_fixture)
             for k, v in env.items():
@@ -144,7 +150,7 @@ def main():
                         atomic_json(stage / f"responses_{repeat}.json", results)
                         print(json.dumps({"mode": mode, "repeat": repeat, "responses": len(results)}), flush=True)
                     audits = [json.loads(line) for path in stage.glob("audit_*.jsonl") for line in path.read_text().splitlines()]
-                    for role in ("draft", "target"):
+                    for role in (("target",) if args.audit_target_only else ("draft", "target")):
                         if not any(r.get("role") == role for r in audits):
                             raise AssertionError("No actual mixed model audit: " + role)
                     if mode == "graph" and not any(r.get("role") == "target" and r["graph_used"] for r in audits):

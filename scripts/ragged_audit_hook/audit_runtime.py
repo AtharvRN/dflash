@@ -20,6 +20,15 @@ ROOT = Path(os.environ["DFLASH_RAGGED_AUDIT_DIR"])
 LIMIT = int(os.environ.get("DFLASH_RAGGED_AUDIT_FORWARDS", "12"))
 MIN_BATCH = int(os.environ.get("DFLASH_RAGGED_AUDIT_MIN_BATCH", "2"))
 DIAGNOSTICS = os.environ.get("DFLASH_RAGGED_AUDIT_DIAGNOSTICS") == "1"
+OUTLIER_CAPTURE = os.environ.get("DFLASH_RAGGED_OUTLIER_CAPTURE") == "1"
+AUDIT_ROLES = set(os.environ.get("DFLASH_RAGGED_AUDIT_ROLES", "draft,target").split(","))
+
+
+def stop_for_hidden_difference(relative_l2, outlier_capture=False):
+    # The normal 5% diagnostic gate is unchanged. Explicit outlier investigation
+    # continues through smaller, fully reported discrepancies to preserve a
+    # severe recurrence; its completion is NOT a correctness pass.
+    return relative_l2 > (0.5 if outlier_capture else 0.05)
 
 
 def emit(row):
@@ -137,7 +146,7 @@ def audited_forward(runner, role, project=None):
     def forward(fb, *args, **kwargs):
         nonlocal checked
         spec = fb.spec_info
-        should_check = (fb.forward_mode.is_target_verify() and
+        should_check = (role in AUDIT_ROLES and fb.forward_mode.is_target_verify() and
                         getattr(spec, "draft_token_num", 0) > 0 and
                         fb.batch_size >= MIN_BATCH and checked < LIMIT)
         # DFlash's fused residual RMSNorm mutates the input-embedding buffer.
@@ -159,6 +168,7 @@ def audited_forward(runner, role, project=None):
         record = {"kind": "same_state_forward", "role": role, "number": checked,
                   "batch_size": fb.batch_size, "real_lengths": real, "physical_lengths": physical,
                   "prefix_lengths": fb.seq_lens.tolist(), "graph_used": bool(out.can_run_graph),
+                  "outlier_capture_only": OUTLIER_CAPTURE,
                   "reference": "independent actual-B, same committed KV prefix", "requests": []}
         graph_runner = getattr(runner, "decode_cuda_graph_runner", None)
         record["captured_batch_size"] = (getattr(graph_runner, "bs", None) if out.can_run_graph else None)
@@ -171,6 +181,9 @@ def audited_forward(runner, role, project=None):
             record["slot_audit"] = slot_audit(runner, fb)
             record["prefix_lengths_cpu"] = fb.seq_lens_cpu.tolist() if fb.seq_lens_cpu is not None else None
             record["prefix_lengths_sum_field"] = fb.seq_lens_sum
+            record["packed_input_ids"] = fb.input_ids.tolist()
+            record["packed_positions"] = fb.positions.tolist()
+            record["req_pool_indices"] = fb.req_pool_indices.tolist()
         # Test all requests, in reverse order to expose hidden batch-order state.
         offsets = [0]
         for size in physical:
@@ -227,13 +240,19 @@ def audited_forward(runner, role, project=None):
                 record["worst_row_same_batch_eager_detail"] = hidden_detail(actual_hidden[first:last], protected_hidden)
                 # Preserve the precise worst case for analysis after a deliberate
                 # failure. This is a bounded local artifact, never training data.
-                if worst_error > 0.05:
+                if stop_for_hidden_difference(worst_error, OUTLIER_CAPTURE):
                     req = int(fb.req_pool_indices[protected])
                     prefix_n = int(fb.seq_lens[protected])
                     prefix_slots = runner.req_to_token_pool.req_to_token[req, :prefix_n].long()
                     path = ROOT / f"discrepancy_{role}_{checked}_{os.getpid()}.pt"
-                    payload = {"role": role, "number": checked, "row": protected,
+                    payload = {"format_version": 2, "role": role, "number": checked, "row": protected,
                                "prefix_length": prefix_n,
+                               "packed_input_tokens": int(fb.input_ids.numel()),
+                               "packed_batch_size": fb.batch_size,
+                               "captured_batch_size": record["captured_batch_size"],
+                               "graph_used": record["graph_used"],
+                               "real_lengths": real, "physical_lengths": physical,
+                               "physical_input_ids": fb.input_ids[first:offsets[protected+1]].cpu(),
                                "input_ids": fb.input_ids[first:last].cpu(),
                                "positions": fb.positions[first:last].cpu(),
                                "actual_hidden": actual_hidden[first:last].cpu(),
@@ -273,11 +292,13 @@ def audited_forward(runner, role, project=None):
         record["restored_hidden"] = compare(actual_hidden, restored.logits_output.hidden_states)
         if actual_logits is not None:
             record["restored_logits"] = compare(actual_logits, restored.logits_output.next_token_logits, logits=True)
+        maximum_error = max(r["hidden"]["relative_l2"] for r in record["requests"])
+        record["normal_5pct_gate_exceeded"] = stop_for_hidden_difference(maximum_error)
         emit(record)
         # A substantial hidden discrepancy is a correctness failure, not a
         # throughput observation. Small BF16/top-1 differences remain visible
         # in the report and require diagnosis, never silently called parity.
-        if any(r["hidden"]["relative_l2"] > 0.05 for r in record["requests"]):
+        if stop_for_hidden_difference(maximum_error, OUTLIER_CAPTURE):
             raise AssertionError("Large same-state packed-vs-independent discrepancy; inspect audit")
         if not record["isolation_hidden"]["bitwise_equal"]:
             raise AssertionError("Changing other requests changed the protected request; inspect isolation audit")
@@ -305,7 +326,8 @@ def install(module):
         emit({"kind": "installation", "worker": module.__file__,
               "worker_sha256": hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest(),
               "audit_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-              "torch": torch.__version__, "limit_per_role": LIMIT})
+              "torch": torch.__version__, "limit_per_role": LIMIT,
+              "outlier_capture_only": OUTLIER_CAPTURE, "audited_roles": sorted(AUDIT_ROLES)})
 
     cls.__init__ = initialize
     original_forced = cls._forced_ragged_block_sizes

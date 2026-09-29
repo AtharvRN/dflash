@@ -71,6 +71,9 @@ def test_shadow_forward_preserves_inplace_embedding_inputs(tmp_path, monkeypatch
     assert records[0]["isolation_hidden"]["bitwise_equal"]
     tied = torch.ones(16, 64)
     assert module.compare(tied, tied, logits=True)["top1_mismatches"] == 0
+    assert module.stop_for_hidden_difference(.062)
+    assert not module.stop_for_hidden_difference(.062, outlier_capture=True)
+    assert module.stop_for_hidden_difference(.908, outlier_capture=True)
     actual, reference = torch.ones(3, 8), torch.ones(3, 8)
     actual[2, 5] = 9
     detail = module.hidden_detail(actual, reference, width=4)
