@@ -1246,7 +1246,8 @@ or all runtime dependencies.
 ## 16. Current handoff
 
 This section records the September 28 handoff; see the dated addendum in
-section 17 for the later completed intermediate-target probe pilot.
+sections 17–18 for the later completed intermediate-target probe pilot and
+controlled data/update scaling study.
 
 The newest completed analysis at that handoff was the matched-state oracle in section 9.1. A
 bounded dense/MoE fixed-width screen is launched on GPU 4, with C1/C4 model
@@ -1293,3 +1294,42 @@ float32 threshold-comparison edge case was fixed by CPU rescoring; checkpoint
 and calibration selection did not change. Final focused tests: 30 passed.
 The detailed note reports all numerical drift and the replayed-confidence
 baseline limitation. No pre-draft 70%-ratio or online-speedup claim follows.
+
+## 18. September 29 addendum: controlled intermediate-probe scaling
+
+The subsequently user-authorized scaling study is complete. See
+[protocol, audits, full results and paths](midverify_scaling_20260929.md).
+Same frozen target/drafter, five depths, linear/128-wide MLP architectures and
+three seeds. Nested 2k/5k/9,999 training cycles; all original 2k feature bytes and
+all 342 calibration/1,416 assessment states preserved. The raw 10k replay found
+one newly accepted-EOS training state outside the 5k prefix. Its evidence was
+preserved and it was excluded in a separate fully audited nonterminal cache;
+no validation change, label repair or replacement state was introduced.
+
+All 90 independent models completed with 128/1,024/extended update-budget
+checkpoints, 270 policies total. Full 128-state batches match exposures across
+sizes; initialization is identical per architecture/seed. Selection uses only
+calibration. All 270 same-shape checkpoint reloads and all final checksum
+audits passed. GPU4 was idle afterward; no recurring monitor or integration.
+
+At the primary 1,024-update budget, L6 MLP three-seed means:
+
+| Train cycles | Assessment retention | Equivalent full-depth work rows |
+| ---: | ---: | ---: |
+| 2,000 | 95.72% | 12.038 |
+| 5,000 | 95.18% | 11.071 |
+| 9,999 | 95.48% | 10.782 |
+| Replayed draft-confidence control | 95.25% | 9.049 |
+
+More data helps: estimated work falls 10.43% from 2k to 9,999 with a -0.23pp
+change in retention. These are calibration-matched, not exactly assessment-
+matched operating points. The larger L6 probe still needs 19.15% more work than
+the confidence control. Its 71.95% acceptance ratio is post-draft AND after six
+target layers; it is not the original pre-draft 70% objective. Later layers
+still lose on this work proxy. None of these values is measured throughput.
+
+Extended training chooses the same L6 MLP checkpoints as the 1,024 budget.
+Training loss continues falling while calibration loss rises; more data reduces
+but does not eliminate overfitting. The improvement argues against declaring
+an intrinsic information limit from the 2k pilot, but still does not justify
+segmented-engine integration or an automatic larger sweep.

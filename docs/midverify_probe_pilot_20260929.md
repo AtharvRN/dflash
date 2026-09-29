@@ -201,3 +201,9 @@ full assessment set.
 **Decision:** no large integration or scaling job on these results. Preserve
 post-draft confidence as the strong matched control; any revisited mid-target
 proposal must beat it after accounting for the early full-width computation.
+
+Subsequent user-authorized follow-up: a controlled 2k/5k/9,999 data/update scaling
+study is now complete; see [the scaling note](midverify_scaling_20260929.md).
+It preserves this pilot's features/validation bytes and uses rerun 2k probes as
+its equal-update controls. More data improves the early probe, but it still
+does not beat the frozen confidence control after early-layer work is counted.
