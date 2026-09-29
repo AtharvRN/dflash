@@ -69,6 +69,15 @@ def test_nonfinite_scores_and_invalid_kept_rejected():
         metrics(np.array([3]), np.array([17]))
 
 
+def test_float32_scores_preserve_exact_threshold_transition():
+    values = np.full((2, 15), .5, dtype=np.float32)
+    just_above = float(np.nextafter(np.float64(.5), np.inf))
+    np.testing.assert_array_equal(kept_rows(values, .5), [16, 16])
+    np.testing.assert_array_equal(kept_rows(values, just_above), [1, 1])
+    setting = calibrate(values, np.array([3, 15]), (.96,))["0.96"]
+    assert apply_setting(values, setting).mean() == setting["mean_kept_rows"]
+
+
 def test_candidate_conditioned_head_and_features():
     torch = pytest.importorskip("torch")
     from scripts.train_midverify_probe import make_features, build_probe

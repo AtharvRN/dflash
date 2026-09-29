@@ -26,7 +26,9 @@ def risk_mask(accepted):
 
 
 def kept_rows(scores, threshold):
-    values = np.asarray(scores)
+    # Match calibration's FP64 comparisons. A Python-float nextafter threshold
+    # otherwise rounds back to float32 under NumPy weak-scalar promotion.
+    values = np.asarray(scores, dtype=np.float64)
     if values.ndim != 2 or values.shape[1] != 15 or not np.isfinite(values).all():
         raise ValueError("Invalid per-candidate scores")
     # Even a rejection of y1 requires the anchor's final logit for the bonus.
