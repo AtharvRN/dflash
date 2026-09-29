@@ -55,3 +55,14 @@ def test_latency_aggregation_uses_total_tokens_not_mean_of_ratios():
     assert r['ms_per_committed_token'] == .75
     assert r['retention_vs_same_engine_b16'] == 1
     assert r['speed_ratio_vs_fixed16'] == 1
+
+
+def test_identical_conditional_latency_and_retention_intervals():
+    from scripts.summarize_midverify_latency import conditional_intervals
+    cells = [{'C': 4, 'mode': 'graph', 'case': case, 'offset': 0,
+              'observations': [{'accepted': [1, 2, 3, 15]}],
+              'uninstrumented_cycle_samples_ms': [1., 2., 3.]}
+             for case in ('fixed16', 'target_free', 'cascade')]
+    r = conditional_intervals(cells, draws=100)['c4_graph']
+    np.testing.assert_array_equal(r['retention_delta_ci95'], [0., 0.])
+    np.testing.assert_array_equal(r['replay_speed_ratio_vs_target_free_ci95'], [1., 1.])

@@ -69,18 +69,49 @@ def frozen_policy_audit(source, states):
         for case, key in [('target_free', 'candidate_confidence_seed913_r0.99'),
                           ('cascade', 'target_candidate_confidence_seed913_r0.99')]:
             front, end = apply_cascade(confidence, scores[key][eval_idx], saved['policies'][key]['setting'])
-            item = {'cached_mean_front': float(front.mean()), 'cached_mean_end': float(end.mean()),
+            expected_front = end if case == 'target_free' else front
+            item = {'cached_mean_stage0': float(front.mean()),
+                    'cached_mean_front': float(expected_front.mean()), 'cached_mean_end': float(end.mean()),
                     'cached_retention': float(np.minimum(a, end-1).sum()/a.sum()), 'native': {}}
             for c in source['config']['concurrencies']:
                 for mode in source['config']['modes']:
                     cells = sorted([r for r in source['results'] if r['C'] == c and r['mode'] == mode and r['case'] == case], key=lambda r:r['offset'])
                     nfront = np.array([n for r in cells for n in r['observations'][0]['front']])
                     nend = np.array([n for r in cells for n in r['observations'][0]['end']])
-                    item['native'][f'c{c}_{mode}'] = {'front_disagreement_states': int((front != nfront).sum()),
+                    item['native'][f'c{c}_{mode}'] = {'front_disagreement_states': int((expected_front != nfront).sum()),
                         'end_disagreement_states': int((end != nend).sum()),
                         'mean_front': float(nfront.mean()), 'mean_end': float(nend.mean())}
             out[case] = item
     return out
+
+
+def conditional_intervals(cells, draws=4000):
+    import numpy as np
+    result = {}
+    for c, mode in sorted({(r['C'], r['mode']) for r in cells}):
+        select = lambda case: sorted([r for r in cells if r['C'] == c and r['mode'] == mode and r['case'] == case], key=lambda r:r['offset'])
+        policy, ref, base = select('cascade'), select('target_free'), select('fixed16')
+        a = np.array([x for r in policy for x in r['observations'][0]['accepted']])
+        b = np.array([x for r in ref for x in r['observations'][0]['accepted']])
+        b16 = np.array([x for r in base for x in r['observations'][0]['accepted']])
+        rng = np.random.default_rng(929)
+        idx = rng.integers(len(a), size=(draws, len(a)))
+        out = {'retention_delta_ci95': np.quantile((a-b)[idx].sum(1)/b16[idx].sum(1), [.025, .975]).tolist(),
+               'retention_scope': 'Paired resampling of 128 prompt snapshots, conditional on frozen fitted policies; no calibration uncertainty.'}
+        if all('uninstrumented_cycle_samples_ms' in r for r in policy+ref):
+            ta, tb = np.zeros(draws), np.zeros(draws)
+            for x, y in zip(policy, ref):
+                ax, by = np.array(x['uninstrumented_cycle_samples_ms']), np.array(y['uninstrumented_cycle_samples_ms'])
+                if ax.shape != by.shape:
+                    raise ValueError('Unmatched timing repeats')
+                take = rng.integers(len(ax), size=(draws, len(ax)))
+                ta += ax[take].mean(1)
+                tb += by[take].mean(1)
+            ratios = tb/ta * (a.sum()+len(a))/(b.sum()+len(b))
+            out['replay_speed_ratio_vs_target_free_ci95'] = np.quantile(ratios, [.025, .975]).tolist()
+            out['timing_scope'] = 'Paired resampling of repeated timing rounds within each fixed batch; conditional on these snapshots and their observed token counts. Not workload/model/retention uncertainty.'
+        result[f'c{c}_{mode}'] = out
+    return result
 
 
 def main():
@@ -101,7 +132,8 @@ def main():
     a.output.mkdir(parents=True)
     report = {'source_completion_sha256': sha256(a.run/'COMPLETE.json'),
         'scope': source['interpretation'], 'aggregation': 'Sum matched batch times / sum actually committed tokens; not mean per-cycle ratios. Repeat SD is not workload uncertainty.',
-        'source_commit': source['config']['commit'], 'cells': result}
+        'source_commit': source['config']['commit'], 'cells': result,
+        'uncertainty': conditional_intervals(source['results'])}
     atomic_json(a.output/'summary.json', report)
     atomic_json(a.output/'frozen_vs_native.json', frozen_policy_audit(source, json.loads((a.run/'states.json').read_text())))
     lines = ['# Native-engine mid-verification latency replay', '', report['scope'], '',
