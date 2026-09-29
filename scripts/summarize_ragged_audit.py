@@ -46,7 +46,7 @@ def summarize(root):
         }
         for field in ("same_batch_eager_hidden", "same_batch_eager_logits", "restored_hidden", "restored_logits",
                       "isolation_hidden", "isolation_logits", "independent_repeat_hidden", "independent_repeat_logits",
-                      "worst_row_same_batch_eager_hidden"):
+                      "worst_row_same_batch_eager_hidden", "emission_row_same_batch_eager_hidden"):
             result[key][field] = aggregate([r[field] for r in rows if field in r])
         slot_reports = [r["slot_audit"] for r in rows if "slot_audit" in r]
         result[key]["slot_checks"] = {

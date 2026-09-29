@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+import pytest
 
 from scripts.check_ragged_primitives import acceptance_case, load_worker
 from scripts.recover_legacy_ragged import digest
@@ -145,3 +146,53 @@ def test_outlier_fixture_matches_executed_not_only_real_token_rows():
     assert module.uniform_shape(state, 64) == ((40, 16), 640)
     state.update(input_ids=[1]*7, graph_used=False)
     assert module.uniform_shape(state, 64) == ((63, 10), 630)
+
+
+def test_emission_capture_preserves_selected_state_then_restores_batch(tmp_path, monkeypatch):
+    monkeypatch.setenv("DFLASH_RAGGED_AUDIT_DIR", str(tmp_path))
+    spec = importlib.util.spec_from_file_location("emission_audit", ROOT / "scripts/ragged_audit_hook/audit_runtime.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "DIAGNOSTICS", True)
+    monkeypatch.setattr(module, "CAPTURE_EMISSION", True)
+    monkeypatch.setattr(module, "OUTLIER_CAPTURE", False)
+    monkeypatch.setattr(module, "AUDIT_ROLES", {"target"})
+
+    def original(fb, *args, **kwargs):
+        logits = torch.zeros(len(fb.input_ids), 32)
+        logits[:, 6 if fb.batch_size == 1 else 5] = 1
+        return SimpleNamespace(logits_output=SimpleNamespace(
+            hidden_states=torch.ones(len(fb.input_ids), 4), next_token_logits=logits), can_run_graph=False)
+
+    def view(fb, rows, lengths, physical):
+        offsets = [0]
+        for n in physical:
+            offsets.append(offsets[-1]+n)
+        indices = [offsets[i]+j for i in rows for j in range(lengths[i])]
+        return SimpleNamespace(input_ids=fb.input_ids[indices].clone(), input_embeds=None, batch_size=len(rows))
+
+    monkeypatch.setattr(module, "batch_view", view)
+    runner = SimpleNamespace(forward=original,
+        req_to_token_pool=SimpleNamespace(req_to_token=torch.tensor([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]])),
+        token_to_kv_pool=SimpleNamespace(get_cpu_copy=lambda slots: [[slots.clone()]]))
+    fb = SimpleNamespace(input_ids=torch.tensor([7, 5, 8, 5]), input_embeds=None,
+        batch_size=2, positions=torch.tensor([3, 4, 3, 4]),
+        seq_lens=torch.tensor([3, 3]), seq_lens_cpu=torch.tensor([3, 3]), seq_lens_sum=6,
+        req_pool_indices=torch.tensor([0, 1]), out_cache_loc=torch.tensor([4, 5, 9, 10]),
+        forward_mode=SimpleNamespace(is_target_verify=lambda: True),
+        spec_info=SimpleNamespace(draft_token_num=2, draft_token_lens=torch.tensor([2, 2]),
+            graph_draft_token_lens=None, num_tokens_per_batch=2))
+    with pytest.raises(AssertionError, match="Preserved an emitted-token disagreement"):
+        module.audited_forward(runner, "target")(fb)
+    records = [json.loads(line) for line in next(tmp_path.glob("audit_*.jsonl")).read_text().splitlines()]
+    record = records[0]
+    assert record["diagnostic_focus_reason"] == "emitted_tokens"
+    assert record["isolation_protected_row"] == 1
+    assert record["restored_logits"]["bitwise_equal"]
+    assert record["isolation_logits"]["bitwise_equal"]
+    assert not record["normal_5pct_gate_exceeded"]
+    saved = torch.load(record["discrepancy_artifact"], weights_only=True)
+    assert saved["row"] == 1 and saved["capture_reason"] == "emitted_tokens"
+    assert torch.equal(saved["input_ids"], torch.tensor([8, 5]))
+    assert saved["actual_logits"].argmax(-1).tolist() == [5, 5]
+    assert saved["independent_logits"].argmax(-1).tolist() == [6, 6]

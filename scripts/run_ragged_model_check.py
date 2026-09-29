@@ -37,6 +37,8 @@ def main():
                         help="Audit slot aliasing, isolate the worst row, and preserve large-discrepancy tensors/KV")
     parser.add_argument("--capture-severe-outlier", action="store_true",
                         help="Investigation ONLY: report smaller discrepancies but stop/save at >50% hidden L2; NOT a correctness pass")
+    parser.add_argument("--capture-emission-disagreement", action="store_true",
+                        help="Target-only investigation: preserve and stop on the first changed accepted-prefix/bonus decision")
     parser.add_argument("--audit-target-only", action="store_true",
                         help="Skip redundant draft shadows when investigating target verification")
     parser.add_argument("--saved-target-fixture", type=Path,
@@ -44,6 +46,9 @@ def main():
     parser.add_argument("--extended-fixture", action="store_true",
                         help="Replay a version-2 outlier with matched execution rows and original graph layout")
     args = parser.parse_args()
+    if args.capture_emission_disagreement:
+        args.diagnostics = True
+        args.audit_target_only = True
     if args.extended_fixture and not args.saved_target_fixture:
         raise ValueError("Extended fixture requires a saved target state")
     if not 2 <= args.audit_min_bs <= args.concurrency or not 0 <= args.fixed_cap <= 256:
@@ -98,6 +103,7 @@ def main():
             env["DFLASH_RAGGED_AUDIT_MIN_BATCH"] = str(args.audit_min_bs)
             env["DFLASH_RAGGED_AUDIT_DIAGNOSTICS"] = "1" if args.diagnostics or args.capture_severe_outlier else "0"
             env["DFLASH_RAGGED_OUTLIER_CAPTURE"] = "1" if args.capture_severe_outlier else "0"
+            env["DFLASH_RAGGED_CAPTURE_EMISSION"] = "1" if args.capture_emission_disagreement else "0"
             env["DFLASH_RAGGED_AUDIT_ROLES"] = "target" if args.audit_target_only else "draft,target"
             if args.saved_target_fixture:
                 env["DFLASH_SAVED_TARGET_FIXTURE"] = str(args.saved_target_fixture)
