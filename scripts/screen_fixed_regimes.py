@@ -115,8 +115,11 @@ def make_workload(registries):
         wrappers[name] = [tokenizer.encode(s, add_special_tokens=False) for s in (prefix, suffix)]
     rows = []
     for candidate in candidates:
-        if len(candidate["messages"]) != 1 or candidate["messages"][0]["role"] != "user":
+        roles = [m["role"] for m in candidate["messages"]]
+        if roles not in (["user"], ["user", "assistant"]):
             raise ValueError("Unexpected prompt manifest conversation")
+        # The source manifest retains the saved answer. Never include it in
+        # the model input; these runs generate their own continuation.
         text = candidate["messages"][0]["content"]
         bodies = {name: tok.encode(text, add_special_tokens=False) for name, tok in tokenizers.items()}
         if any(len(body)+sum(map(len, wrappers[name])) < 1024 for name, body in bodies.items()):
