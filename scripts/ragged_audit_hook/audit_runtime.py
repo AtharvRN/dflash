@@ -294,6 +294,9 @@ def install(module):
     @wraps(original_init)
     def initialize(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
+        if os.environ.get("DFLASH_SAVED_TARGET_FIXTURE"):
+            from saved_state_fixture import run
+            run(self.target_worker.model_runner, Path(os.environ["DFLASH_SAVED_TARGET_FIXTURE"]), ROOT)
         def project(hidden):
             return project_without_inference_buffers(self, hidden)
 

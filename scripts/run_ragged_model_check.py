@@ -35,6 +35,8 @@ def main():
                         help="Use SGLang's existing batch-invariant mode as a correctness control, not a timing configuration")
     parser.add_argument("--diagnostics", action="store_true",
                         help="Audit slot aliasing, isolate the worst row, and preserve large-discrepancy tensors/KV")
+    parser.add_argument("--saved-target-fixture", type=Path,
+                        help="Run only the B7 saved-state numerical fixture; no request workload")
     args = parser.parse_args()
     if not 2 <= args.audit_min_bs <= args.concurrency or not 0 <= args.fixed_cap <= 256:
         raise ValueError("Invalid bounded audit/stress settings")
@@ -87,6 +89,8 @@ def main():
                    "DFLASH_RAGGED_AUDIT_FORWARDS": str(args.audit_forwards), "SGLANG_DFLASH_TIMING": "0"}
             env["DFLASH_RAGGED_AUDIT_MIN_BATCH"] = str(args.audit_min_bs)
             env["DFLASH_RAGGED_AUDIT_DIAGNOSTICS"] = "1" if args.diagnostics else "0"
+            if args.saved_target_fixture:
+                env["DFLASH_SAVED_TARGET_FIXTURE"] = str(args.saved_target_fixture)
             for k, v in env.items():
                 launch += ["-e", f"{k}={v}"]
             launch += ["--entrypoint", "python", IMAGE, "-m", "sglang.launch_server",
@@ -113,6 +117,11 @@ def main():
                 try:
                     wait_ready(base, container, stage / "server.log", timeout=900)
                     atomic_json(stage / "server_info.json", requests.get(base + "/get_server_info", timeout=10).json())
+                    if args.saved_target_fixture:
+                        if not (stage / "FIXTURE.json").is_file():
+                            raise AssertionError("Saved-state fixture did not complete")
+                        print(json.dumps({"mode": mode, "fixture_completed": True}), flush=True)
+                        continue
                     for repeat in range(2):
                         items = prompts if repeat == 0 else list(reversed(prompts))
 
