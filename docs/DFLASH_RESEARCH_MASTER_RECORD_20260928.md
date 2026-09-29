@@ -1246,8 +1246,8 @@ or all runtime dependencies.
 ## 16. Current handoff
 
 This section records the September 28 handoff; see the dated addendum in
-sections 17–19 for the later intermediate-target probe pilot, controlled
-data/update scaling study, and confidence-first cascade test.
+sections 17–20 for the later intermediate-target probe pilot, controlled
+data/update scaling study, confidence-first cascade test, and native latency screen.
 
 The newest completed analysis at that handoff was the matched-state oracle in section 9.1. A
 bounded dense/MoE fixed-width screen is launched on GPU 4, with C1/C4 model
@@ -1379,3 +1379,56 @@ at the higher-retention point, not yet a matched-retention systems win. No
 automatic 100k collection or segmented-engine integration. A further gate would
 be retention-controlled confirmation versus the strongest target-free controls,
 followed only then by bounded overhead and actual-forward checks.
+
+## 20. September 29 addendum: bounded native-engine latency screen
+
+The user authorized the latency tests after choosing between longer training
+and measurement. See [full protocol, costs and audits](midverify_latency_20260929.md).
+No further training was performed. The same seed 913/99%-calibrated models were
+used on 128 distinct assessment prompts, one first eligible cycle each, at
+C64/C128. This is a selected snapshot cohort, not all 1,416 assessment cycles.
+
+Recovered SGLang spec-v2, native Qwen3-4B layers and FlashInfer, BF16/TF32 off,
+Torch 2.11.0+cu129 pinned container, GPU 4. Both eager and exact-shape manually
+captured target segments; eager drafting. Runtime confidence and probe inference,
+packing, metadata, acceptance and draft-KV upkeep are included in clean cycle
+times. Prefill, scheduler/HTTP, real allocator commits and graph-bucket misses
+are not. This is NOT an online serving speedup claim.
+
+| C | Graph-mode policy | Clean cycle ms | Retention vs saved B16 | ms/committed token |
+| ---: | --- | ---: | ---: | ---: |
+| 64 | Target-free learned trim | 40.432 | 98.451% | 0.14112 |
+| 64 | L6 cascade | 39.544 | 98.673% | 0.13778 |
+| 128 | Target-free learned trim | 68.264 | 98.451% | 0.11913 |
+| 128 | L6 cascade | 67.308 | 96.903% | 0.11892 |
+
+Incremental replay-rate gain is 2.42% at C64 and 0.18% at C128 graph; C128 eager
+regresses 0.84%. Actual B8 redrafting is faster than cascade at C64 and nearly
+tied at C128. A separate actual-B16 redraft control makes the fixed-width
+comparison fair; do not confuse saved B16 candidates with fresh native ones.
+
+C128 target computation falls 42.573→40.034 ms, but extra metadata, probe and
+compaction consume much of the 2.54 ms saving. L6 probe/features 0.616 ms;
+compaction 0.395 ms; total target planning 1.836 ms versus 0.944 ms. The no-prune split
+adds 1.24 ms at identical lengths/outputs. Projection plus confidence also costs
+13.87 ms versus 5.65 ms for projection/argmax alone; this common cost is not an
+L6-only penalty and the statistics implementation is not optimized.
+
+Correctness: no-prune split is bitwise identical within mode, all tested batches;
+native explicit traversal matches eager model dispatch. Shape-changing pruning
+and graph/eager comparisons have output-changing discrepancies at high C.
+C128 graph cascade vs independent shorter eager forward: 7 changed top-1 rows,
+4 acceptance lengths and 5 bonus IDs. Full saved-B16 graph/eager also differs.
+Do not describe completion of the diagnostic guard as a lossless-serving proof.
+
+Two C4 smoke suites, initial 36-cell run and amended 42-cell run completed. Final
+launch commit `a11bbbc`; audited analysis `002bd18`; 45 focused tests passed,
+eight downloaded bound files passed hash verification. Final worker test took
+98.83 seconds excluding startup; GPU 4 returned idle, no containers or monitors
+left running. Preserve initial results. Final evidence is under
+`outputs/midverify_latency_v2_20260929/analysis_audited`.
+
+Conclusion: the current L6 increment is too small to justify automatic scaling
+or broad integration. Further work would need stable execution-path retention
+and correctness plus a larger net gain over target-free trimming and actual
+fixed-width controls. This small cohort does not prove a universal ceiling.

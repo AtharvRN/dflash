@@ -210,6 +210,13 @@ strongest target-free controls (including fresh prompt-level evaluation), then
 a bounded overhead/segmented-forward feasibility check—not another architecture
 or data sweep by default. No such follow-up has been launched.
 
+Dated follow-up: the subsequently authorized
+[native-engine latency test](midverify_latency_20260929.md) is now complete.
+It uses fresh native confidence/L6 features and fixed saved candidates on a
+128-prompt snapshot cohort. The L6 increment is small at C64 and essentially
+flat at C128 graph, with numerical/retention differences. See that note for
+actual costs and limitations; this does not replace the offline assessment table.
+
 ## Full paths
 
 Remote:
