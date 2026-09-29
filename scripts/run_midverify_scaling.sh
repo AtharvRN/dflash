@@ -25,11 +25,13 @@ case "$TASK_STAGE" in
       --gpu "$GPU" --batch-size 8 --max-seconds 3600 2>&1 | tee "$TASK_RUN/collection.log"
     ;;
   train)
-    if [[ ! -f "$TASK_RUN/cache/COMPLETE.json" || -e "$TASK_RUN/training" ]]; then
+    TASK_TRAIN_CACHE="${TRAIN_CACHE:-$TASK_RUN/cache}"
+    if [[ ! -f "$TASK_TRAIN_CACHE/COMPLETE.json" || -e "$TASK_RUN/training" ]]; then
       echo "Require completed cache and fresh training destination" >&2; exit 1
     fi
     trap 'code=$?; printf "exit_code=%s\n" "$code" > "$TASK_RUN/training_exit.txt"' EXIT
-    "$TASK_PYTHON" -u scripts/train_midverify_scaling.py --cache "$TASK_RUN/cache" \
+    "$TASK_PYTHON" -u scripts/train_midverify_scaling.py --cache "$TASK_TRAIN_CACHE" \
+      --sizes 2000 5000 "${TRAIN_ROWS:-10000}" \
       --baseline "$TASK_ROOT/runs/midverify_probe_2k_20260929/assessment_fp64" \
       --output "$TASK_RUN/training" --gpu "$GPU" --max-seconds 3600 \
       2>&1 | tee "$TASK_RUN/training.log"

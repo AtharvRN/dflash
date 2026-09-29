@@ -5,6 +5,7 @@ import pytest
 
 from scripts.collect_midverify_probe import seed_mapping, array_row_digest
 from scripts.train_midverify_scaling import batch_stream, calibration_bce, paired_intervals
+from scripts.finalize_midverify_nonterminal import nonterminal_selection
 
 
 def sample_row(group, pid, cycle, row):
@@ -79,3 +80,20 @@ def test_calibration_bce_ignores_unobserved_suffix():
     loss = calibration_bce(np.array([[.8, .2, .001]]), labels, mask)
     assert loss == pytest.approx(-np.log(.8))
     assert loss == calibration_bce(np.array([[.8, .2, .999]]), labels, mask)
+
+
+def test_terminal_filter_only_new_unprotected_training():
+    rows = [{"group": "train", "draft_ids": [1, 9], "accepted_len": 1, "replayed_accepted_eos": False},
+            {"group": "train", "draft_ids": [1, 9], "accepted_len": 2, "replayed_accepted_eos": True}]
+    keep, excluded = nonterminal_selection(rows, {9}, [0], protected_train_prefix=1)
+    np.testing.assert_array_equal(keep, [0])
+    assert excluded == [1]
+    for group in ("calibration", "assessment"):
+        changed = copy.deepcopy(rows)
+        changed[1]["group"] = group
+        with pytest.raises(ValueError, match="Cannot exclude"):
+            nonterminal_selection(changed, {9}, [], protected_train_prefix=0)
+    with pytest.raises(ValueError, match="Cannot exclude"):
+        nonterminal_selection(rows, {9}, [1], protected_train_prefix=0)
+    with pytest.raises(ValueError, match="Cannot exclude"):
+        nonterminal_selection(rows, {9}, [], protected_train_prefix=2)

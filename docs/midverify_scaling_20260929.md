@@ -64,3 +64,19 @@ fine-tuning, hybrid confidence inputs or SGLang integration. A positive result
 must first beat the matched post-draft confidence control with its early-layer
 work accounted for. Prior oracle limits remain operating-point-specific work
 bounds, not measured latency bounds.
+
+## Collection-time amendment, before training
+
+The completed 10k replay found one newly terminal training state: prompt54855,
+cycle59, original row8273. Its same-forward accepted length changed from the
+source's6 to9, crossing EOS at candidate8. The collector refused completion
+and no training started on that cache. Both original 2k/5k subsets and all
+validation states remain nonterminal.
+
+An explicit CPU finalization rechecks every new shard against its receipt,
+every materialized array against its shard or frozen seed, label/candidate
+alignment, prefix hashes and preserved group bytes. It copies only nonterminal
+rows into a separate `cache_nonterminal`, preserving the failed cache intact.
+The largest training size is therefore **9,999**, not10,000. No replacement
+state, label repair or validation change is introduced. All other preregistered
+training and evaluation settings above are unchanged.

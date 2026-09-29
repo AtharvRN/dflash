@@ -92,11 +92,14 @@ def main():
     p.add_argument("--gpu", type=int)
     p.add_argument("--cpu", action="store_true", help="Only for the bounded driver smoke")
     p.add_argument("--smoke", action="store_true")
+    p.add_argument("--sizes", type=int, nargs=3, default=[2000, 5000, 10000])
     p.add_argument("--max-seconds", type=int, default=3600)
     args = p.parse_args()
     if args.output.exists() or args.max_seconds < 1 or (args.cpu and not args.smoke) or (not args.cpu and args.gpu is None):
         raise ValueError("Require fresh output and explicit authorized device")
-    sizes, layers, seeds = [2000, 5000, 10000], [6, 9, 12, 18, 24], [913, 914, 915]
+    sizes, layers, seeds = args.sizes, [6, 9, 12, 18, 24], [913, 914, 915]
+    if sizes[:2] != [2000, 5000] or sizes[2] not in (9999, 10000):
+        raise ValueError("Unexpected nested scaling sizes")
     budgets, max_updates, eval_every, patience = [128, 1024], 2048, 64, 8
     batch_size, kinds = 128, ["linear", "mlp128"]
     if args.smoke:
@@ -128,7 +131,7 @@ def main():
     for i, j in zip(eval_idx, old_eval_idx):
         if {k: v for k, v in rows[i].items() if k != "row"} != {k: v for k, v in old_rows[j].items() if k != "row"}:
             raise ValueError("Frozen validation metadata changed")
-    expected_groups = {"train": 10000, "calibration": 342, "assessment": 1416}
+    expected_groups = {"train": max(sizes), "calibration": 342, "assessment": 1416}
     if not args.smoke and dict(Counter(r["group"] for r in rows)) != expected_groups:
         raise ValueError("Unexpected full scaling dataset")
     if not args.cpu:
