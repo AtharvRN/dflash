@@ -141,10 +141,12 @@ def batch_view(fb, rows, lengths, physical):
 def audited_forward(runner, role, project=None):
     original = runner.forward
     checked = 0
+    largest_saved_error = 0.0
+    near_miss_snapshots = 0
 
     @wraps(original)
     def forward(fb, *args, **kwargs):
-        nonlocal checked
+        nonlocal checked, largest_saved_error, near_miss_snapshots
         spec = fb.spec_info
         should_check = (role in AUDIT_ROLES and fb.forward_mode.is_target_verify() and
                         getattr(spec, "draft_token_num", 0) > 0 and
@@ -240,7 +242,9 @@ def audited_forward(runner, role, project=None):
                 record["worst_row_same_batch_eager_detail"] = hidden_detail(actual_hidden[first:last], protected_hidden)
                 # Preserve the precise worst case for analysis after a deliberate
                 # failure. This is a bounded local artifact, never training data.
-                if stop_for_hidden_difference(worst_error, OUTLIER_CAPTURE):
+                retain_near_miss = (OUTLIER_CAPTURE and worst_error > max(0.1, largest_saved_error)
+                                    and near_miss_snapshots < 4)
+                if stop_for_hidden_difference(worst_error, OUTLIER_CAPTURE) or retain_near_miss:
                     req = int(fb.req_pool_indices[protected])
                     prefix_n = int(fb.seq_lens[protected])
                     prefix_slots = runner.req_to_token_pool.req_to_token[req, :prefix_n].long()
@@ -251,6 +255,7 @@ def audited_forward(runner, role, project=None):
                                "packed_batch_size": fb.batch_size,
                                "captured_batch_size": record["captured_batch_size"],
                                "graph_used": record["graph_used"],
+                               "num_tokens_per_batch": int(spec.num_tokens_per_batch),
                                "real_lengths": real, "physical_lengths": physical,
                                "physical_input_ids": fb.input_ids[first:offsets[protected+1]].cpu(),
                                "input_ids": fb.input_ids[first:last].cpu(),
@@ -263,6 +268,8 @@ def audited_forward(runner, role, project=None):
                                "same_batch_eager_logits": protected_logits.cpu() if protected_logits is not None else None,
                                "prefix_kv": runner.token_to_kv_pool.get_cpu_copy(prefix_slots)}
                     torch.save(payload, path)
+                    largest_saved_error = max(largest_saved_error, worst_error)
+                    near_miss_snapshots += int(retain_near_miss)
                     record["discrepancy_artifact"] = str(path)
             perturb = batch_view(reference_inputs, list(range(fb.batch_size)), physical, physical)
             other = torch.ones_like(perturb.input_ids, dtype=torch.bool)
