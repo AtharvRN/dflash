@@ -233,3 +233,27 @@ the original audit. The underlying first-SIGTERM sender is still unresolved.
 
 Local replay summary:
 `/Users/atharvramesh/Projects/MLSys/dflash-headroom/outputs/actual_block_predictor_10k_finish_20260928/benchmark/summary.json`
+
+## Completed collection and training (supersedes progress-only status above)
+
+The finish run subsequently completed its audit and all six predictor trainings.
+The verified training audit records 10,102 collected states, 10,054 eligible
+states, exactly 10,000 selected training cycles from 1,317 prompts, and 54 unused
+eligible tail rows. Canonical split separation, receipt/prefix hashes and feature
+alignment passed; checked canonical disagreements were zero. Evaluation remains
+342 calibration and 1,416 assessment states on the unchanged prompt membership.
+
+`training/COMPLETE.json` records `success=true`, `smoke=false` and binds the
+configuration, audit, selected index, six checkpoints, histories, frozen
+selection, predictions, operating curves and report. Reload and paired
+initialization/order checks passed. This is distinct from the still-unfinished
+September 15 paired raw/fused 100k expansion.
+
+At the 96% calibration target, the three actual-supervision seeds average ratio
+0.54634 at assessment retention 0.95316; clipped-supervision controls average
+0.53930 at 0.95598. The frozen historical 100k MLP reaches 0.53942 at 0.96006.
+These are unequal-retention operating points. No model reaches the requested
+joint 70% ratio / 96% retention point. Gains are small and seed-dependent, not
+a serving speedup. Full per-seed results and paired prompt intervals are in:
+
+`/Users/atharvramesh/Projects/MLSys/dflash-headroom/outputs/actual_block_predictor_10k_finish_20260928/training/summary.json`

@@ -1,11 +1,14 @@
 # Historical packed DFlash recovery — 2026-09-28
 
-Status: runtime recovered; primitive and small-batch integration checks completed.
-C64 ragged stress found a large same-state target-hidden discrepancy and stopped.
-Focused diagnostics explain a separate 6.2% eager discrepancy as ordinary
-batch-shape sensitivity, but the extreme 90.8% graph-run case remains unresolved.
-Profiling remains gated; no new ragged throughput/speedup claim. No task jobs or
-recurring monitor remain running at handoff.
+Status: runtime recovered; primitive and bounded integration checks completed.
+A preserved 85.1% hidden-discrepancy recurrence also appears in ordinary
+fixed-width verification of the same state. Exact graph replay reproduces the
+saved result. This removes that recurrence as evidence of a mixed-length-only
+defect, but does not certify numerical or end-to-end output parity. The earlier
+90.8% state was not saved and cannot itself be replayed. See
+[the numerical follow-up](ragged_numerical_followup_20260928.md) for newer
+results, emitted-token diagnostics, and current job status. No new ragged
+throughput/speedup claim; no recurring monitor.
 
 ## Recovered runtime
 
@@ -111,7 +114,7 @@ Each includes launch/configuration records, raw audit JSONL, full server logs,
 and output token IDs. Remote roots use the same run names under
 `/data/scratch/zekaili/atharv/dflash/runs/`.
 
-### C64 stress: unresolved discrepancy
+### Initial C64 stress: original state not preserved
 
 `ragged_c64_stress_buffers_20260928` uses 128 development prompts, concurrency
 64, and a fixed 128-token cap with EOS ignored solely to sustain concurrency.
@@ -219,9 +222,9 @@ Thus that discrepancy is not evidence of a ragged indexing/packing defect. It
 does not identify the exact arithmetic kernel responsible, and does not resolve
 the original 0.9082 graph-run case, whose full tensors were not saved. It would
 be incorrect to discard that extreme case merely because this smaller case is
-now explained. The next correctness step is a preserved same-state replay of
-that extreme case (or a comparable recurrence), followed by target-only output
-and longer allocator checks before clean profiling.
+now explained. The subsequent comparable-recurrence replay is documented in
+[the numerical follow-up](ragged_numerical_followup_20260928.md). Target-only
+output and longer allocator checks remain distinct from that replay.
 
 ### Preserved harness failures / superseded evidence
 
@@ -270,6 +273,6 @@ cooperative lock. Checks use a new task-owned container and pinned cached image,
 with no changes to the main environment or unrelated running containers. Launches
 are bounded, logged durably, and do not create a recurring monitor.
 
-Eight local recovery/profiling-helper tests pass. All 16 original source overlay
+Ten local recovery/profiling-helper tests pass. All 16 original source overlay
 hashes were rechecked at handoff and remain unchanged. Runtime source stays
 verbatim; only test harnesses, recovery tooling and this report were changed.
