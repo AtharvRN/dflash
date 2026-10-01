@@ -76,8 +76,8 @@ exactly the **first 2,000 eligible training rows in immutable receipt order**.
 These are cycles, not 2,000 prompts.
 
 Evaluation preserves the source experiment's prompt partition: 47 calibration
-prompts and 187 assessment prompts, whose source caches contain 342 and 1,416
-states respectively. The source cache identifies the cycle numbers and prefix
+prompts and 187 assessment prompts. The source caches contain 344 and 1,420
+rows respectively, of which 342 and 1,416 are eligible. The source cache identifies the cycle numbers and prefix
 hashes to replay. Its previous labels are never joined to newly generated
 features. Every retained replay row obtains fresh B2 through B16 outcomes.
 
@@ -394,3 +394,25 @@ artifacts include `config.json`, `row_index_and_donors.json`,
 `selection_frozen.json`, `summary.json`, `assessment_curves.json`,
 `assessment_predictions.npz`, `report.md`, and a completion file binding the
 result files.
+
+## Implementation verification, 2026-10-01
+
+The implementation was deployed through git to
+`/home/zekaili/atharv/dflash` on `tianhaowang-gpu0.ucsd.edu`.
+All 47 selected CPU tests passed locally and in the workstation's existing
+environment: 43 new collector/cache/model/comparison tests plus four existing
+paired-length tests. A separate synthetic six-epoch, three-seed run completed
+all nine models locally; synthetic metrics are not research results.
+
+A read-only workstation preflight passed without GPU access. It resolved 600
+planned canonical training prompts and verified the evaluation counts above,
+the pinned target/draft model revisions, and source completion binding:
+
+```text
+b54837192ab1a475b5704c5ee34f00de00df9f889420a4b4b34ead44ced3cb6f
+```
+
+Real-model GPU smoke, serial/parallel execution parity, collection, and pilot
+training remain unexecuted because no GPU was free. No recurring monitor or
+automatic retry was created. Local pre-existing edits and artifacts were
+preserved and were not included in the implementation commit.
