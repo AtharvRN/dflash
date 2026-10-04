@@ -2,9 +2,11 @@
 # Bounded, no-resume pilot. Never waits for or preempts an occupied GPU.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-TASK_ROOT="/data/scratch/zekaili/atharv/dflash"
-TASK_DATA="$TASK_ROOT/data/dflashv2_data"
-TASK_PYTHON="$TASK_ROOT/envs/main/bin/python"
+TASK_ROOT="${DFLASH_TASK_ROOT:-/data/scratch/zekaili/atharv/dflash}"
+TASK_DATA="${DFLASH_DATA_ROOT:-$TASK_ROOT/data/dflashv2_data}"
+TASK_PYTHON="${DFLASH_PYTHON:-$TASK_ROOT/envs/main/bin/python}"
+TASK_MODELS="${DFLASH_MODELS:-$TASK_ROOT/models.json}"
+TASK_EVAL_CACHE="${DFLASH_EVAL_CACHE:-$TASK_ROOT/runs/policy_granularity_20260927/cache}"
 TASK_RUN_ID="${RUN_ID:-rejected_trace_2k_20261001}"
 TASK_MODE="${MODE:-pilot}"
 TASK_WORKERS="${WORKERS:-4}"
@@ -20,7 +22,14 @@ if [[ "$TASK_WORKERS" != 1 && "$TASK_WORKERS" != 2 && "$TASK_WORKERS" != 4 ]]; t
   echo "WORKERS must be 1, 2, or 4" >&2
   exit 1
 fi
-if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+if [[ -n "${DFLASH_POD_UID:-}" || -n "${KUBERNETES_SERVICE_HOST:-}" ]]; then
+  if [[ -n "${GPU:-}" || -n "${SLURM_JOB_ID:-}" || -z "${DFLASH_POD_UID:-}" ||
+        -z "${KUBERNETES_SERVICE_HOST:-}" ]]; then
+    echo "Kubernetes requires its pod UID and isolated GPU; do not set GPU or Slurm overrides" >&2
+    exit 1
+  fi
+  TASK_GPU_ARGS=(--use-container-gpu)
+elif [[ -n "${SLURM_JOB_ID:-}" ]]; then
   if [[ -n "${GPU:-}" || ! "${SLURM_JOB_GPUS:-}" =~ ^[0-7]$ ||
         -z "${CUDA_VISIBLE_DEVICES:-}" || "$CUDA_VISIBLE_DEVICES" == *,* ]]; then
     echo "Slurm requires one allocated GPU and inherited CUDA_VISIBLE_DEVICES; do not set GPU" >&2
@@ -51,7 +60,14 @@ for TASK_STORAGE in "$TASK_ROOT" /tmp; do
     exit 1
   fi
 done
-if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+if [[ -n "${DFLASH_POD_UID:-}" ]]; then
+  TASK_PHYSICAL_GPU=$("$TASK_PYTHON" -c \
+    'from scripts.gpu_runtime import configure_gpu_runtime; print(configure_gpu_runtime(use_container_gpu=True, require_gpu=True)["nvidia_smi_query_id"])')
+  if [[ ! "$TASK_PHYSICAL_GPU" =~ ^GPU-[a-zA-Z0-9-]+$ ]]; then
+    echo "Cannot resolve Kubernetes GPU UUID for its lock" >&2
+    exit 1
+  fi
+elif [[ -n "${SLURM_JOB_ID:-}" ]]; then
   # Existing manual launchers key locks by NVML index, not /dev/nvidia minor.
   # Resolve the Slurm device through its UUID; this never initializes CUDA.
   TASK_PHYSICAL_GPU=$("$TASK_PYTHON" -c \
@@ -69,7 +85,7 @@ if ! flock -n 9 || ! flock -n 8 || ! flock -n 7; then
   echo "An existing experiment holds this GPU lock" >&2
   exit 1
 fi
-if [[ -z "${SLURM_JOB_ID:-}" ]]; then
+if [[ -z "${SLURM_JOB_ID:-}" && -z "${DFLASH_POD_UID:-}" ]]; then
   TASK_GPU_QUERY=$(nvidia-smi --id="$TASK_PHYSICAL_GPU" \
     --query-gpu=memory.used,utilization.gpu --format=csv,noheader,nounits)
   IFS=, read -r TASK_MEMORY TASK_UTIL <<< "$TASK_GPU_QUERY"
@@ -88,16 +104,16 @@ fi
 # and checks occupancy before loading models; CUDA/NVML ordinals may differ.
 mkdir -p "$TASK_RUN" "$TASK_WORK"
 trap 'code=$?; printf "exit_code=%s\n" "$code" > "$TASK_RUN/pipeline_exit.txt"' EXIT
-printf 'job_id=%s nvidia_smi_index=%s CUDA_VISIBLE_DEVICES=%s commit=%s\n' \
-  "${SLURM_JOB_ID:-manual}" "$TASK_PHYSICAL_GPU" "${CUDA_VISIBLE_DEVICES:-unset}" "$(git rev-parse HEAD)"
+printf 'allocation=%s gpu_lock_key=%s CUDA_VISIBLE_DEVICES=%s commit=%s\n' \
+  "${SLURM_JOB_ID:-${DFLASH_POD_UID:-manual}}" "$TASK_PHYSICAL_GPU" "${CUDA_VISIBLE_DEVICES:-unset}" "$(git rev-parse HEAD)"
 export PYTHONPATH="$(pwd)"
 export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false
 TASK_COMMON=(
   --manifest "$TASK_DATA/manifests/qwen3_4b_instruct_100k_messages.jsonl"
   --pilot-manifest "$TASK_DATA/runs/prefusion_pilot_20260915/cache/manifest.json"
   --split-dir "$TASK_DATA/splits/qwen3_4b_instruct100k_full_4a100_manifest_seed0_val5pct_20260719"
-  --eval-cache "$TASK_ROOT/runs/policy_granularity_20260927/cache"
-  --models "$TASK_ROOT/models.json" "${TASK_GPU_ARGS[@]}" --seed 1001
+  --eval-cache "$TASK_EVAL_CACHE"
+  --models "$TASK_MODELS" "${TASK_GPU_ARGS[@]}" --seed 1001
 )
 
 # Real-model same-forward and canonical AR checks precede the full pilot.

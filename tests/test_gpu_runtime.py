@@ -169,5 +169,138 @@ class GpuRuntimeTests(unittest.TestCase):
             self.assertFalse((root/"output").exists())
 
 
+class ContainerGpuRuntimeTests(unittest.TestCase):
+    UUID = "GPU-12345678-1234-1234-1234-123456789abc"
+    OTHER_UUID = "GPU-abcdef12-1234-1234-1234-123456789abc"
+
+    def setUp(self):
+        environment = mock.patch.dict(os.environ, {
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1", "DFLASH_POD_UID": "test-pod-uid",
+            "NVIDIA_VISIBLE_DEVICES": self.UUID,
+        }, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
+        self.inventory = self.UUID+"\n"
+        self.occupancy = "6, 24, 0\n"
+        patch = mock.patch("scripts.gpu_runtime.subprocess.check_output", side_effect=
+            lambda command, **kwargs: self.inventory if "--query-gpu=uuid" in command else self.occupancy)
+        self.query = patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_single_allocation_uuid_selected_with_unset_visibility(self):
+        result = configure_gpu_runtime(use_container_gpu=True, require_gpu=True)
+        self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], self.UUID)
+        self.assertEqual(result["mode"], "kubernetes_container")
+        self.assertEqual(result["device"], "cuda:0")
+        self.assertEqual(result["container_allocated_gpu_uuid"], self.UUID)
+        self.assertEqual(result["kubernetes_pod_uid"], "test-pod-uid")
+        self.assertEqual(result["nvidia_smi_index"], 6)
+        self.assertIsNone(result["physical_gpu_index"])
+        self.assertIn("--id="+self.UUID, self.query.call_args.args[0])
+
+    def test_sole_ordinal_normalized_to_proven_allocated_uuid(self):
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+        result = configure_gpu_runtime(use_container_gpu=True)
+        self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], self.UUID)
+        self.assertEqual(result["inherited_cuda_visible_devices"], "0")
+
+    def test_matching_uuid_preserved(self):
+        os.environ["CUDA_VISIBLE_DEVICES"] = self.UUID
+        original = dict(os.environ)
+        configure_gpu_runtime(use_container_gpu=True)
+        self.assertEqual(dict(os.environ), original)
+
+    def test_requires_kubernetes_signal_and_downward_api_identity(self):
+        for key in ("KUBERNETES_SERVICE_HOST", "DFLASH_POD_UID"):
+            with self.subTest(key=key), mock.patch.dict(os.environ, {key: ""}):
+                with self.assertRaisesRegex(ValueError, "Kubernetes.*DFLASH_POD_UID"):
+                    configure_gpu_runtime(use_container_gpu=True)
+        self.query.assert_not_called()
+
+    def test_refuses_missing_multiple_ordinal_mig_or_all_allocation(self):
+        for allocation in ("", "all", "none", "0", "GPU-short", "MIG-"+self.UUID,
+                           self.UUID+","+self.OTHER_UUID, " "+self.UUID):
+            with self.subTest(allocation=allocation), mock.patch.dict(os.environ, {"NVIDIA_VISIBLE_DEVICES": allocation}):
+                with self.assertRaisesRegex(ValueError, "NVIDIA_VISIBLE_DEVICES"):
+                    configure_gpu_runtime(use_container_gpu=True)
+        self.query.assert_not_called()
+
+    def test_refuses_disabled_multiple_foreign_or_nonzero_visibility(self):
+        for visible in ("", "-1", "1", "0,1", "all", self.OTHER_UUID, self.UUID+",0"):
+            with self.subTest(visible=visible), mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": visible}):
+                with self.assertRaisesRegex(ValueError, "CUDA_VISIBLE_DEVICES"):
+                    configure_gpu_runtime(use_container_gpu=True)
+                self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], visible)
+        self.query.assert_not_called()
+
+    def test_inventory_must_contain_only_the_allocated_gpu(self):
+        for inventory in ("", self.OTHER_UUID, self.UUID+"\n"+self.OTHER_UUID, self.UUID+"\n"+self.UUID):
+            with self.subTest(inventory=inventory):
+                self.inventory = inventory
+                with self.assertRaisesRegex(RuntimeError, "inventory"):
+                    configure_gpu_runtime(use_container_gpu=True)
+                self.assertNotIn("CUDA_VISIBLE_DEVICES", os.environ)
+
+    def test_occupancy_failure_does_not_change_visibility(self):
+        for occupancy in ("6, 1025, 0", "6, 24, 11", "N/A", "6, 24, 0\n7, 24, 0"):
+            with self.subTest(occupancy=occupancy):
+                self.occupancy = occupancy
+                with self.assertRaises(RuntimeError):
+                    configure_gpu_runtime(use_container_gpu=True)
+                self.assertNotIn("CUDA_VISIBLE_DEVICES", os.environ)
+
+    def test_query_failure_does_not_change_visibility(self):
+        self.query.side_effect = OSError("nvidia-smi unavailable")
+        with self.assertRaises(OSError):
+            configure_gpu_runtime(use_container_gpu=True)
+        self.assertNotIn("CUDA_VISIBLE_DEVICES", os.environ)
+
+    def test_modes_mutually_exclusive(self):
+        for kwargs in ({"gpu": 0}, {"use_visible_gpu": True}):
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, "Choose"):
+                configure_gpu_runtime(use_container_gpu=True, **kwargs)
+        self.query.assert_not_called()
+
+    def test_manual_override_forbidden_in_kubernetes(self):
+        with self.assertRaisesRegex(ValueError, "forbidden inside Kubernetes"):
+            configure_gpu_runtime(gpu=0)
+        self.query.assert_not_called()
+
+    def test_slurm_and_kubernetes_allocation_cannot_be_combined(self):
+        os.environ["SLURM_JOB_ID"] = "123"
+        with self.assertRaisesRegex(ValueError, "Slurm allocation"):
+            configure_gpu_runtime(use_container_gpu=True)
+        self.query.assert_not_called()
+
+    def test_cpu_default_never_queries_or_uses_allocated_gpu(self):
+        result = configure_gpu_runtime()
+        self.assertEqual(result["device"], "cpu")
+        self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], "")
+        self.query.assert_not_called()
+
+    def test_container_preflight_remains_read_only_without_allocation(self):
+        from scripts.collect_rejected_trace import main
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            argv = ["collect_rejected_trace.py", "--use-container-gpu", "--preflight"]
+            for flag in ("manifest", "pilot-manifest", "split-dir", "eval-cache", "models", "output", "backup"):
+                argv += ["--"+flag, str(root/flag)]
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch("sys.argv", argv), \
+                 mock.patch("scripts.collect_rejected_trace.select_training_groups", return_value=[]), \
+                 mock.patch("scripts.collect_rejected_trace.select_groups", return_value=[]), \
+                 mock.patch("scripts.collect_rejected_trace.load_reference", return_value=({}, "refhash")), \
+                 mock.patch("scripts.collect_rejected_trace.validate_models"), \
+                 mock.patch("scripts.collect_rejected_trace.configure_gpu_runtime") as configure, \
+                 mock.patch.object(Path, "read_text", side_effect=["{}", '{"train_prompt_ids":[]}', '{"val_prompt_ids":[]}']), \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                main()
+            configure.assert_not_called()
+            self.query.assert_not_called()
+            self.assertIn('"gpu_accessed": false', output.getvalue())
+            self.assertFalse((root/"output").exists())
+            self.assertFalse((root/"backup").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

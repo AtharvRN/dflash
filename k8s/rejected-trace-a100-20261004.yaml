@@ -1,0 +1,89 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dflash-rejected-2k-a100-20261004
+  namespace: wenglab-interpretable-ai
+  labels:
+    app: dflash-rejected-trace
+spec:
+  # Submit suspended, verify the exact revision, then replace the pending Slurm run.
+  suspend: true
+  backoffLimit: 0
+  activeDeadlineSeconds: 21600
+  template:
+    metadata:
+      labels:
+        app: dflash-rejected-trace
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values: [NVIDIA-A100-SXM4-80GB, NVIDIA-A100-80GB-PCIe]
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: [amd64]
+      containers:
+        - name: pilot
+          image: python@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
+          command: [/bin/bash, -lc]
+          args:
+            - |
+              set -euo pipefail
+              timeout 300s apt-get update -qq
+              timeout 300s apt-get install -y --no-install-recommends git libgomp1
+              exec bash "$DFLASH_CODE_ROOT/scripts/run_rejected_trace_nrp.sh"
+          env:
+            - name: DFLASH_POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: DFLASH_CODE_COMMIT
+              value: SET_AT_SUBMISSION
+            - name: DFLASH_CODE_ROOT
+              value: /workspace/dflashv2_data/code/rejected_trace_nrp_20261004
+            - name: DFLASH_TASK_ROOT
+              value: /workspace/dflashv2_data
+            - name: DFLASH_DATA_ROOT
+              value: /workspace/dflashv2_data
+            - name: DFLASH_PYTHON
+              value: /workspace/dflashv2_data/envs/rejected_trace_py312_torch213_cu130_20261004/bin/python
+            - name: DFLASH_EVAL_CACHE
+              value: /workspace/dflashv2_data/runs/policy_granularity_20260927/cache
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: compute,utility
+            - name: RUN_ID
+              value: rejected_trace_2k_a100_20261004
+            - name: WORKERS
+              value: "4"
+            - name: MODE
+              value: pilot
+          resources:
+            requests:
+              cpu: "16"
+              memory: 96Gi
+              ephemeral-storage: 40Gi
+              nvidia.com/a100: "1"
+            limits:
+              cpu: "16"
+              memory: 96Gi
+              ephemeral-storage: 100Gi
+              nvidia.com/a100: "1"
+          volumeMounts:
+            - name: data
+              mountPath: /workspace
+            - name: shared-memory
+              mountPath: /dev/shm
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: atharv-rwx-storage-1ti
+        - name: shared-memory
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi

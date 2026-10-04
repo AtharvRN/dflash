@@ -198,7 +198,9 @@ def run(args):
     if not args.smoke and (args.training_rows != 2000 or args.epochs != 6 or args.batch_size != 128
                            or args.seeds != [913, 914, 915]):
         raise ValueError("Non-smoke run requires 2000 rows, seeds913/914/915, six epochs, batch128")
-    gpu_runtime = configure_gpu_runtime(args.gpu, getattr(args, "use_visible_gpu", False), max_utilization=None)
+    gpu_runtime = configure_gpu_runtime(args.gpu, getattr(args, "use_visible_gpu", False),
+                                        use_container_gpu=getattr(args, "use_container_gpu", False),
+                                        max_utilization=None)
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     import torch
     from scripts.audit_rejected_trace_cache import load_cache
@@ -405,6 +407,8 @@ def main():
     gpu_args.add_argument("--gpu", type=int, help="Physical GPU index outside Slurm only; omit for CPU")
     gpu_args.add_argument("--use-visible-gpu", action="store_true",
                           help="Use the single Slurm-assigned GPU without changing CUDA_VISIBLE_DEVICES")
+    gpu_args.add_argument("--use-container-gpu", action="store_true",
+                          help="Use the single Kubernetes-allocated GPU UUID after validating container isolation")
     parser.add_argument("--training-rows", type=int, default=2000)
     parser.add_argument("--seeds", type=int, nargs="+", default=[913, 914, 915])
     parser.add_argument("--donor-seed", type=int, default=913)

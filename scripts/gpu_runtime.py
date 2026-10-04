@@ -3,7 +3,9 @@
 Slurm's CUDA_VISIBLE_DEVICES may be remapped by the job's device cgroup.  Never
 use that local ordinal as an nvidia-smi physical index. This workstation's GRES
 uses /dev/nvidia0..7; resolve SLURM_JOB_GPUS device minor to UUID via XML instead.
-No torch import is needed.
+Kubernetes uses a single device-plugin allocation UUID, verified against the
+container's accessible inventory before CUDA visibility is set. No torch import
+is needed.
 """
 from __future__ import annotations
 
@@ -30,7 +32,28 @@ def slurm_gpu_uuid(device_minor):
     return uuid
 
 
-def configure_gpu_runtime(gpu=None, use_visible_gpu=False, *, require_gpu=False,
+def container_gpu_uuid(inherited):
+    """Validate the explicit single-GPU Kubernetes allocation without CUDA."""
+    if not os.environ.get("KUBERNETES_SERVICE_HOST") or not os.environ.get("DFLASH_POD_UID", "").strip():
+        raise ValueError("--use-container-gpu requires Kubernetes and downward-API DFLASH_POD_UID")
+    allocation = os.environ.get("NVIDIA_VISIBLE_DEVICES", "")
+    if not re.fullmatch(r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", allocation):
+        raise ValueError("Expected one full GPU UUID in NVIDIA_VISIBLE_DEVICES; no all, ordinals, or MIG")
+    # An empty existing mask explicitly disables CUDA; never silently broaden it.
+    # The sole logical ordinal is accepted only after the NVML inventory proves
+    # that the container can access exactly this allocated device.
+    if inherited not in (None, "0", allocation):
+        raise ValueError("CUDA_VISIBLE_DEVICES must be unset, 0, or the allocated container GPU UUID")
+    inventory = subprocess.check_output([
+        "nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader",
+    ], text=True, timeout=15)
+    accessible = [line.strip() for line in inventory.splitlines() if line.strip()]
+    if accessible != [allocation]:
+        raise RuntimeError("Container accessible GPU inventory does not exactly match its single allocation")
+    return allocation
+
+
+def configure_gpu_runtime(gpu=None, use_visible_gpu=False, *, use_container_gpu=False, require_gpu=False,
                           max_memory_mib=1024, max_utilization=10):
     """Validate selection, check occupancy, then set/preserve CUDA visibility.
 
@@ -40,11 +63,20 @@ def configure_gpu_runtime(gpu=None, use_visible_gpu=False, *, require_gpu=False,
     """
     inherited = os.environ.get("CUDA_VISIBLE_DEVICES")
     job_id = os.environ.get("SLURM_JOB_ID") or os.environ.get("SLURM_JOBID")
-    if gpu is not None and use_visible_gpu:
-        raise ValueError("Choose --gpu OR --use-visible-gpu, not both")
+    if sum((gpu is not None, bool(use_visible_gpu), bool(use_container_gpu))) > 1:
+        raise ValueError("Choose --gpu OR --use-visible-gpu OR --use-container-gpu, not both/multiple")
     if gpu is not None and job_id:
         raise ValueError("Physical --gpu override is forbidden inside Slurm; use --use-visible-gpu")
-    if use_visible_gpu:
+    if gpu is not None and os.environ.get("KUBERNETES_SERVICE_HOST"):
+        raise ValueError("Physical --gpu override is forbidden inside Kubernetes; use --use-container-gpu")
+    if use_container_gpu and job_id:
+        raise ValueError("--use-container-gpu cannot be combined with a Slurm allocation")
+    allocated_uuid = None
+    if use_container_gpu:
+        allocated_uuid = container_gpu_uuid(inherited)
+        physical_gpu = None
+        mode, visible = "kubernetes_container", allocated_uuid
+    elif use_visible_gpu:
         if not job_id or not re.fullmatch(r"[0-9]+", job_id):
             raise ValueError("--use-visible-gpu requires an active numeric SLURM_JOB_ID")
         allocation = os.environ.get("SLURM_JOB_GPUS", "")
@@ -61,11 +93,11 @@ def configure_gpu_runtime(gpu=None, use_visible_gpu=False, *, require_gpu=False,
         mode, visible = "manual", str(gpu)
     else:
         if require_gpu:
-            raise ValueError("GPU execution requires --gpu or --use-visible-gpu")
+            raise ValueError("GPU execution requires --gpu, --use-visible-gpu, or --use-container-gpu")
         physical_gpu = None
         mode, visible = "cpu", ""
     provenance = {
-        "mode": mode, "device": "cpu" if physical_gpu is None else "cuda:0",
+        "mode": mode, "device": "cpu" if mode == "cpu" else "cuda:0",
         "physical_gpu_index": physical_gpu if mode == "manual" else None,
         "allocated_device_minor": physical_gpu if mode == "slurm_visible" else None,
         "inherited_cuda_visible_devices": inherited,
@@ -73,11 +105,14 @@ def configure_gpu_runtime(gpu=None, use_visible_gpu=False, *, require_gpu=False,
         "slurm_job_gpus": os.environ.get("SLURM_JOB_GPUS"),
         "slurm_step_gpus": os.environ.get("SLURM_STEP_GPUS"),
         "slurm_job_node_list": os.environ.get("SLURM_JOB_NODELIST"),
+        "container_allocated_gpu_uuid": allocated_uuid,
+        "kubernetes_pod_uid": os.environ.get("DFLASH_POD_UID") if use_container_gpu else None,
+        "nvidia_visible_devices": os.environ.get("NVIDIA_VISIBLE_DEVICES") if use_container_gpu else None,
     }
-    if physical_gpu is not None:
+    if mode != "cpu":
         # Slurm physical /dev/nvidia minor -> UUID, NOT the remapped CUDA ordinal
         # or an assumed nvidia-smi index. Manual mode retains its NVML index API.
-        query_id = slurm_gpu_uuid(physical_gpu) if use_visible_gpu else str(physical_gpu)
+        query_id = allocated_uuid if use_container_gpu else (slurm_gpu_uuid(physical_gpu) if use_visible_gpu else str(physical_gpu))
         result = subprocess.check_output([
             "nvidia-smi", f"--id={query_id}",
             "--query-gpu=index,memory.used,utilization.gpu", "--format=csv,noheader,nounits",
@@ -89,11 +124,12 @@ def configure_gpu_runtime(gpu=None, use_visible_gpu=False, *, require_gpu=False,
         if nvml_index < 0 or used < 0 or not 0 <= utilization <= 100:
             raise RuntimeError("Invalid GPU occupancy from nvidia-smi; refusing to load models")
         if used > max_memory_mib or (max_utilization is not None and utilization > max_utilization):
-            raise RuntimeError(f"GPU {physical_gpu} is occupied ({used} MiB, {utilization}%); no models loaded")
+            raise RuntimeError(f"GPU {query_id} is occupied ({used} MiB, {utilization}%); no models loaded")
         provenance["occupancy_before_load"] = {"memory_mib": used, "utilization_percent": utilization}
         provenance["nvidia_smi_query_id"] = query_id
         provenance["nvidia_smi_index"] = nvml_index
-    # In inherited mode leave the scheduler's environment byte-for-byte intact.
+    # Slurm visibility remains byte-for-byte intact. Kubernetes uses the verified
+    # allocated UUID rather than assuming its NVML index is a CUDA ordinal.
     if not use_visible_gpu:
         os.environ["CUDA_VISIBLE_DEVICES"] = visible
     return provenance

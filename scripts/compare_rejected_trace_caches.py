@@ -17,7 +17,7 @@ from scripts.audit_rejected_trace_cache import GROUPS, load_cache, sha256
 
 IGNORED_CONFIG_FIELDS = {
     "manifest", "pilot_manifest", "split_dir", "eval_cache", "output", "backup",
-    "gpu", "use_visible_gpu", "gpu_runtime", "workers", "max_seconds",
+    "gpu", "use_visible_gpu", "use_container_gpu", "gpu_runtime", "workers", "max_seconds",
 }
 REQUIRED_PROTOCOL_FIELDS = {
     "models", "seed", "states_per_prompt", "max_new_tokens", "max_prompt_tokens",

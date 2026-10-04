@@ -349,6 +349,8 @@ def main():
     gpu_args.add_argument("--gpu", type=int, help="Physical GPU index outside Slurm only")
     gpu_args.add_argument("--use-visible-gpu", action="store_true",
                           help="Use the single Slurm-assigned GPU without changing CUDA_VISIBLE_DEVICES")
+    gpu_args.add_argument("--use-container-gpu", action="store_true",
+                          help="Use the single Kubernetes-allocated GPU UUID after validating container isolation")
     p.add_argument("--workers", type=int, choices=[1, 2, 4], default=1)
     p.add_argument("--training-rows", type=int, default=2000)
     p.add_argument("--limit-training-prompts", type=int, default=600)
@@ -394,7 +396,8 @@ def main():
             "model_revisions": MODEL_REVISIONS, "reference_completion_sha256": reference_binding}, indent=2))
         return
     # Parent-only idle check happens before loading any worker's models.
-    gpu_runtime = configure_gpu_runtime(args.gpu, args.use_visible_gpu, require_gpu=True)
+    gpu_runtime = configure_gpu_runtime(args.gpu, args.use_visible_gpu,
+                                        use_container_gpu=args.use_container_gpu, require_gpu=True)
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args.output.mkdir(parents=True)
     args.backup.mkdir(parents=True)
