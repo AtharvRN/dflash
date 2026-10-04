@@ -416,3 +416,47 @@ Real-model GPU smoke, serial/parallel execution parity, collection, and pilot
 training remain unexecuted because no GPU was free. No recurring monitor or
 automatic retry was created. Local pre-existing edits and artifacts were
 preserved and were not included in the implementation commit.
+
+## Slurm launcher added 2026-10-04
+
+The October 1 status above is historical. The pilot can now be submitted with
+`scripts/run_rejected_trace_slurm.sbatch` from a dedicated detached checkout,
+with `EXPECTED_COMMIT` set to that checkout's full git revision. The wrapper
+checks the revision and tracked-file cleanliness again when the job starts.
+Do not modify or remove the checkout while a job is pending or running.
+
+The request is one GPU, one task, 16 CPUs, 96 GiB host RAM, and six hours in the
+`gpu` partition, account `users`, QoS `normal`. Four collection workers share
+that one GPU; they are not four scheduler tasks. Automatic requeue is disabled.
+The scientific protocol, fixed evaluation membership, smoke/parity gates, and
+three-arm/three-seed training configuration are unchanged.
+
+Both Python entry points accept `--use-visible-gpu` to preserve Slurm's
+`CUDA_VISIBLE_DEVICES` and use logical `cuda:0`. A physical `--gpu` override is
+rejected inside a Slurm allocation. Omitting both options still selects CPU
+for the trainer, including its small training smoke. Collector `--preflight`
+remains read-only and does not access a GPU.
+
+This host's GRES device minors and NVML indices differ. The runtime resolves
+`SLURM_JOB_GPUS` through the NVIDIA XML inventory's device minor to GPU UUID,
+then queries that UUID for occupancy and its NVML index. Existing cooperative
+locks use the NVML index, matching the earlier manual launchers. Neither the
+CUDA ordinal nor the Slurm device minor is assumed to be the NVML index.
+Allocation identity and occupancy are recorded as execution provenance, not
+compared as scientific protocol fields in the serial/parallel parity gate.
+Source hashes and exact label/feature comparisons remain enforced.
+
+The launcher requires at least 10 GiB free on both temporary and durable
+filesystems at start and refuses existing destinations. Per-prompt durable
+backups remain enabled. Every main stage, including the parity comparison,
+has a bounded timeout; a failed gate stops the pipeline. There is no polling
+loop, automatic resubmission, model download, or overwrite of partial runs.
+
+Default logs are under
+`/data/scratch/zekaili/atharv/dflash/slurm_logs/dflash-rejected-2k-<job_id>.out`.
+The actual job name can change that filename. Default durable output is
+`/data/scratch/zekaili/atharv/dflash/runs/rejected_trace_slurm_<job_id>`;
+an explicitly submitted `RUN_ID` overrides the final component. Submission is
+not completion: use the scheduler job ID and the stage logs to establish live
+status, and do not submit again after an ambiguous SSH response without first
+checking whether the original job exists.

@@ -13,7 +13,6 @@ import json
 import os
 from pathlib import Path
 import random
-import subprocess
 import sys
 import time
 
@@ -23,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dflash.block_response import (TARGETS, calibration_curve, choose_response_budget,
     response_metrics, select_response_points, training_targets)
 from dflash.rejected_trace import ARMS, RejectedTraceResponseModel, make_donor_mapping, model_batch
+from scripts.gpu_runtime import configure_gpu_runtime
 
 
 def sha256(path):
@@ -162,7 +162,7 @@ def benchmark_predictor(model, arrays, indices, arm, donors, repeats, device="cp
             batch = model_batch(arrays, ids, arm, donors, device)
             for _ in range(10):
                 model(**batch)
-            if device == "cuda":
+            if str(device).startswith("cuda"):
                 torch.cuda.synchronize()
                 events = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in range(repeats)]
                 for begin, end in events:
@@ -182,8 +182,8 @@ def benchmark_predictor(model, arrays, indices, arm, donors, repeats, device="cp
                 "effective_memory_rows": int(batch["trace_mask"].any(1).sum()),
                 "input_bytes": sum(value.numel()*value.element_size() for value in batch.values())}
     model.cpu()
-    return {"device": torch.cuda.get_device_name() if device == "cuda" else "CPU",
-        "timing": "CUDA events" if device == "cuda" else "perf_counter",
+    return {"device": torch.cuda.get_device_name() if str(device).startswith("cuda") else "CPU",
+        "timing": "CUDA events" if str(device).startswith("cuda") else "perf_counter",
         "warmup": 10, "repeats": repeats, "batches": measurements,
         "scope": "preallocated full predictor including trace encoding and dtype conversion; excludes input gather/H2D, target capture/retention, and serving integration"}
 
@@ -198,7 +198,7 @@ def run(args):
     if not args.smoke and (args.training_rows != 2000 or args.epochs != 6 or args.batch_size != 128
                            or args.seeds != [913, 914, 915]):
         raise ValueError("Non-smoke run requires 2000 rows, seeds913/914/915, six epochs, batch128")
-    os.environ["CUDA_VISIBLE_DEVICES"] = "" if args.gpu is None else str(args.gpu)
+    gpu_runtime = configure_gpu_runtime(args.gpu, getattr(args, "use_visible_gpu", False), max_utilization=None)
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     import torch
     from scripts.audit_rejected_trace_cache import load_cache
@@ -206,11 +206,6 @@ def run(args):
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     torch.use_deterministic_algorithms(True)
-    if args.gpu is not None:
-        used = subprocess.check_output(["nvidia-smi", f"--id={args.gpu}", "--query-gpu=memory.used",
-                                       "--format=csv,noheader,nounits"], text=True)
-        if int(used.strip()) > 1024:
-            raise RuntimeError("GPU is occupied; no training launched")
     cache_config, raw_rows, raw_arrays, audit = load_cache(args.cache, require_complete=not args.smoke)
     if not args.smoke and (cache_config.get("smoke", False) or cache_config["training_rows"] != 2000):
         raise ValueError("Non-smoke training needs a production 2000-cycle cache")
@@ -230,11 +225,12 @@ def run(args):
         "policy": "argmax mu_B - lambda*(B-1); all integer blocks2--16; calibration upper-envelope breakpoints and fixedB16 fallback",
         "matching": "same architecture, initialization, epoch row orders and dropout RNG stream within seed; all scores CPUFP32",
         "donors": "fixed seed, within partition and previousB/A, different prompt, sampled with replacement; no donor means empty trace in ALL arms",
-        "torch": torch.__version__, "cache_config": cache_config,
+        "torch": torch.__version__, "cache_config": cache_config, "gpu_runtime": gpu_runtime,
         "source_hashes": {str(path): sha256(path) for path in (Path(__file__),
             Path(__file__).resolve().parents[1]/"dflash/rejected_trace.py",
             Path(__file__).resolve().parents[1]/"dflash/block_response.py",
-            Path(__file__).resolve().parents[1]/"scripts/audit_rejected_trace_cache.py")}})
+            Path(__file__).resolve().parents[1]/"scripts/audit_rejected_trace_cache.py",
+            Path(__file__).resolve().parents[1]/"scripts/gpu_runtime.py")}})
     atomic_json(args.output/"config.json", config)
     atomic_json(args.output/"audit.json", audit)
     index = [{"selected_row": i, "cache_row": int(raw_indices[i]), "prompt_id": int(row["prompt_id"]),
@@ -245,7 +241,7 @@ def run(args):
     atomic_json(args.output/"row_index_and_donors.json", index)
     atomic_json(args.output/"memory_coverage.json", coverage)
     print("AUDIT_PASSED", json.dumps({"selected": coverage, "parameter_count": config["parameter_count"]}), flush=True)
-    device = "cuda" if args.gpu is not None else "cpu"
+    device = gpu_runtime["device"]
     started = time.monotonic()
     selected, randomness = {}, {}
     for seed in args.seeds:
@@ -405,7 +401,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cache", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--gpu", type=int)
+    gpu_args = parser.add_mutually_exclusive_group()
+    gpu_args.add_argument("--gpu", type=int, help="Physical GPU index outside Slurm only; omit for CPU")
+    gpu_args.add_argument("--use-visible-gpu", action="store_true",
+                          help="Use the single Slurm-assigned GPU without changing CUDA_VISIBLE_DEVICES")
     parser.add_argument("--training-rows", type=int, default=2000)
     parser.add_argument("--seeds", type=int, nargs="+", default=[913, 914, 915])
     parser.add_argument("--donor-seed", type=int, default=913)

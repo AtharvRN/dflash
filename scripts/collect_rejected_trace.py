@@ -27,6 +27,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.audit_block_headroom import sha256
 from scripts.collect_policy_granularity import atomic_json, select_groups, select_training_groups
+from scripts.gpu_runtime import configure_gpu_runtime
 
 BLOCKS = list(range(2, 17))
 WIDTH = 2560
@@ -328,9 +329,9 @@ def initialize_worker(options, models):
         return item["path"] if isinstance(item, dict) else item
     tokenizer = AutoTokenizer.from_pretrained(model_path("target"), local_files_only=True)
     target = AutoModelForCausalLM.from_pretrained(model_path("target"), torch_dtype=torch.bfloat16,
-                attn_implementation="sdpa", local_files_only=True).cuda().eval().requires_grad_(False)
+                attn_implementation="sdpa", local_files_only=True).to("cuda:0").eval().requires_grad_(False)
     draft = DFlashDraftModel.from_pretrained(model_path("draft"), torch_dtype=torch.bfloat16,
-                attn_implementation="sdpa", local_files_only=True).cuda().eval().requires_grad_(False)
+                attn_implementation="sdpa", local_files_only=True).to("cuda:0").eval().requires_grad_(False)
     _WORKER = (argparse.Namespace(**options), target, draft, tokenizer)
 
 
@@ -344,7 +345,10 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     for name in ("manifest", "pilot-manifest", "split-dir", "eval-cache", "models", "output", "backup"):
         p.add_argument("--"+name, type=Path, required=True)
-    p.add_argument("--gpu", type=int, required=True)
+    gpu_args = p.add_mutually_exclusive_group(required=True)
+    gpu_args.add_argument("--gpu", type=int, help="Physical GPU index outside Slurm only")
+    gpu_args.add_argument("--use-visible-gpu", action="store_true",
+                          help="Use the single Slurm-assigned GPU without changing CUDA_VISIBLE_DEVICES")
     p.add_argument("--workers", type=int, choices=[1, 2, 4], default=1)
     p.add_argument("--training-rows", type=int, default=2000)
     p.add_argument("--limit-training-prompts", type=int, default=600)
@@ -390,16 +394,13 @@ def main():
             "model_revisions": MODEL_REVISIONS, "reference_completion_sha256": reference_binding}, indent=2))
         return
     # Parent-only idle check happens before loading any worker's models.
-    query = subprocess.check_output(["nvidia-smi", f"--id={args.gpu}", "--query-gpu=memory.used,utilization.gpu", "--format=csv,noheader,nounits"], text=True)
-    used, utilization = map(int, query.strip().split(","))
-    if used > 1024 or utilization > 10:
-        raise RuntimeError(f"GPU {args.gpu} is occupied ({used} MiB, {utilization}%); no models loaded")
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+    gpu_runtime = configure_gpu_runtime(args.gpu, args.use_visible_gpu, require_gpu=True)
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args.output.mkdir(parents=True)
     args.backup.mkdir(parents=True)
     options = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
     config = {**options, "schema_version": "dflash_rejected_trace_v1", "blocks": BLOCKS,
+              "gpu_runtime": gpu_runtime,
               "models": models, "prompt_ids": [int(r["manifest_index"]) for r in selected],
               "prompt_groups": {str(r["manifest_index"]): r["group"] for r in selected},
               "prompt_content_hashes": {str(r["manifest_index"]): r["content_sha256"] for r in selected},
@@ -411,7 +412,7 @@ def main():
               "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
               "source_sha256": sha256(Path(__file__)), "dtype": "bfloat16", "attention": "sdpa", "thinking": False,
               "dependency_sha256": {name: sha256(Path(__file__).resolve().parents[1]/name) for name in
-                  ("dflash/model.py", "scripts/collect_policy_granularity.py", "scripts/audit_block_headroom.py")},
+                  ("dflash/model.py", "scripts/collect_policy_granularity.py", "scripts/audit_block_headroom.py", "scripts/gpu_runtime.py")},
               "temperature": 0, "tf32": False, "training_selection": "first 2000 eligible rows in immutable receipt order; finish bounded in-flight prompts",
               "trace": "same-forward B16 previous cycle; STRICTLY AFTER first rejected draft token; target row i-1 paired with draft row i; packed offsets1..count",
               "previous_meta": "has_previous, previous_B/16, previous_A/15; all zeros at cycle0"}

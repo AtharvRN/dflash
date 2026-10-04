@@ -114,6 +114,16 @@ class RejectedTraceComparisonTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "models.target.revision"):
             compare(self.serial, self.parallel)
 
+    def test_gpu_execution_provenance_does_not_change_collection_protocol(self):
+        self.change_config("gpu", None)
+        self.change_config("use_visible_gpu", True)
+        runtime = {"mode": "slurm_visible", "device": "cuda:0", "slurm_job_id": "123",
+                   "occupancy_before_load": {"memory_mib": 24, "utilization_percent": 0}}
+        self.change_config("gpu_runtime", runtime)
+        result = compare(self.serial, self.parallel)
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["execution_differences"]["gpu_runtime"]["right"], runtime)
+
     def test_dependency_hash_and_input_hash_changes_rejected(self):
         config = json.loads((self.parallel/"config.json").read_text())
         self.change_config("dependency_sha256", {"dflash/model.py": "d"*64})
