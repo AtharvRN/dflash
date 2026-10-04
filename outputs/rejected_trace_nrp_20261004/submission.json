@@ -1,0 +1,68 @@
+{
+  "experiment": "rejected_trace_2k_pilot",
+  "submitted_at_utc": "2026-10-04T23:24:07Z",
+  "context": "nautilus",
+  "namespace": "wenglab-interpretable-ai",
+  "job": "dflash-rejected-2k-a100-20261004",
+  "job_uid": "bc36c6b5-4b05-4188-8e4f-ccf8f571531a",
+  "pod": "dflash-rejected-2k-a100-20261004-w6djr",
+  "status_at_submission": "Pending; no GPU assigned yet",
+  "code_commit": "d9734ed4ce6c613a618bddaa6ebee496c21f21ae",
+  "code_root": "/workspace/dflashv2_data/code/rejected_trace_nrp_20261004",
+  "image": "python@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de",
+  "environment": {
+    "python": "3.12",
+    "torch": "2.13.0+cu130",
+    "transformers": "4.57.1",
+    "numpy": "2.2.6",
+    "venv": "/workspace/dflashv2_data/envs/rejected_trace_py312_torch213_cu130_20261004"
+  },
+  "resources": {
+    "nvidia.com/a100": 1,
+    "gpu_product_constraint": ["NVIDIA-A100-SXM4-80GB", "NVIDIA-A100-80GB-PCIe"],
+    "cpu": 8,
+    "memory": "96Gi",
+    "workers": 4,
+    "active_deadline_seconds": 21600,
+    "deadline_includes_pending_time": true,
+    "backoff_limit": 0
+  },
+  "pvc": "atharv-rwx-storage-1ti",
+  "run_root": "/workspace/dflashv2_data/runs/rejected_trace_2k_a100_20261004",
+  "log_parent": "/workspace/dflashv2_data/nrp_logs",
+  "eval_cache": "/workspace/dflashv2_data/runs/policy_granularity_20260927/cache",
+  "eval_complete_sha256": "b54837192ab1a475b5704c5ee34f00de00df9f889420a4b4b34ead44ced3cb6f",
+  "preflight": {
+    "passed": true,
+    "gpu_accessed": false,
+    "training_prompt_pool": 600,
+    "training_cycle_target": 2000,
+    "calibration_prompts": 47,
+    "calibration_source_rows": 344,
+    "calibration_source_eligible_rows": 342,
+    "assessment_prompts": 187,
+    "assessment_source_rows": 1420,
+    "assessment_source_eligible_rows": 1416,
+    "note": "Source membership is fixed; eligibility on A100 must pass existing replay and audit gates. These are not newly collected rows."
+  },
+  "tests": {
+    "local_focused": "84 passed",
+    "nrp_cpu_focused": "84 passed, 82 subtests passed in 172.43 seconds",
+    "local_unrestricted_discovery": "Not clean in ece285 environment: missing pytest and other test dependencies; focused suite verified separately on NRP.",
+    "real_gpu_smoke": "Not run at submission; job gates full pilot on smoke, AR checks, serial/parallel parity and training smoke."
+  },
+  "slurm_replacement": {
+    "host": "zekaili@tianhaowang-gpu0.ucsd.edu",
+    "job_id": 14614,
+    "verified_previous_state": "PENDING",
+    "final_state": "CANCELLED by 1008",
+    "runtime_before_cancellation": "00:00:00"
+  },
+  "staging": {
+    "first_pod": "dflash-rejected-stage-20261004 (Completed; durable environment preserved)",
+    "second_pod": "dflash-rejected-stage-r2-20261004 (deleted after staging/tests; PVC data preserved)",
+    "data_transfer": "Only the roughly 42 MiB policy-granularity cache was transferred; pinned models and prompt/split inputs were already on the PVC.",
+    "superseded_jobs": "Two never-started job definitions were replaced to pin the immutable code revision and reduce CPU reservation from 16 to 8. No experiment data was deleted."
+  },
+  "monitor_created": false
+}

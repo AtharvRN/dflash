@@ -44,7 +44,7 @@ spec:
                 fieldRef:
                   fieldPath: metadata.uid
             - name: DFLASH_CODE_COMMIT
-              value: SET_AT_SUBMISSION
+              value: d9734ed4ce6c613a618bddaa6ebee496c21f21ae
             - name: DFLASH_CODE_ROOT
               value: /workspace/dflashv2_data/code/rejected_trace_nrp_20261004
             - name: DFLASH_TASK_ROOT
@@ -65,12 +65,12 @@ spec:
               value: pilot
           resources:
             requests:
-              cpu: "16"
+              cpu: "8"
               memory: 96Gi
               ephemeral-storage: 40Gi
               nvidia.com/a100: "1"
             limits:
-              cpu: "16"
+              cpu: "8"
               memory: 96Gi
               ephemeral-storage: 100Gi
               nvidia.com/a100: "1"
