@@ -26,5 +26,8 @@ printf 'pod_uid=%s commit=%s\n' "$DFLASH_POD_UID" "$DFLASH_CODE_COMMIT"
 nvidia-smi --query-gpu=uuid,name,memory.total,driver_version --format=csv
 export PYTHONDONTWRITEBYTECODE=1
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
-export DFLASH_MODELS="$DFLASH_CODE_ROOT/configs/rejected_trace_nrp_models.json"
+export DFLASH_MODELS="${DFLASH_MODELS:-$DFLASH_CODE_ROOT/configs/rejected_trace_nrp_models.json}"
+nvidia-smi --query-gpu=timestamp,uuid,utilization.gpu,utilization.memory,memory.used,memory.total --format=csv -l 5 > "$TASK_LOG_DIR/gpu_utilization.csv" &
+TASK_GPU_MONITOR=$!
+trap 'kill "$TASK_GPU_MONITOR" 2>/dev/null || true' EXIT
 bash scripts/run_rejected_trace_predictor.sh

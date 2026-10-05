@@ -329,9 +329,11 @@ def initialize_worker(options, models):
         return item["path"] if isinstance(item, dict) else item
     tokenizer = AutoTokenizer.from_pretrained(model_path("target"), local_files_only=True)
     target = AutoModelForCausalLM.from_pretrained(model_path("target"), torch_dtype=torch.bfloat16,
-                attn_implementation="sdpa", local_files_only=True).to("cuda:0").eval().requires_grad_(False)
+                attn_implementation="sdpa", local_files_only=True,
+                device_map={"": "cuda:0"}, low_cpu_mem_usage=True).eval().requires_grad_(False)
     draft = DFlashDraftModel.from_pretrained(model_path("draft"), torch_dtype=torch.bfloat16,
-                attn_implementation="sdpa", local_files_only=True).to("cuda:0").eval().requires_grad_(False)
+                attn_implementation="sdpa", local_files_only=True,
+                device_map={"": "cuda:0"}, low_cpu_mem_usage=True).eval().requires_grad_(False)
     _WORKER = (argparse.Namespace(**options), target, draft, tokenizer)
 
 
