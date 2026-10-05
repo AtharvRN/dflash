@@ -1,0 +1,114 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dflash-rejected-2k-a100-r2-20261005
+  namespace: wenglab-interpretable-ai
+  labels:
+    app: dflash-rejected-trace
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 21600
+  template:
+    metadata:
+      labels:
+        app: dflash-rejected-trace
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values: [NVIDIA-A100-SXM4-80GB, NVIDIA-A100-80GB-PCIe]
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: [amd64]
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values: [node-2-2.sdsc.optiputer.net]
+      containers:
+        - name: pilot
+          image: lmsysorg/sglang@sha256:df6ad77ad91b1f83985ebb789de97b83fc8745786abf5c2913d6d0387007e4cb
+          command: [/bin/bash, -lc]
+          args:
+            - |
+              set -euo pipefail
+              export PYTHONPATH= PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2
+              TASK_LOG_DIR="$DFLASH_TASK_ROOT/nrp_logs/${RUN_ID}_${DFLASH_POD_UID}"
+              mkdir -p "$TASK_LOG_DIR"
+              exec > >(tee "$TASK_LOG_DIR/bootstrap.log") 2>&1
+              trap 'TASK_EXIT=$?; printf "exit_code=%s\n" "$TASK_EXIT" > "$TASK_LOG_DIR/bootstrap_exit.txt"' EXIT
+              date -u +%FT%TZ
+              printf 'pod_uid=%s NVIDIA_VISIBLE_DEVICES=%s CUDA_VISIBLE_DEVICES=%s\n' "$DFLASH_POD_UID" "${NVIDIA_VISIBLE_DEVICES-unset}" "${CUDA_VISIBLE_DEVICES-unset}"
+              if ! command -v git >/dev/null; then
+                timeout 300s apt-get update -qq
+                timeout 300s apt-get install -y --no-install-recommends git
+              fi
+              timeout 300s git clone --depth 1 --branch codex/block-headroom-20260926 https://github.com/AtharvRN/dflash.git "$DFLASH_CODE_ROOT"
+              cd "$DFLASH_CODE_ROOT"
+              timeout 300s git fetch --depth 1 origin "$DFLASH_CODE_COMMIT"
+              git checkout --detach "$DFLASH_CODE_COMMIT"
+              # Fail before staging or package installation if GPU isolation is wrong.
+              python -c 'from scripts.gpu_runtime import configure_gpu_runtime; print(configure_gpu_runtime(use_container_gpu=True, require_gpu=True))'
+              python -m venv /tmp/dflash-rejected-r2-env
+              timeout 900s "$DFLASH_PYTHON" -m pip install --no-cache-dir torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
+              timeout 600s "$DFLASH_PYTHON" -m pip install --no-cache-dir torch==2.13.0 transformers==4.57.1 numpy==2.2.6 accelerate==1.10.1 rich loguru pytest
+              "$DFLASH_PYTHON" -c 'from scripts.gpu_runtime import configure_gpu_runtime; configure_gpu_runtime(use_container_gpu=True, require_gpu=True); import torch, transformers; assert torch.__version__ == "2.13.0+cu130"; assert transformers.__version__ == "4.57.1"; assert torch.cuda.device_count() == 1; x=torch.ones((64,64),device="cuda"); assert (x@x)[0,0].item() == 64; print("CUDA_SMOKE_PASSED")'
+              PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 timeout 300s "$DFLASH_PYTHON" -m pytest -q tests/test_gpu_runtime.py tests/test_rejected_trace_slurm_launcher.py tests/test_collect_rejected_trace.py tests/test_rejected_trace_predictor.py tests/test_compare_rejected_trace_caches.py tests/test_rejected_trace_cache.py tests/test_stage_rejected_trace_nrp.py
+              timeout 1200s "$DFLASH_PYTHON" -u scripts/stage_rejected_trace_nrp.py --destination "$DFLASH_DATA_ROOT" --models configs/rejected_trace_nrp_models.json
+              cp "$DFLASH_DATA_ROOT/staging.json" "$TASK_LOG_DIR/staging.json"
+              bash scripts/run_rejected_trace_nrp.sh
+          env:
+            - name: DFLASH_POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: DFLASH_CODE_COMMIT
+              value: 82fba5f7074ef9985e781c388f5f253b1c7e7f45
+            - name: DFLASH_CODE_ROOT
+              value: /tmp/dflash-rejected-r2-code
+            - name: DFLASH_TASK_ROOT
+              value: /workspace/dflashv2_data
+            - name: DFLASH_DATA_ROOT
+              value: /tmp/dflash-rejected-r2-inputs
+            - name: DFLASH_PYTHON
+              value: /tmp/dflash-rejected-r2-env/bin/python
+            - name: DFLASH_EVAL_CACHE
+              value: /tmp/dflash-rejected-r2-inputs/runs/policy_granularity_20260927/cache
+            - name: DFLASH_MODELS
+              value: /tmp/dflash-rejected-r2-inputs/models.json
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: compute,utility
+            - name: RUN_ID
+              value: rejected_trace_2k_a100_r2_20261005
+            - name: WORKERS
+              value: "4"
+            - name: MODE
+              value: pilot
+          resources:
+            requests:
+              cpu: "8"
+              memory: 64Gi
+              ephemeral-storage: 40Gi
+              nvidia.com/a100: "1"
+            limits:
+              cpu: "8"
+              memory: 64Gi
+              ephemeral-storage: 100Gi
+              nvidia.com/a100: "1"
+          volumeMounts:
+            - name: data
+              mountPath: /workspace
+            - name: shared-memory
+              mountPath: /dev/shm
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: atharv-rwx-storage-1ti
+        - name: shared-memory
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
