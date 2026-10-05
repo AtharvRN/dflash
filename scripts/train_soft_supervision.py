@@ -33,7 +33,10 @@ FIELDS = ("matches", "accepted_len", "at_risk", "tv_overlap", "target_margin", "
           "candidate_vectors", "eligible", "anchor_match", "accepted_eos")
 
 
-def load_cache(root):
+def load_cache(root, *, view="postdraft"):
+    if view not in ("postdraft", "predraft"):
+        raise ValueError("Unknown cache view")
+    fields = FIELDS if view == "postdraft" else tuple(k for k in FIELDS if k != "candidate_vectors") + ("fused", "target_candidate_prob")
     complete = json.loads((root/"COMPLETE.json").read_text())
     if not complete.get("complete"):
         raise ValueError("Incomplete collection")
@@ -53,14 +56,14 @@ def load_cache(root):
         if receipt["summary"].get("canonical_disagreements", 0):
             raise ValueError("Canonical disagreement")
         with np.load(root/name, allow_pickle=False) as shard:
-            chunk = {k: shard[k] for k in FIELDS}
+            chunk = {k: shard[k] for k in fields}
         if any(len(v) != len(receipt["rows"]) for v in chunk.values()):
             raise ValueError("Shard alignment mismatch")
         seen.extend(receipt["rows"])
         chunks.append(chunk)
     if seen != list(range(len(rows))) or [r["row"] for r in rows] != seen:
         raise ValueError("Row identity/order mismatch")
-    arrays = {k: np.concatenate([c[k] for c in chunks]) for k in FIELDS}
+    arrays = {k: np.concatenate([c[k] for c in chunks]) for k in fields}
     if not np.array_equal(accepted_lengths(arrays["matches"]), arrays["accepted_len"]):
         raise ValueError("Acceptance mismatch")
     if not np.array_equal(risk_mask(arrays["accepted_len"]), arrays["at_risk"]):
@@ -68,12 +71,16 @@ def load_cache(root):
     if not np.array_equal(arrays["eligible"], arrays["anchor_match"] & ~arrays["accepted_eos"]):
         raise ValueError("Eligibility mismatch")
     n = len(rows)
-    for field, shape in (("draft_stats", (n,15,3)), ("candidate_vectors", (n,15,2560)),
-                         ("tv_overlap", (n,15)), ("target_margin", (n,15))):
+    shapes = [("draft_stats", (n,15,3)), ("tv_overlap", (n,15)), ("target_margin", (n,15))]
+    shapes += ([("candidate_vectors", (n,15,2560))] if view == "postdraft" else
+               [("fused", (n,2560)), ("target_candidate_prob", (n,15))])
+    for field, shape in shapes:
         if arrays[field].shape != shape or not np.isfinite(arrays[field]).all():
             raise ValueError("Invalid feature or label array")
     if np.any((arrays["tv_overlap"] < -1e-6) | (arrays["tv_overlap"] > 1+1e-6)):
         raise ValueError("Invalid TV labels")
+    if view == "predraft" and np.any((arrays["target_candidate_prob"] < 0) | (arrays["target_candidate_prob"] > 1)):
+        raise ValueError("Invalid target probability labels")
     groups = {g: {int(r["prompt_id"]) for r in rows if r["group"] == g} for g in ("train", "calibration", "assessment")}
     if any(groups[a] & groups[b] for a in groups for b in groups if a < b):
         raise ValueError("Prompt leakage")
