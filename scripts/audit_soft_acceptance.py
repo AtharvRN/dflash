@@ -191,7 +191,7 @@ def initialize(models):
 def work(batch):
     import torch
     with torch.inference_mode():
-        return replay_batch(batch, *_MODELS, canonical_check=batch[0]["row"] == 0)
+        return replay_batch(batch, *_MODELS, canonical_check=batch[0]["row"] == 0 or batch[0].get("canonical_check", False))
 
 
 def summarize(arrays, rows):
