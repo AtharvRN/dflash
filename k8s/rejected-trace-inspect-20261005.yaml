@@ -1,0 +1,39 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dflash-rejected-inspect-20261005
+  namespace: wenglab-interpretable-ai
+  labels:
+    app: dflash-rejected-trace
+spec:
+  restartPolicy: Never
+  activeDeadlineSeconds: 600
+  automountServiceAccountToken: false
+  containers:
+    - name: inspect
+      image: python@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
+      command: [python, -u, -c]
+      args:
+        - |
+          from pathlib import Path
+          import json, time
+          root = Path('/workspace/dflashv2_data/runs/rejected_trace_2k_a100_local_20261005')
+          logs = Path('/workspace/dflashv2_data/nrp_logs/rejected_trace_2k_a100_local_20261005_d83ae9a6-b2a7-40f4-84ad-a34a18131ffc')
+          print('UTC', time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
+          for path in [logs/'pipeline.log', logs/'gpu_utilization.csv', root/'parallel_gate.json', root/'pipeline_exit.txt', root/'serial_smoke/progress.json', root/'parallel_smoke/progress.json', root/'cache/progress.json']:
+              print('FILE', str(path), 'exists', path.exists())
+              if path.exists():
+                  print('MTIME', time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(path.stat().st_mtime)))
+                  print('\n'.join(path.read_text().splitlines()[-30:]))
+      resources:
+        requests: {cpu: "1", memory: 1Gi}
+        limits: {cpu: "1", memory: 1Gi}
+      volumeMounts:
+        - name: data
+          mountPath: /workspace
+          readOnly: true
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: atharv-rwx-storage-1ti
+        readOnly: true
