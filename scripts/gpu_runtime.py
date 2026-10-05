@@ -3,9 +3,10 @@
 Slurm's CUDA_VISIBLE_DEVICES may be remapped by the job's device cgroup.  Never
 use that local ordinal as an nvidia-smi physical index. This workstation's GRES
 uses /dev/nvidia0..7; resolve SLURM_JOB_GPUS device minor to UUID via XML instead.
-Kubernetes uses a single device-plugin allocation UUID, verified against the
-container's accessible inventory before CUDA visibility is set. No torch import
-is needed.
+Kubernetes verifies a single exposed full-GPU UUID before setting CUDA visibility.
+Some container runtimes inject devices without a UUID in NVIDIA_VISIBLE_DEVICES;
+in that case, only an unambiguous single-device inventory is accepted. No torch
+import is needed; the launcher's separate CUDA smoke validates compute access.
 """
 from __future__ import annotations
 
@@ -33,24 +34,33 @@ def slurm_gpu_uuid(device_minor):
 
 
 def container_gpu_uuid(inherited):
-    """Validate the explicit single-GPU Kubernetes allocation without CUDA."""
+    """Validate single-device exposure, with or without legacy UUID metadata."""
     if not os.environ.get("KUBERNETES_SERVICE_HOST") or not os.environ.get("DFLASH_POD_UID", "").strip():
         raise ValueError("--use-container-gpu requires Kubernetes and downward-API DFLASH_POD_UID")
-    allocation = os.environ.get("NVIDIA_VISIBLE_DEVICES", "")
-    if not re.fullmatch(r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", allocation):
-        raise ValueError("Expected one full GPU UUID in NVIDIA_VISIBLE_DEVICES; no all, ordinals, or MIG")
+    allocation = os.environ.get("NVIDIA_VISIBLE_DEVICES")
+    uuid_pattern = r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
+    discover = allocation in (None, "", "void")
+    if not discover and not re.fullmatch(uuid_pattern, allocation):
+        raise ValueError("Unsupported NVIDIA_VISIBLE_DEVICES; require a UUID or inventory discovery, not all/none/ordinals/MIG")
     # An empty existing mask explicitly disables CUDA; never silently broaden it.
     # The sole logical ordinal is accepted only after the NVML inventory proves
     # that the container can access exactly this allocated device.
-    if inherited not in (None, "0", allocation):
+    if inherited not in (None, "0") and not (
+        isinstance(inherited, str) and re.fullmatch(uuid_pattern, inherited)
+        and (discover or inherited == allocation)
+    ):
         raise ValueError("CUDA_VISIBLE_DEVICES must be unset, 0, or the allocated container GPU UUID")
     inventory = subprocess.check_output([
         "nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader",
     ], text=True, timeout=15)
     accessible = [line.strip() for line in inventory.splitlines() if line.strip()]
-    if accessible != [allocation]:
+    if len(accessible) != 1 or not re.fullmatch(uuid_pattern, accessible[0]):
+        raise RuntimeError("Container GPU inventory must expose exactly one full GPU UUID")
+    if not discover and accessible != [allocation]:
         raise RuntimeError("Container accessible GPU inventory does not exactly match its single allocation")
-    return allocation
+    if inherited not in (None, "0", accessible[0]):
+        raise ValueError("CUDA_VISIBLE_DEVICES does not match the single exposed GPU")
+    return accessible[0]
 
 
 def configure_gpu_runtime(gpu=None, use_visible_gpu=False, *, use_container_gpu=False, require_gpu=False,
@@ -108,6 +118,8 @@ def configure_gpu_runtime(gpu=None, use_visible_gpu=False, *, use_container_gpu=
         "container_allocated_gpu_uuid": allocated_uuid,
         "kubernetes_pod_uid": os.environ.get("DFLASH_POD_UID") if use_container_gpu else None,
         "nvidia_visible_devices": os.environ.get("NVIDIA_VISIBLE_DEVICES") if use_container_gpu else None,
+        "container_uuid_source": ("single_visible_inventory" if os.environ.get("NVIDIA_VISIBLE_DEVICES")
+                                  in (None, "", "void") else "nvidia_env_uuid") if use_container_gpu else None,
     }
     if mode != "cpu":
         # Slurm physical /dev/nvidia minor -> UUID, NOT the remapped CUDA ordinal

@@ -22,7 +22,7 @@ exec > >(tee "$TASK_LOG_DIR/pipeline.log") 2>&1
 date -u +%FT%TZ
 printf 'pod_uid=%s commit=%s\n' "$DFLASH_POD_UID" "$DFLASH_CODE_COMMIT"
 "$DFLASH_PYTHON" -m pip freeze > "$TASK_LOG_DIR/environment.txt"
-"$DFLASH_PYTHON" -c 'import torch, transformers; assert torch.__version__ == "2.13.0+cu130"; assert transformers.__version__ == "4.57.1"; print("Pinned framework versions passed")'
+"$DFLASH_PYTHON" -c 'from scripts.gpu_runtime import configure_gpu_runtime; print(configure_gpu_runtime(use_container_gpu=True, require_gpu=True)); import torch, transformers; assert torch.__version__ == "2.13.0+cu130"; assert transformers.__version__ == "4.57.1"; assert torch.cuda.device_count() == 1; x=torch.ones((64,64),device="cuda"); assert (x@x)[0,0].item() == 64; print("Pinned framework versions and CUDA compute smoke passed")'
 nvidia-smi --query-gpu=uuid,name,memory.total,driver_version --format=csv
 export PYTHONDONTWRITEBYTECODE=1
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1

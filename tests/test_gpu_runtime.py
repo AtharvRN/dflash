@@ -217,13 +217,42 @@ class ContainerGpuRuntimeTests(unittest.TestCase):
                     configure_gpu_runtime(use_container_gpu=True)
         self.query.assert_not_called()
 
-    def test_refuses_missing_multiple_ordinal_mig_or_all_allocation(self):
-        for allocation in ("", "all", "none", "0", "GPU-short", "MIG-"+self.UUID,
+    def test_refuses_multiple_ordinal_mig_or_all_allocation(self):
+        for allocation in ("all", "none", "0", "GPU-short", "MIG-"+self.UUID,
                            self.UUID+","+self.OTHER_UUID, " "+self.UUID):
             with self.subTest(allocation=allocation), mock.patch.dict(os.environ, {"NVIDIA_VISIBLE_DEVICES": allocation}):
                 with self.assertRaisesRegex(ValueError, "NVIDIA_VISIBLE_DEVICES"):
                     configure_gpu_runtime(use_container_gpu=True)
         self.query.assert_not_called()
+
+    def test_runtime_inventory_discovery_without_legacy_uuid(self):
+        for allocation in (None, "", "void"):
+            with self.subTest(allocation=allocation), mock.patch.dict(os.environ):
+                if allocation is None:
+                    os.environ.pop("NVIDIA_VISIBLE_DEVICES", None)
+                else:
+                    os.environ["NVIDIA_VISIBLE_DEVICES"] = allocation
+                result = configure_gpu_runtime(use_container_gpu=True, require_gpu=True)
+                self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], self.UUID)
+                self.assertEqual(result["container_uuid_source"], "single_visible_inventory")
+                self.assertEqual(result["nvidia_visible_devices"], allocation)
+
+    def test_discovery_requires_one_valid_full_device(self):
+        os.environ["NVIDIA_VISIBLE_DEVICES"] = "void"
+        for inventory in ("", "MIG-"+self.UUID, "GPU-short", self.UUID+"\n"+self.OTHER_UUID):
+            with self.subTest(inventory=inventory):
+                self.inventory = inventory
+                with self.assertRaisesRegex(RuntimeError, "inventory"):
+                    configure_gpu_runtime(use_container_gpu=True)
+                self.assertNotIn("CUDA_VISIBLE_DEVICES", os.environ)
+
+    def test_discovery_preserves_explicit_cuda_restrictions(self):
+        os.environ["NVIDIA_VISIBLE_DEVICES"] = "void"
+        for visible in ("", "-1", "1", "0,1", self.OTHER_UUID):
+            with self.subTest(visible=visible), mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": visible}):
+                with self.assertRaisesRegex(ValueError, "CUDA_VISIBLE_DEVICES"):
+                    configure_gpu_runtime(use_container_gpu=True)
+                self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], visible)
 
     def test_refuses_disabled_multiple_foreign_or_nonzero_visibility(self):
         for visible in ("", "-1", "1", "0,1", "all", self.OTHER_UUID, self.UUID+",0"):
