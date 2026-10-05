@@ -40,13 +40,37 @@ finish() {
     printf 'exit_code=%s\n' "$code" > "$TASK_RUN/pipeline_exit.txt"
 }
 trap finish EXIT
+# NVML utilization is a recent sampling window and can stay high briefly after
+# a completed worker releases all memory. Keep the strict entry guard; wait for
+# three quiet readings between our stages, never override occupied-device checks.
+wait_for_quiet_gpu() {
+    "$DFLASH_PYTHON" -c '
+import subprocess,time
+quiet=0
+for attempt in range(30):
+    line=subprocess.check_output(["nvidia-smi","--query-gpu=memory.used,utilization.gpu","--format=csv,noheader,nounits"],text=True,timeout=10)
+    if len(line.strip().splitlines())!=1:
+        raise RuntimeError("Ambiguous GPU inventory between stages")
+    memory,util=map(int,line.strip().split(","))
+    quiet=quiet+1 if 0<=memory<=1024 and 0<=util<=10 else 0
+    if quiet>=3:
+        print("GPU_QUIET",memory,util,flush=True)
+        break
+    time.sleep(1)
+else:
+    raise RuntimeError("GPU did not become idle within bounded inter-stage check")
+'
+}
 TASK_COMMON=(--source "$DFLASH_SOURCE" --evaluation "$DFLASH_EVALUATION" --models "$DFLASH_MODELS" --workers 4)
 timeout --signal=TERM --kill-after=30s 600s "$DFLASH_PYTHON" -u scripts/collect_soft_supervision.py \
     "${TASK_COMMON[@]}" --smoke --output "$TASK_WORK/smoke_cache" --backup "$TASK_RUN/smoke_cache"
+wait_for_quiet_gpu
 timeout --signal=TERM --kill-after=30s 600s "$DFLASH_PYTHON" -u scripts/train_soft_supervision.py \
     --cache "$TASK_WORK/smoke_cache" --smoke --output "$TASK_WORK/smoke_training" --backup "$TASK_RUN/smoke_training"
+wait_for_quiet_gpu
 timeout --signal=TERM --kill-after=30s 1800s "$DFLASH_PYTHON" -u scripts/collect_soft_supervision.py \
     "${TASK_COMMON[@]}" --output "$TASK_WORK/cache" --backup "$TASK_RUN/cache"
+wait_for_quiet_gpu
 timeout --signal=TERM --kill-after=30s 3600s "$DFLASH_PYTHON" -u scripts/train_soft_supervision.py \
     --cache "$TASK_WORK/cache" --output "$TASK_WORK/training" --backup "$TASK_RUN/training"
 echo "EXPERIMENT_COMPLETE $TASK_RUN/training/summary.json"
