@@ -27,6 +27,9 @@ from scripts.train_midverify_scaling import batch_stream, parameter_sha
 from scripts.train_soft_supervision import load_cache, bootstrap, descriptive_curve, TARGETS
 
 ARMS = ("hard", "soft_tv", "soft_target", "hard_tv", "hard_target")
+BCE_ARMS = ("hard", "soft_tv_bce", "mixed_tv_bce", "mixed_margin_bce")
+SOFT_WEIGHT = .25
+MARGIN_TEMPERATURE = 1.0
 LIMITATIONS = [
     "Pre-draft inputs only; B16 candidate-preserving clipping, NOT actual smaller-block drafting",
     "No online throughput or draft-work saving established by this experiment",
@@ -74,13 +77,69 @@ def objective(output, hard, tv, target, mask, arm):
     return loss
 
 
+def same_head_targets(hard, tv, margin, arm):
+    """Fixed labels for the SAME primary output; no assessment-fitted parameters."""
+    if arm not in BCE_ARMS:
+        raise ValueError("Unknown same-head arm")
+    if arm == "hard":
+        return hard
+    if arm == "soft_tv_bce":
+        return tv.clamp(0, 1)  # FP32 summation can exceed one by tiny roundoff.
+    soft = tv.clamp(0, 1) if arm == "mixed_tv_bce" else (margin / MARGIN_TEMPERATURE).sigmoid()
+    # At exact argmax ties, retain the actual hard tie-breaking outcome in the
+    # hard component; the margin soft component is neutral (0.5).
+    return (1-SOFT_WEIGHT)*hard + SOFT_WEIGHT*soft
+
+
+def same_head_objective(output, hard, tv, margin, mask, arm):
+    import torch.nn.functional as F
+    labels = same_head_targets(hard, tv, margin, arm)
+    values = F.binary_cross_entropy_with_logits(output[:, 0], labels, reduction="none")
+    return (values*mask).sum()/mask.sum().clamp_min(1)
+
+
 def policy_scores(output, arm):
     import torch.nn.functional as F
-    if arm not in ARMS:
+    if arm not in ARMS + BCE_ARMS:
         raise ValueError("Unknown supervision arm")
     head = 1 if arm == "soft_tv" else 2 if arm == "soft_target" else 0
     # Log-space prefix products: stable, monotonically decreasing by position.
     return F.logsigmoid(output[:, head]).cumsum(-1)
+
+
+def prefix_calibration(scores, accepted):
+    """Descriptive reliability against real greedy prefix outcomes, all 15 slots.
+
+    Once a rejection occurs, prefix-survival labels are known zero even though
+    subsequent token-match labels are off-path. No fitting or policy selection.
+    """
+    values = np.asarray(scores, dtype=np.float64)
+    a = np.asarray(accepted)
+    if values.shape != (len(a), 15) or not np.isfinite(values).all() or np.any(values > 1e-6):
+        raise ValueError("Invalid log-prefix scores")
+    if np.any((a < 0) | (a > 15) | (a != a.astype(int))):
+        raise ValueError("Invalid accepted lengths")
+    probability = np.exp(values).clip(0, 1)
+    truth = a[:, None] >= np.arange(1, 16)[None]
+    per_position = []
+    for j in range(15):
+        bins = np.minimum((probability[:, j]*10).astype(int), 9)
+        reliability = []
+        ece = 0.
+        for b in range(10):
+            take = bins == b
+            if not take.any():
+                continue
+            confidence, frequency = float(probability[take, j].mean()), float(truth[take, j].mean())
+            ece += float(take.mean())*abs(confidence-frequency)
+            reliability.append({"bin": b, "count": int(take.sum()), "predicted": confidence, "observed": frequency})
+        per_position.append({"position": j+1, "brier": float(np.square(probability[:, j]-truth[:, j]).mean()),
+                             "ece_10_equal_width_bins": ece, "reliability": reliability})
+    return {"mean_brier": float(np.square(probability-truth).mean()),
+            "mean_position_ece": float(np.mean([v["ece_10_equal_width_bins"] for v in per_position])),
+            "surrogate_expected_A_mae": float(np.abs(probability.sum(1)-a).mean()),
+            "positions": per_position,
+            "scope": "diagnostic only; soft/mixed prefix products are not assumed to be greedy probabilities"}
 
 
 def score(model, x, arm):
@@ -110,7 +169,10 @@ def main():
     for name in ("cache", "output", "backup"):
         p.add_argument("--"+name, type=Path, required=True)
     p.add_argument("--smoke", action="store_true")
+    p.add_argument("--suite", choices=("auxiliary", "same_head_bce"), default="auxiliary")
     args = p.parse_args()
+    same_head = args.suite == "same_head_bce"
+    arms = BCE_ARMS if same_head else ARMS
     if args.output.exists() or args.backup.exists() or args.output.resolve() == args.backup.resolve():
         raise ValueError("Fresh independent destinations required")
     collection, rows, arrays = load_cache(args.cache, view="predraft")
@@ -135,9 +197,12 @@ def main():
     tx, cx, ax = x[tr], x[ca], x[ass]
     y, tv, target, risk = (torch.as_tensor(arrays[k][tr], dtype=torch.float32, device=device)
                            for k in ("matches", "tv_overlap", "target_candidate_prob", "at_risk"))
+    margin = torch.as_tensor(arrays["target_margin"][tr], dtype=torch.float32, device=device)
     accepted = arrays["accepted_len"]
     prompts = np.array([r["prompt_id"] for r in rows])[ass]
     seeds, updates, every = ([913], 8, 4) if args.smoke else ([913, 914, 915], 1024, 64)
+    evaluation_steps = sorted(set(range(every, updates+1, every)) |
+                              ({8, 16, 32, 48} if same_head and not args.smoke else set()))
     args.output.mkdir(parents=True)
     args.backup.mkdir(parents=True)
 
@@ -147,7 +212,8 @@ def main():
 
     config = {"schema": "predraft_soft_supervision_v1", "cache_complete_sha256": sha256(args.cache/"COMPLETE.json"),
               "runtime": runtime, "seeds": seeds, "updates": updates, "calibrate_every": every,
-              "batch_size": 128, "arms": ARMS, "input_allowlist": ["fused"],
+              "batch_size": 128, "arms": arms, "suite": args.suite, "evaluation_steps": evaluation_steps,
+              "input_allowlist": ["fused"],
               "inputs": "2560-d latest committed-token fused vector captured BEFORE current draft; no extra normalization",
               "architecture": "2560-512-256-128-45; GELU/LayerNorm/dropout.05; three 15-position heads in EVERY arm",
               "loss": "masked hard BCE OR soft SmoothL1(sigmoid, label; beta=.1) OR sum of hard and soft losses",
@@ -160,6 +226,14 @@ def main():
               "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
               "source_sha256": sha256(Path(__file__)), "smoke": args.smoke,
               "limitations": LIMITATIONS}
+    if same_head:
+        config.update(schema="predraft_same_head_bce_v1",
+                      loss="at-risk BCE on primary output only; labels hard, TV, .75*hard+.25*TV, or .75*hard+.25*sigmoid(margin/1.0)",
+                      soft_label_weight=SOFT_WEIGHT, margin_temperature=MARGIN_TEMPERATURE,
+                      decision="threshold log-prefix-product of the SAME primary head in every arm; 0..15 proposals",
+                      unused_outputs="two auxiliary output slots retained in every model to preserve initialization against prior baseline; receive no loss",
+                      hyperparameters_selected_on_assessment=False,
+                      prefix_calibration="diagnostic Brier/ECE against actual greedy prefix outcomes; no extra fitted calibration")
     save_json("config.json", config)
     save_json("row_selection.json", {g: v.tolist() for g, v in select.items()})
     summaries, choices, predictions, curves = {}, {}, {}, {}
@@ -167,7 +241,7 @@ def main():
     started = time.monotonic()
     for seed in seeds:
         initial_reference, order_reference = None, None
-        for arm in ARMS:
+        for arm in arms:
             torch.manual_seed(seed)
             model = build_model().to(device)
             initial = parameter_sha(model.state_dict())
@@ -185,13 +259,14 @@ def main():
                 b = b.to(device)
                 model.train()
                 opt.zero_grad(set_to_none=True)
-                loss = objective(model(tx[b]), y[b], tv[b], target[b], risk[b], arm)
+                loss = (same_head_objective(model(tx[b]), y[b], tv[b], margin[b], risk[b], arm) if same_head else
+                        objective(model(tx[b]), y[b], tv[b], target[b], risk[b], arm))
                 if not torch.isfinite(loss):
                     raise ValueError("Nonfinite training loss")
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=True)
                 opt.step()
-                if step % every:
+                if step not in evaluation_steps:
                     continue
                 qc = score(model, cx, arm)
                 point = calibrate(qc, accepted[ca], (.96,))["0.96"]
@@ -224,9 +299,13 @@ def main():
                 "minibatch_order_sha256": order_hash.hexdigest(), "parameter_count": sum(v.numel() for v in model.parameters()),
                 "primary": points["0.96"], "operating_points": points,
                 "bootstrap": bootstrap(accepted[ass], k, choices[f"hard_seed{seed}"], prompts, 100 if args.smoke else 2000),
-                "label_diagnostics": label_diagnostics(model, ax, arrays, ass),
-                "trained_heads": (["hard"] if arm == "hard" else [arm.removeprefix("soft_")] if arm.startswith("soft_")
+                "label_diagnostics": label_diagnostics(model, ax, arrays, ass) if not same_head else None,
+                "trained_heads": (["primary"] if same_head else ["hard"] if arm == "hard" else [arm.removeprefix("soft_")] if arm.startswith("soft_")
                                   else ["hard", arm.removeprefix("hard_")])}
+            if same_head:
+                summaries[name]["prefix_calibration"] = {"calibration": prefix_calibration(qc, accepted[ca]),
+                                                         "assessment": prefix_calibration(qa, accepted[ass])}
+                summaries[name]["assessment_matched_retention_DESCRIPTIVE"] = calibrate(qa, accepted[ass], (.96,))["0.96"]
             predictions[name], calibration_predictions[name] = qa, qc
             curves[name] = descriptive_curve(qa, accepted[ass])
             save_json(name+"_history.json", history)
@@ -243,7 +322,7 @@ def main():
     summary = {"models": summaries, "controls": controls, "counts": config["counts"], "across_seeds": {},
                "full_b16": metrics(accepted[ass], np.full(len(ass), 16)),
                "elapsed_seconds": time.monotonic()-started, "limitations": LIMITATIONS}
-    for arm in ARMS:
+    for arm in arms:
         summary["across_seeds"][arm] = {}
         for field in ("aggregate_accept_ratio", "retention", "mean_kept_rows", "mean_accepted"):
             values = [summaries[f"{arm}_seed{s}"]["primary"]["assessment"][field] for s in seeds]

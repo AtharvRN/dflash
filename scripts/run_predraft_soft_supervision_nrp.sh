@@ -8,6 +8,8 @@ set -euo pipefail
 : "${DFLASH_CACHE_ROOT:?}"
 : "${RUN_ID:?}"
 [[ "$RUN_ID" =~ ^[a-zA-Z0-9_-]+$ ]]
+TASK_SUITE=${DFLASH_SUPERVISION_SUITE:-auxiliary}
+[[ "$TASK_SUITE" == auxiliary || "$TASK_SUITE" == same_head_bce ]]
 cd "$DFLASH_CODE_ROOT"
 [[ "$(git rev-parse HEAD)" == "$DFLASH_CODE_COMMIT" && -z "$(git status --porcelain)" ]]
 export PYTHONPATH="$DFLASH_CODE_ROOT" PYTHONDONTWRITEBYTECODE=1
@@ -40,7 +42,7 @@ finish() {
 }
 trap finish EXIT
 timeout --signal=TERM --kill-after=30s 300s "$DFLASH_PYTHON" -u scripts/train_predraft_soft_supervision.py \
-    --cache "$DFLASH_CACHE_ROOT/smoke_cache" --smoke --output "$TASK_WORK/smoke_training" --backup "$TASK_RUN/smoke_training"
+    --suite "$TASK_SUITE" --cache "$DFLASH_CACHE_ROOT/smoke_cache" --smoke --output "$TASK_WORK/smoke_training" --backup "$TASK_RUN/smoke_training"
 # NVML can retain the previous process's utilization for a sampling window.
 "$DFLASH_PYTHON" -c '
 import subprocess,time
@@ -58,5 +60,5 @@ else:
     raise RuntimeError("GPU did not become idle after smoke")
 '
 timeout --signal=TERM --kill-after=30s 1800s "$DFLASH_PYTHON" -u scripts/train_predraft_soft_supervision.py \
-    --cache "$DFLASH_CACHE_ROOT/cache" --output "$TASK_WORK/training" --backup "$TASK_RUN/training"
+    --suite "$TASK_SUITE" --cache "$DFLASH_CACHE_ROOT/cache" --output "$TASK_WORK/training" --backup "$TASK_RUN/training"
 echo "EXPERIMENT_COMPLETE $TASK_RUN/training/summary.json"
