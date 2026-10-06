@@ -19,6 +19,7 @@ import numpy as np
 import torch
 
 from dflash.midverify_latency import packed_indices, compact_indices, accepted_from_top1
+from dflash.predraft_latency import fixed_width, frozen_lengths
 from scripts.audit_block_headroom import sha256
 from scripts.profile_sglang_latency import atomic_json, distribution
 from scripts.train_midverify_cascade import build_probe
@@ -100,7 +101,11 @@ class Snapshot:
             self.draft.req_to_token_pool.req_to_token[reqs[j], length:length+16] = self.suffix[j].int()
         self.positions = self.lengths_gpu.long()[:, None] + torch.arange(16, device='cuda')[None]
         self.anchor_top1 = []
+        self.raw_latest = []
         self.prefill()
+        self.raw_latest = torch.cat(self.raw_latest)
+        if self.raw_latest.shape != (self.n, 12800):
+            raise AssertionError('Latest committed-token capture has wrong shape')
         self.fingerprint_locs = torch.stack([s[-1] for s in self.prefix_slots])
         self.prefix_fingerprint = [self.runner.token_to_kv_pool.get_key_buffer(i)[self.fingerprint_locs].clone()
                                    for i in range(36)]
@@ -125,6 +130,7 @@ class Snapshot:
                 num_token_non_padded_cpu=len(ids))
             out = self.runner.forward(fb).logits_output
             self.anchor_top1.extend(out.next_token_logits.argmax(-1).tolist())
+            self.raw_latest.append(out.hidden_states[lens.long().cumsum(0)-1].clone())
             self.worker._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=out.hidden_states, cache_loc=slots, positions=pos)
         torch.cuda.synchronize()
@@ -260,6 +266,29 @@ class Policy:
         return torch.minimum(front, k), q
 
 
+class PredraftPolicy:
+    """Only latest committed-token features, before any current draft forward."""
+    def __init__(self, directory, setting):
+        from scripts.train_predraft_soft_supervision import build_model
+        self.setting = setting
+        payload = torch.load(directory / setting['checkpoint'], map_location='cpu', weights_only=False)
+        if (payload['seed'] != setting['seed'] or payload['arm'] != setting['arm']
+                or payload['selected_update'] != setting['selected_update']):
+            raise ValueError('Checkpoint identity differs from frozen bundle')
+        self.model = build_model().cuda().eval()
+        self.model.load_state_dict(payload['model'])
+
+    def lengths(self, fused):
+        from scripts.train_predraft_soft_supervision import policy_scores
+        scores = policy_scores(self.model(fused), self.setting['arm'])
+        return frozen_lengths(scores, self.setting['threshold'])
+
+
+def predraft_fused(snapshot):
+    # Charge recomputing fc/norm and the FP16 cache quantization used in training.
+    return snapshot.draft.model.project_target_hidden(snapshot.raw_latest).half().float()
+
+
 def draft_forward(snapshot, timer, confidence=True, block_size=16):
     with timer.phase('draft_setup_and_metadata'):
         fb, _ = snapshot.fb(np.full(snapshot.n, block_size, dtype=np.int32), noise=True)
@@ -302,16 +331,24 @@ class Case:
         s, timer, case = self.s, Timer(timed), self.case
         torch.cuda.synchronize()
         begin = time.perf_counter()
-        draft_size = 8 if case == 'fixed8_redraft' else 16
-        stats, draft_top = draft_forward(s, timer, confidence=not case.startswith('fixed'), block_size=draft_size)
+        predraft = case.startswith('predraft_')
+        if predraft:
+            with timer.phase('predraft_fusion_and_predictor'):
+                k_gpu = self.policies[case].lengths(predraft_fused(s))
+            with timer.phase('predraft_lengths_device_to_host'):
+                front = k_gpu.cpu().numpy()
+        draft_size = fixed_width(case) if case.endswith('_redraft') else 16
+        stats, draft_top = draft_forward(s, timer, confidence=not (case.startswith('fixed') or predraft), block_size=draft_size)
         with timer.phase('stage0_probe_and_pack'):
             blocks = s.blocks
             if case.endswith('_redraft'):
                 blocks = blocks.clone()
                 blocks[:, 1:draft_size] = draft_top
             if case.startswith('fixed'):
-                front = np.full(s.n, 16 if case.startswith('fixed16') else 8, dtype=np.int32)
+                front = np.full(s.n, fixed_width(case), dtype=np.int32)
                 policy, k_gpu = None, cuda(front, torch.int32)
+            elif predraft:
+                policy = None
             else:
                 policy = self.policies['cascade' if case == 'cascade' else 'target_free']
                 k_gpu = policy.front(stats)
@@ -372,6 +409,8 @@ class Case:
             'mean_front': float(np.mean(front)), 'mean_end': float(np.mean(end)),
             'committed_tokens': int(committed.sum()), 'wall_ms': wall_ms, 'phases': phases,
             'row_layer_proxy': float(np.mean((6*np.asarray(front)+30*np.asarray(end))/36)) if case == 'cascade' else float(np.mean(end))}
+        if getattr(s, 'native_candidate_replay', False) and not case.endswith('_redraft') and self.last['draft_top1_changed_positions']:
+            raise AssertionError('Fresh B16 candidates changed within a frozen native replay snapshot')
         self.last_hidden, self.last_aux, self.last_fb = result[0], result[1], final_fb
         return self.last
 
@@ -421,8 +460,15 @@ def run(worker, config_path):
         torch.backends.cudnn.allow_tf32 = False
         rows = json.loads((output/'states.json').read_text())
         directory = Path(config['policies'])
-        policies = {'target_free': Policy(directory, 'candidate_confidence_seed913_r0.99'),
-                    'cascade': Policy(directory, 'target_candidate_confidence_seed913_r0.99')}
+        predraft_suite = config.get('suite') == 'predraft_verification_trim'
+        if predraft_suite:
+            from scripts.export_predraft_latency_bundle import verify
+            verify(directory)
+            bundle = json.loads((directory/'bundle.json').read_text())
+            policies = {name: PredraftPolicy(directory, setting) for name, setting in bundle['policies'].items()}
+        else:
+            policies = {'target_free': Policy(directory, 'candidate_confidence_seed913_r0.99'),
+                        'cascade': Policy(directory, 'target_candidate_confidence_seed913_r0.99')}
         runner = worker.target_worker.model_runner
         if list(runner.model.model.layers_to_capture) != [2, 10, 18, 26, 34]:
             raise ValueError('DFlash hidden-layer capture mapping differs')
@@ -434,21 +480,38 @@ def run(worker, config_path):
             for offset in range(0, len(rows), concurrency):
                 batch = rows[offset:offset+concurrency]
                 snapshot = Snapshot(worker, batch)
+                if predraft_suite:
+                    # Generate once using this engine and batch shape. All trim
+                    # cases subsequently pay a full draft and preserve these IDs.
+                    _, native_ids = draft_forward(snapshot, Timer(False), confidence=False)
+                    cached = snapshot.blocks[:, 1:].clone()
+                    snapshot.blocks[:, 1:] = native_ids
+                    snapshot.native_candidate_replay = True
+                    fused = predraft_fused(snapshot)
+                    cached_fused = cuda(np.load(directory/'cached_fused.npy', allow_pickle=False)[offset:offset+len(batch)]).float()
+                    native_audit = {'cached_vs_native_candidate_differences': int((native_ids != cached).sum()),
+                        'cached_vs_native_fused': difference(fused, cached_fused),
+                        'policies': {name: {'native_lengths': p.lengths(fused).tolist(),
+                                           'cached_lengths': p.lengths(cached_fused).tolist()} for name, p in policies.items()}}
+                    atomic_json(output/f'predraft_feature_audit_c{concurrency}_offset{offset}.json', native_audit)
                 for mode in config['modes']:
                     cases = {}
                     for name in config['cases']:
                         current = Case(snapshot, name, mode, policies)
                         audit = correctness(current)
+                        if predraft_suite and config['smoke'] and any(audit[k] for k in ('top1_differences', 'acceptance_differences', 'bonus_differences')):
+                            raise AssertionError('Small-C correctness smoke failed; full replay forbidden')
                         for _ in range(config['warmups']):
                             current.run(False)
                         cases[name] = (current, audit)
                         print(json.dumps({'stage': 'ready', 'C': concurrency, 'offset': offset,
                             'mode': mode, 'case': name, 'audit': audit, 'lengths': current.last['end']}), flush=True)
-                    unsplit, split = cases['target_free'][0], cases['target_free_split'][0]
-                    split_control = difference(split.last_hidden, unsplit.last_hidden)
-                    atomic_json(output/f'split_control_c{concurrency}_offset{offset}_{mode}.json', split_control)
-                    if not split_control['bitwise']:
-                        raise AssertionError('Matched no-prune split differs from unsplit in the same execution mode')
+                    if not predraft_suite:
+                        unsplit, split = cases['target_free'][0], cases['target_free_split'][0]
+                        split_control = difference(split.last_hidden, unsplit.last_hidden)
+                        atomic_json(output/f'split_control_c{concurrency}_offset{offset}_{mode}.json', split_control)
+                        if not split_control['bitwise']:
+                            raise AssertionError('Matched no-prune split differs from unsplit in the same execution mode')
                     observations = {name: [] for name in cases}
                     clean = {name: [] for name in cases}
                     rng = random.Random(929+concurrency+offset)
@@ -505,6 +568,8 @@ def run(worker, config_path):
             'peak_allocated_bytes': torch.cuda.max_memory_allocated(),
             'interpretation': 'Replay cycle timing, not serving throughput. Models, native layers/backend and graph mode matched within comparisons. Graphs are exact-shape segment captures, not SGLang scheduler bucket integration. Fresh same-engine labels; frozen thresholds not retuned to assessment.'})
         names = ['config.json', 'states.json', 'summary.json', 'partial.json']
+        if predraft_suite:
+            names += sorted(p.name for p in output.glob('predraft_feature_audit_*.json'))
         atomic_json(output/'COMPLETE.json', {'passed': True,
             'binding': {name: sha256(output/name) for name in names}})
         print('MIDVERIFY_LATENCY_COMPLETE', flush=True)
