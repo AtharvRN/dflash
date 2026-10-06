@@ -2,6 +2,19 @@
 from __future__ import annotations
 
 
+def resolve_concurrencies(values=None, *, smoke=False):
+    """Keep every concurrency on the complete, equally partitioned cohort."""
+    values = list(values) if values is not None else ([4] if smoke else [64, 128])
+    cohort_size = 4 if smoke else 128
+    if (not values or len(set(values)) != len(values) or
+            any(type(c) is not int or c <= 0 or c > cohort_size or cohort_size % c
+                for c in values)):
+        raise ValueError('Concurrencies must be unique positive divisors of the cohort size')
+    if smoke and values != [4]:
+        raise ValueError('Smoke concurrency must remain C4')
+    return values
+
+
 def frozen_lengths(scores, threshold):
     import torch
     if scores.ndim != 2 or scores.shape[1] != 15:

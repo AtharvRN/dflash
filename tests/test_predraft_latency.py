@@ -7,9 +7,40 @@ import pytest
 import torch
 
 from dflash.midverify import apply_setting
-from dflash.predraft_latency import fixed_width, frozen_lengths, same_model_identity
+from dflash.predraft_latency import fixed_width, frozen_lengths, resolve_concurrencies, same_model_identity
 from scripts.export_predraft_latency_bundle import select, verify
 from scripts.train_predraft_soft_supervision import build_model, policy_scores
+
+
+def test_concurrency_defaults_and_matched_low_concurrency_cohorts():
+    assert resolve_concurrencies() == [64, 128]
+    assert resolve_concurrencies(smoke=True) == [4]
+    assert resolve_concurrencies([8, 16, 32]) == [8, 16, 32]
+    assert resolve_concurrencies([4], smoke=True) == [4]
+
+
+@pytest.mark.parametrize('values', [[], [0], [-8], [3], [256], [8, 8], [True], [8.0]])
+def test_invalid_concurrencies(values):
+    with pytest.raises(ValueError):
+        resolve_concurrencies(values)
+
+
+def test_smoke_remains_c4():
+    with pytest.raises(ValueError, match='Smoke'):
+        resolve_concurrencies([2], smoke=True)
+
+
+def test_invalid_cli_concurrency_rejected_before_gpu_or_files(monkeypatch, tmp_path):
+    import sys
+    from scripts import gpu_runtime, run_midverify_latency
+    monkeypatch.setattr(sys, 'argv', ['replay', '--output', str(tmp_path/'out'),
+        '--predraft-bundle', str(tmp_path/'bundle'), '--use-container-gpu', '--concurrencies', '3'])
+    def unexpected(**kwargs):
+        pytest.fail('Invalid concurrency must fail before GPU access')
+    monkeypatch.setattr(gpu_runtime, 'configure_gpu_runtime', unexpected)
+    with pytest.raises(ValueError, match='Concurrencies'):
+        run_midverify_latency.main()
+    assert not (tmp_path/'out').exists()
 
 
 def test_exact_frozen_threshold_and_all_integer_lengths():

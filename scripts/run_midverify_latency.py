@@ -26,6 +26,8 @@ def main():
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--gpu', type=int, default=4)
     p.add_argument('--smoke', action='store_true')
+    p.add_argument('--concurrencies', type=int, nargs='+',
+                   help='Full-cohort batch sizes (unique divisors of 128); defaults to 64 128')
     p.add_argument('--max-seconds', type=int, default=1800)
     p.add_argument('--predraft-bundle', type=Path)
     p.add_argument('--use-visible-gpu', action='store_true')
@@ -35,6 +37,8 @@ def main():
     p.add_argument('--scratch-dir', type=Path)
     p.add_argument('--gpu-idle-wait-seconds', type=int, default=0)
     a = p.parse_args()
+    from dflash.predraft_latency import resolve_concurrencies
+    concurrencies = resolve_concurrencies(a.concurrencies, smoke=a.smoke)
     if a.output.exists() or not 60 <= a.max_seconds <= 3600:
         raise ValueError('Fresh output and bounded deadline required')
     root = a.data_root.resolve()
@@ -100,11 +104,11 @@ def main():
     config = {'gpu': gpu, 'image': IMAGE, 'models': models, 'cache': str(cache),
         'gpu_idle_wait_seconds': a.gpu_idle_wait_seconds,
         'policies': str(policies), 'output': str(a.output), 'smoke': a.smoke,
-        'concurrencies': [4] if a.smoke else [64, 128], 'seed': 913, 'target': .99,
+        'concurrencies': concurrencies, 'seed': 913, 'target': .99,
         'warmups': 2 if a.smoke else 3, 'repeats': 2 if a.smoke else 12,
         'modes': ['eager', 'graph'], 'max_seconds': a.max_seconds,
         'cases': ['fixed16', 'fixed16_redraft', 'fixed8_same_candidates', 'fixed8_redraft', 'target_free', 'target_free_split', 'cascade'],
-        'selection': 'First eligible state of each distinct assessment prompt, canonical order; same 128 states at both C; seed913 fixed in advance, not best-seed selection.',
+        'selection': 'First eligible state of each distinct assessment prompt, canonical order; same 128 states at every C; seed913 fixed in advance, not best-seed selection.',
         'scope': 'Same-state native SGLang layer/FlashInfer replay, eager or exact-shape manually captured target segments; eager drafter. Not scheduler/HTTP/closed-loop throughput. Saved B16 candidates unchanged except explicitly labeled fixed8_redraft/fixed16_redraft controls; fixed8_same_candidates is post-draft truncation only.',
         'limits': 'Fixed allocated prefix/suffix slots; reservation/free microcost reported separately. No prefill, request scheduling, graph bucket misses, allocator commit or future trajectory cost in replay cycle.',
         'commit': command(['git', 'rev-parse', 'HEAD'], cwd=repo).strip(),
