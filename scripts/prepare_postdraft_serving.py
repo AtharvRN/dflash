@@ -35,6 +35,18 @@ def extend(destination):
          '            help="Greedy post-draft consecutive logprob threshold; anchor always retained.",\n'
          '        )\n        parser.add_argument(\n'
          '            "--speculative-dflash-postdraft-alpha",')
+    edit("arg_groups/speculative_hook.py",
+         'def handle_speculative_decoding(server_args: "ServerArgs") -> None:\n',
+         'def handle_speculative_decoding(server_args: "ServerArgs") -> None:\n'
+         '    raw_threshold = server_args.speculative_dflash_postdraft_logprob_threshold\n'
+         '    if raw_threshold is not None:\n'
+         '        import math\n'
+         '        if not math.isfinite(raw_threshold) or raw_threshold > 0:\n'
+         '            raise ValueError("Raw post-draft logprob threshold must be finite and <= 0")\n'
+         '        if str(server_args.speculative_algorithm).upper() != "DFLASH" or not _is_spec_v2_enabled():\n'
+         '            raise ValueError("Raw post-draft trimming requires DFLASH spec-v2")\n'
+         '        if server_args.tp_size != 1 or server_args.attention_backend != "flashinfer":\n'
+         '            raise ValueError("Raw post-draft trimming requires TP1 / FlashInfer")\n')
     edit("speculative/dflash_worker_v2.py", '        self.postdraft_policy: Optional[DFlashPostdraftPolicy] = None',
          '        self.postdraft_policy: Optional[DFlashPostdraftPolicy] = None\n'
          '        raw_threshold = server_args.speculative_dflash_postdraft_logprob_threshold\n'

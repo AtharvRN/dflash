@@ -36,6 +36,21 @@ def summarize(root):
         if ("fixed16", c) in groups:
             metric["speedup_vs_fixed16"] = statistics.mean(tps) / statistics.mean(
                 r["throughput_tok_s"] for r in groups[("fixed16", c)])
+        fixed_controls = {method: statistics.mean(r["throughput_tok_s"] for r in runs)
+                          for (method, cc), runs in groups.items()
+                          if cc == c and method in ("fixed8", "fixed12", "fixed16")}
+        if fixed_controls:
+            best_fixed = max(fixed_controls, key=fixed_controls.get)
+            metric["best_measured_fixed_control"] = best_fixed
+            metric["speedup_vs_best_measured_fixed"] = statistics.mean(tps) / fixed_controls[best_fixed]
+        repeated = prompts.get((case, c, 1))
+        initial = prompts.get((case, c, 0))
+        if repeated is not None and initial is not None:
+            assert repeated.keys() == initial.keys()
+            metric["repeat_token_agreement"] = {
+                "exact_matches": sum(repeated[p].get("output_ids") == initial[p].get("output_ids")
+                                     for p in repeated if "output_ids" in repeated[p] and "output_ids" in initial[p]),
+                "requests": len(repeated)}
         comparisons = []
         for row in rows:
             actual = prompts[(case, c, row["repeat"])]

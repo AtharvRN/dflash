@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 import pytest
 import json
+from types import SimpleNamespace, MethodType
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -13,7 +14,7 @@ from prepare_postdraft_serving import prepare
 def test_extension_restores_and_parses(tmp_path):
     dst = tmp_path / "source"
     manifest = prepare(dst)
-    assert len(manifest["changes"]) == 5
+    assert len(manifest["changes"]) == 6
     for rel in manifest["changes"]:
         ast.parse((dst / "python/sglang/srt" / rel).read_text())
     with pytest.raises(ValueError):
@@ -52,3 +53,47 @@ def test_summary_counts_actual_completions_over_workload_wall_time(tmp_path):
     assert result["metrics"]["raw_c4"]["throughput_tok_s_mean"] == 20
     assert result["metrics"]["raw_c4"]["speedup_vs_fixed16"] == pytest.approx(4/3)
     assert not result["complete"]
+
+
+def test_logprob_reuse_does_not_change_draft_candidates(tmp_path):
+    torch = pytest.importorskip("torch")
+    dst = tmp_path / "source"
+    prepare(dst)
+    source = ast.parse((dst / "python/sglang/srt/speculative/dflash_worker.py").read_text())
+    cls = next(n for n in source.body if isinstance(n, ast.ClassDef) and n.name == "DFlashWorker")
+    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_greedy_sample_from_vocab_parallel_head")
+    namespace = {"torch": torch, "get_tp_group": lambda: SimpleNamespace(world_size=1)}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), "projection_test", "exec"), namespace)
+    worker = SimpleNamespace(_draft_greedy_local_cap=0, _draft_greedy_local_max_buf=None,
+                             _draft_greedy_local_arg_buf=None)
+    project = MethodType(namespace[method.name], worker)
+    torch.manual_seed(913)
+    hidden = torch.randn(31, 8)
+    head = SimpleNamespace(weight=torch.randn(23, 8), shard_indices=SimpleNamespace(
+        num_org_elements=23, num_org_elements_padded=23, num_added_elements=0,
+        org_vocab_start_index=0, added_vocab_start_index=23))
+    plain = project(hidden_states=hidden, lm_head=head)
+    raw_ids, raw_stats = project(hidden_states=hidden, lm_head=head, return_confidence="logprob_only")
+    full_ids, full_stats = project(hidden_states=hidden, lm_head=head, return_confidence=True)
+    assert torch.equal(plain, raw_ids) and torch.equal(plain, full_ids)
+    assert torch.equal(raw_stats[:,3], full_stats[:,3])
+    assert not raw_stats[:,:3].any()
+
+
+def test_unsupported_raw_policy_cannot_be_silently_ignored(tmp_path):
+    dst = tmp_path / "source"
+    prepare(dst)
+    source = ast.parse((dst / "python/sglang/srt/arg_groups/speculative_hook.py").read_text())
+    fn = next(n for n in source.body if isinstance(n, ast.FunctionDef) and n.name == "handle_speculative_decoding")
+    namespace = {"_is_spec_v2_enabled": lambda: True}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), "arg_guard_test", "exec"), namespace)
+    for overrides in [{"speculative_algorithm": None}, {"tp_size": 2},
+                      {"attention_backend": "triton"},
+                      {"speculative_dflash_postdraft_logprob_threshold": float("nan")}]:
+        fields = dict(speculative_algorithm="DFLASH", tp_size=1, attention_backend="flashinfer",
+                      speculative_dflash_postdraft_logprob_threshold=-.8)
+        with pytest.raises(ValueError):
+            namespace[fn.name](SimpleNamespace(**(fields | overrides)))
+    namespace["_is_spec_v2_enabled"] = lambda: False
+    with pytest.raises(ValueError, match="spec-v2"):
+        namespace[fn.name](SimpleNamespace(**fields))
