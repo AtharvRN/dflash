@@ -1,0 +1,68 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dflash-a100-gpu-test
+  namespace: wenglab-interpretable-ai
+  labels:
+    job-name: dflash-benchmark
+    experiment: predraft-latency-20261005
+spec:
+  restartPolicy: Never
+  activeDeadlineSeconds: 21600
+  terminationGracePeriodSeconds: 45
+  containers:
+    - name: main
+      image: slimerl/slime@sha256:a7317182c71d35712ee4edc86a5d1c313dc969efdf0026d339673299c186ea75
+      command: ["/bin/bash", "-lc"]
+      args:
+        - |
+          set -euo pipefail
+          export PYTHONPATH= PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
+          task_log="/workspace/dflashv2_data/runs/predraft_latency_20261005/nrp_${DFLASH_POD_UID}_bootstrap"
+          mkdir -p "$task_log"
+          exec > >(tee "$task_log/bootstrap.log") 2>&1
+          trap 'task_exit=$?; printf "exit_code=%s\n" "$task_exit" > "$task_log/exit.txt"; echo "Pipeline exited: $task_exit; pod retained for inspection until deadline"; sleep infinity & wait' EXIT
+          date -u +%FT%TZ
+          timeout 300 git clone --depth 1 --branch codex/block-headroom-20260926 https://github.com/AtharvRN/dflash.git /tmp/predraft-latency-code
+          cd /tmp/predraft-latency-code
+          timeout 300 git fetch --depth 1 origin "$DFLASH_CODE_COMMIT"
+          git checkout --detach "$DFLASH_CODE_COMMIT"
+          export DFLASH_RUN_ROOT="/workspace/dflashv2_data/runs/predraft_latency_20261005/nrp_${DFLASH_POD_UID}"
+          timeout --signal=TERM --kill-after=45s 10800 bash scripts/run_predraft_latency_nrp.sh
+      env:
+        - name: HF_HOME
+          value: /workspace/.cache/huggingface
+        - name: DFLASH_POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: PYTHONPATH
+          value: ""
+        - name: DFLASH_CODE_COMMIT
+          value: 7560ea1de0ad397107a8e4dde530efe053c83001
+        - name: DFLASH_IMAGE_DIGEST
+          value: slimerl/slime@sha256:a7317182c71d35712ee4edc86a5d1c313dc969efdf0026d339673299c186ea75
+      resources:
+        requests:
+          cpu: "8"
+          memory: 32Gi
+          ephemeral-storage: 40Gi
+          nvidia.com/a100: "1"
+        limits:
+          cpu: "8"
+          memory: 32Gi
+          ephemeral-storage: 100Gi
+          nvidia.com/a100: "1"
+      volumeMounts:
+        - name: data
+          mountPath: /workspace
+        - name: shm
+          mountPath: /dev/shm
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: atharv-rwx-storage-1ti
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 8Gi
