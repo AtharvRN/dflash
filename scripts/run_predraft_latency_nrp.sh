@@ -31,5 +31,5 @@ trap 'kill "$telemetry_pid" 2>/dev/null || true' EXIT
   --output "$DFLASH_RUN_ROOT/smoke" --scratch-dir "$task_scratch/smoke" --smoke --max-seconds 1800
 "$task_python" scripts/run_midverify_latency.py --use-container-gpu --data-root /workspace/dflashv2_data \
   --models-config configs/rejected_trace_nrp_models.json --predraft-bundle "$task_bundle" \
-  --output "$DFLASH_RUN_ROOT/full" --scratch-dir "$task_scratch/full" --max-seconds 3600
+  --output "$DFLASH_RUN_ROOT/full" --scratch-dir "$task_scratch/full" --max-seconds 3600 --gpu-idle-wait-seconds 30
 "$task_python" scripts/summarize_predraft_latency.py --run "$DFLASH_RUN_ROOT/full"

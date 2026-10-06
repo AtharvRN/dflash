@@ -13,7 +13,27 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import time
 import xml.etree.ElementTree as ET
+
+
+class GPUOccupiedError(RuntimeError):
+    """Valid allocation, but its sampled occupancy exceeds the launch guard."""
+
+
+def wait_gpu_runtime(*, wait_seconds=30, poll_seconds=2, **kwargs):
+    """Bounded settling wait; never relax thresholds or retry invalid allocation."""
+    if not 0 <= wait_seconds <= 60 or not 0 < poll_seconds <= 5:
+        raise ValueError('Invalid bounded GPU settling interval')
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        try:
+            return configure_gpu_runtime(**kwargs)
+        except GPUOccupiedError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(poll_seconds, remaining))
 
 
 def slurm_gpu_uuid(device_minor):
@@ -136,7 +156,7 @@ def configure_gpu_runtime(gpu=None, use_visible_gpu=False, *, use_container_gpu=
         if nvml_index < 0 or used < 0 or not 0 <= utilization <= 100:
             raise RuntimeError("Invalid GPU occupancy from nvidia-smi; refusing to load models")
         if used > max_memory_mib or (max_utilization is not None and utilization > max_utilization):
-            raise RuntimeError(f"GPU {query_id} is occupied ({used} MiB, {utilization}%); no models loaded")
+            raise GPUOccupiedError(f"GPU {query_id} is occupied ({used} MiB, {utilization}%); no models loaded")
         provenance["occupancy_before_load"] = {"memory_mib": used, "utilization_percent": utilization}
         provenance["nvidia_smi_query_id"] = query_id
         provenance["nvidia_smi_index"] = nvml_index

@@ -33,6 +33,7 @@ def main():
     p.add_argument('--data-root', type=Path, default=ROOT)
     p.add_argument('--models-config', type=Path)
     p.add_argument('--scratch-dir', type=Path)
+    p.add_argument('--gpu-idle-wait-seconds', type=int, default=0)
     a = p.parse_args()
     if a.output.exists() or not 60 <= a.max_seconds <= 3600:
         raise ValueError('Fresh output and bounded deadline required')
@@ -46,8 +47,9 @@ def main():
     if os.environ.get('SLURM_JOB_ID') and not a.use_visible_gpu:
         raise ValueError('Do not override Slurm GPU allocation')
     if a.use_visible_gpu or a.use_container_gpu:
-        from scripts.gpu_runtime import configure_gpu_runtime
-        provenance = configure_gpu_runtime(use_visible_gpu=a.use_visible_gpu, use_container_gpu=a.use_container_gpu, require_gpu=True)
+        from scripts.gpu_runtime import wait_gpu_runtime
+        provenance = wait_gpu_runtime(wait_seconds=a.gpu_idle_wait_seconds,
+            use_visible_gpu=a.use_visible_gpu, use_container_gpu=a.use_container_gpu, require_gpu=True)
         a.gpu = provenance['nvidia_smi_index']
         gpu = {'uuid': provenance['nvidia_smi_query_id'], 'allocation': provenance}
     else:
@@ -96,6 +98,7 @@ def main():
     restore(repo / 'vendor/sglang_ragged_20260723', scratch / 'source')
     atomic_json(a.output / 'states.json', rows)
     config = {'gpu': gpu, 'image': IMAGE, 'models': models, 'cache': str(cache),
+        'gpu_idle_wait_seconds': a.gpu_idle_wait_seconds,
         'policies': str(policies), 'output': str(a.output), 'smoke': a.smoke,
         'concurrencies': [4] if a.smoke else [64, 128], 'seed': 913, 'target': .99,
         'warmups': 2 if a.smoke else 3, 'repeats': 2 if a.smoke else 12,

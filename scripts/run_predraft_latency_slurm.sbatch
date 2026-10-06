@@ -48,5 +48,5 @@ run_child "$task_python" scripts/run_midverify_latency.py --use-visible-gpu \
   --predraft-bundle "${task_root}/bundle" --output "${task_output}/smoke" --smoke --max-seconds 900
 # Launcher's success requires COMPLETE; numerical smoke gates must also pass.
 run_child "$task_python" scripts/run_midverify_latency.py --use-visible-gpu \
-  --predraft-bundle "${task_root}/bundle" --output "${task_output}/full" --max-seconds 2400
+  --predraft-bundle "${task_root}/bundle" --output "${task_output}/full" --max-seconds 2400 --gpu-idle-wait-seconds 30
 run_child "$task_python" scripts/summarize_predraft_latency.py --run "${task_output}/full"
