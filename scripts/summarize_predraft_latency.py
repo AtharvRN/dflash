@@ -38,6 +38,11 @@ def summarize(source):
         value['best_measured_fixed_case'] = min(('fixed16', 'fixed8_redraft', 'fixed12_redraft'),
                                                key=lambda ref: totals[prefix+ref]['ms_per_committed_token'])
         value['speed_ratio_vs_best_measured_fixed'] = value['speed_ratio_vs_'+value['best_measured_fixed_case']]
+        current_cells = [r for r in cells if r['C']==c and r['mode']==mode and r['case']==case]
+        value['prefix_invariance_vs_b16'] = {
+            field: sum(r['audit'].get('same_candidates_vs_b16', {}).get(field, 0) for r in current_cells)
+            for field in ('kept_top1_differences', 'acceptance_differences', 'bonus_differences')
+        } if not case.endswith('_redraft') else None
         if not case.startswith('predraft_'):
             continue
         select = lambda name: sorted((r for r in cells if r['C']==c and r['mode']==mode and r['case']==name), key=lambda r:r['offset'])

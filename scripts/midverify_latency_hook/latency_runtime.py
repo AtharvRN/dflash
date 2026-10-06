@@ -528,6 +528,19 @@ def run(worker, config_path):
                     base_sum = sum(base['accepted'])
                     for name, (current, audit) in cases.items():
                         obs = observations[name]
+                        if predraft_suite and not name.endswith('_redraft'):
+                            # Prefix invariance against FULL verification, not
+                            # merely against another forward at the same width.
+                            end = np.asarray(obs[0]['end'])
+                            expected_a = np.minimum(np.asarray(base['accepted']), end-1)
+                            expected_bonus = np.asarray(base['top1'])[np.arange(len(batch)), expected_a]
+                            prefix_mask = np.arange(16)[None] < end[:, None]
+                            audit['same_candidates_vs_b16'] = {
+                                'kept_top1_differences': int(((np.asarray(obs[0]['top1']) != np.asarray(base['top1'])) & prefix_mask).sum()),
+                                'acceptance_differences': int((np.asarray(obs[0]['accepted']) != expected_a).sum()),
+                                'bonus_differences': int((np.asarray(obs[0]['bonus']) != expected_bonus).sum())}
+                            if config['smoke'] and any(audit['same_candidates_vs_b16'].values()):
+                                raise AssertionError('Small-C prefix invariance against full B16 failed')
                         # Repeated snapshots must not silently change policy decisions.
                         if any(r['end'] != obs[0]['end'] or r['accepted'] != obs[0]['accepted'] for r in obs):
                             raise AssertionError('Nondeterministic decisions across replay repeats')
