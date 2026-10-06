@@ -51,7 +51,9 @@ def workload(args, model):
         if len(messages) != 2 or [m["role"] for m in messages] != ["user", "assistant"]:
             raise ValueError("Unexpected original conversation schema")
         tokens = tokenizer.apply_chat_template(messages[:1], tokenize=True,
-                    add_generation_prompt=True, enable_thinking=False)
+                    add_generation_prompt=True, enable_thinking=False, return_dict=False)
+        if not isinstance(tokens, list) or not all(isinstance(t, int) for t in tokens):
+            raise TypeError("Expected unbatched token IDs from chat template")
         if not 1 <= len(tokens) <= 2048:
             continue
         content_key = tuple(tokens)
