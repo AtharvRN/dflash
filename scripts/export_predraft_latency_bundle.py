@@ -46,10 +46,28 @@ def select(rows, eligible, count=128):
     raise ValueError("Insufficient distinct eligible assessment prompts")
 
 
+def select_all_assessment(rows, eligible):
+    """Retain every eligible cycle, including later cycles and repeated prompts."""
+    selected, seen = [], set()
+    for row, valid in zip(rows, eligible, strict=True):
+        if row['group'] != 'assessment' or not valid:
+            continue
+        key = (str(row['prompt_id']), row['cycle'])
+        if key in seen:
+            raise ValueError('Duplicate assessment cycle')
+        seen.add(key)
+        # Reuse the exact prefix/anchor integrity checks, not its sampling rule.
+        selected.extend(select([row], [True], count=1))
+    if not selected or len(selected) > 4096:
+        raise ValueError('Full-cycle replay requires 1..4096 eligible assessment states')
+    return selected
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     for name in ("cache", "training", "output"):
         p.add_argument("--" + name, type=Path, required=True)
+    p.add_argument('--all-assessment', action='store_true')
     args = p.parse_args()
     if args.output.exists():
         raise ValueError("Fresh export destination required")
@@ -58,7 +76,8 @@ def main():
     collection, rows, arrays = load_cache(args.cache, view="predraft")
     if collection["smoke"]:
         raise ValueError("Require full pilot, not smoke data")
-    selected = select(rows, arrays["eligible"])
+    selected = (select_all_assessment(rows, arrays['eligible']) if args.all_assessment
+                else select(rows, arrays["eligible"]))
     indices = [r["row"] for r in selected]
     lookup = {r["row"]: r for r in selected}
     # Fresh same-forward candidates belong with this cache's fused features and
@@ -87,7 +106,9 @@ def main():
     atomic_json(args.output / "bundle.json", {
         "schema": "predraft_latency_bundle_v1", "policies": policies,
         "models": collection["models"], "rows": len(selected),
-        "selection": "First eligible cycle per distinct assessment prompt in canonical order; first 128 prompts; no acceptance-based selection",
+        "cohort_mode": "all_assessment_cycles" if args.all_assessment else "first_128_prompts",
+        "selection": ("All eligible assessment cycles in canonical order; no additional sampling or acceptance filtering"
+                      if args.all_assessment else "First eligible cycle per distinct assessment prompt in canonical order; first 128 prompts; no acceptance-based selection"),
         "source_cache": str(args.cache), "source_training": str(args.training),
         "source_cache_complete_sha256": sha256(args.cache / "COMPLETE.json"),
         "source_training_complete_sha256": sha256(args.training / "COMPLETE.json"),

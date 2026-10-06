@@ -14,6 +14,20 @@ from scripts.collect_policy_granularity import atomic_json
 from scripts.summarize_midverify_latency import aggregate
 
 
+def retention_intervals(a, b, base, prompt_ids, rng, draws=2000):
+    """Cluster by prompt, including when a prompt contributes multiple cycles."""
+    _, inverse = np.unique(np.asarray(prompt_ids).astype(str), return_inverse=True)
+    totals = np.column_stack([np.bincount(inverse, weights=v) for v in (a, b, base)])
+    samples = totals[rng.integers(len(totals), size=(draws, len(totals)))].sum(1)
+    valid = samples[:, 2] > 0
+    if not valid.any():
+        raise ValueError('Empty bootstrap acceptance denominator')
+    s = samples[valid]
+    return {'prompt_bootstrap_retention_ci95': np.quantile(s[:,0]/s[:,2], [.025,.975]).tolist(),
+            'prompt_bootstrap_retention_delta_vs_hard_ci95': np.quantile((s[:,0]-s[:,1])/s[:,2], [.025,.975]).tolist(),
+            'bootstrap_prompts': len(totals), 'bootstrap_valid_draws': int(valid.sum())}
+
+
 def summarize(source):
     if source['config'].get('suite') != 'predraft_verification_trim':
         raise ValueError('Wrong experiment suite')
@@ -48,7 +62,7 @@ def summarize(source):
         select = lambda name: sorted((r for r in cells if r['C']==c and r['mode']==mode and r['case']==name), key=lambda r:r['offset'])
         policy, control, base = select(case), select('predraft_hard'), select('fixed16')
         a, b, a16 = [np.array([x for r in rows for x in r['observations'][0]['accepted']]) for rows in (policy, control, base)]
-        idx = rng.integers(len(a), size=(2000, len(a)))
+        prompt_ids = [p for r in policy for p in r['prompt_ids']]
         ci = lambda x: np.quantile(x, [.025, .975]).tolist()
         # Timing-only uncertainty conditional on these exact snapshots and their
         # observed committed counts. It excludes workload/fit/calibration uncertainty.
@@ -59,10 +73,9 @@ def summarize(source):
                 summed += samples[rng.integers(len(samples), size=(2000, len(samples)))].mean(1)
             return summed / sum(r['observations'][0]['committed_tokens'] for r in rows)
         intervals[key] = {
-            'prompt_bootstrap_retention_ci95': ci(a[idx].sum(1)/a16[idx].sum(1)),
-            'prompt_bootstrap_retention_delta_vs_hard_ci95': ci((a-b)[idx].sum(1)/a16[idx].sum(1)),
+            **retention_intervals(a, b, a16, prompt_ids, rng),
             'conditional_timing_speed_vs_b16_ci95': ci(timing_samples(base)/timing_samples(policy)),
-            'scope': '128 distinct prompt snapshots; retention resamples prompts. Speed CI resamples timing repeats only, conditional on this cohort; not training/threshold/workload uncertainty.'}
+            'scope': 'Retention resamples whole prompts with all their cycles. Speed CI resamples timing repeats only, conditional on this cohort; not training/threshold/workload uncertainty.'}
     return {'metrics': totals, 'uncertainty': intervals,
             'limitations': ['Native replay, not HTTP or closed-loop serving throughput',
                 'All candidate-preserving policies pay full B16 drafting; only verification is shortened',

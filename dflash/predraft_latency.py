@@ -3,7 +3,7 @@ from __future__ import annotations
 
 
 def resolve_concurrencies(values=None, *, smoke=False):
-    """Keep every concurrency on the complete, equally partitioned cohort."""
+    """Supported batch sizes; a full-cycle cohort may have one smaller tail batch."""
     values = list(values) if values is not None else ([4] if smoke else [64, 128])
     cohort_size = 4 if smoke else 128
     if (not values or len(set(values)) != len(values) or
@@ -13,6 +13,18 @@ def resolve_concurrencies(values=None, *, smoke=False):
     if smoke and values != [4]:
         raise ValueError('Smoke concurrency must remain C4')
     return values
+
+
+def validate_replay_cohort(rows, metadata):
+    if metadata.get('cohort_mode') == 'all_assessment_cycles':
+        if len(rows) != metadata['rows'] or not 4 <= len(rows) <= 4096:
+            raise ValueError('Full assessment cohort count mismatch')
+    elif len(rows) != 128:
+        raise ValueError('Frozen legacy cohort must contain 128 assessment states')
+    if any(r['group'] != 'assessment' for r in rows):
+        raise ValueError('Replay must not contain training/calibration states')
+    if len({(str(r['prompt_id']), r['cycle']) for r in rows}) != len(rows):
+        raise ValueError('Duplicate replay cycle')
 
 
 def frozen_lengths(scores, threshold):

@@ -240,6 +240,15 @@ class Segment:
             self.result = target_range(self.runner, self.fb, self.begin, self.end, self.state)
         return self.result
 
+    def close(self):
+        # Snapshot-specific graph wrappers must not accumulate across hundreds
+        # of full-cohort batches. Every replay is synchronized before cleanup.
+        if self.graph is not None:
+            self.graph = None
+            backend = self.runner.attn_backend
+            key = backend._prefill_cuda_graph_metadata_key(self.fb.batch_size, self.fb.spec_info)
+            backend.prefill_cuda_graph_metadata.pop(key)
+
 
 class Policy:
     def __init__(self, directory, name):
@@ -331,6 +340,10 @@ class Case:
         self.segments, self.preparing = [], True
         self.run(False)
         self.preparing = False
+
+    def close(self):
+        for segment in self.segments:
+            segment.close()
 
     def segment(self, index, fb, begin, end, timer, state=None):
         if self.preparing:
@@ -580,6 +593,8 @@ def run(worker, config_path):
                             'wall_ms_per_committed_token': np.mean([r['wall_ms']/r['committed_tokens'] for r in obs])}
                         results.append(values)
                     atomic_json(output/'partial.json', results)
+                    for current, _ in cases.values():
+                        current.close()
                     del current, cases, observations
                     gc.collect()
                     torch.cuda.empty_cache()
@@ -588,7 +603,7 @@ def run(worker, config_path):
                 for _ in range(20):
                     torch.cuda.synchronize()
                     begin = time.perf_counter()
-                    slots = snapshot.alloc.alloc(concurrency*16)
+                    slots = snapshot.alloc.alloc(len(batch)*16)
                     if slots is None:
                         raise RuntimeError('Allocation microcheck failed')
                     snapshot.alloc.free(slots)

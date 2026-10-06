@@ -75,8 +75,8 @@ def main():
             raise ValueError('Wrong bundle schema')
         source = cache/'states.json'
         rows = json.loads(source.read_text())
-        if len(rows) != 128:
-            raise ValueError('Frozen cohort must contain 128 assessment states')
+        from dflash.predraft_latency import validate_replay_cohort
+        validate_replay_cohort(rows, collection)
         rows = rows[:4] if a.smoke else rows
     else:
         cache = ROOT / 'runs/midverify_scaling_10k_20260929/cache_nonterminal'
@@ -103,6 +103,8 @@ def main():
     atomic_json(a.output / 'states.json', rows)
     config = {'gpu': gpu, 'image': IMAGE, 'models': models, 'cache': str(cache),
         'gpu_idle_wait_seconds': a.gpu_idle_wait_seconds,
+        'cohort_rows': len(rows),
+        'tail_batch_sizes': {str(c): len(rows) % c for c in concurrencies},
         'policies': str(policies), 'output': str(a.output), 'smoke': a.smoke,
         'concurrencies': concurrencies, 'seed': 913, 'target': .99,
         'warmups': 2 if a.smoke else 3, 'repeats': 2 if a.smoke else 12,
