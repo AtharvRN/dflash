@@ -15,6 +15,9 @@ def summarize(root):
         assert len(results) == row["requests"]
         assert len({r["prompt_id"] for r in results}) == len(results)
         tokens = sum(r["response"]["meta_info"]["completion_tokens"] for r in results)
+        for r in results:
+            if "output_ids" in r["response"]:
+                assert len(r["response"]["output_ids"]) == r["response"]["meta_info"]["completion_tokens"]
         assert tokens == row["output_tokens"]
         assert abs(tokens/row["wall_time_s"] - row["throughput_tok_s"]) < 1e-8
         workloads.add(row["workload_sha256"])
@@ -43,8 +46,10 @@ def summarize(root):
                 assert actual.keys() == ref.keys()
                 comparisons.append({"reference": reference, "repeat": row["repeat"],
                     "exact_text_matches": sum(actual[p].get("text") == ref[p].get("text") for p in actual),
+                    "exact_token_matches": sum(actual[p].get("output_ids") == ref[p].get("output_ids")
+                                               for p in actual if "output_ids" in actual[p] and "output_ids" in ref[p]),
                     "requests": len(actual),
-                    "note": "String equality, not token-level or task-accuracy proof; shapes/batching can change BF16 argmax."})
+                    "note": "Output agreement is not task-accuracy evaluation; shapes/batching can change BF16 argmax."})
         metric["output_agreement"] = comparisons
         metrics[f"{case}_c{c}"] = metric
     return {"measurement": "Actual HTTP output tokens / full workload elapsed wall time, including prefill and all successive cycles",

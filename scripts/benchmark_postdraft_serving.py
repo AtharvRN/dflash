@@ -86,13 +86,15 @@ def request_one(base, row, max_tokens):
 
 
 def run_requests(base, rows, concurrency, max_tokens):
+    started_unix = time.time()
     started = time.perf_counter()
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         results = list(pool.map(lambda row: request_one(base, row, max_tokens), rows))
     elapsed = time.perf_counter() - started
     tokens = sum(r["response"]["meta_info"]["completion_tokens"] for r in results)
     times = sorted(r["latency_s"] for r in results)
-    return {"wall_time_s": elapsed, "output_tokens": tokens, "throughput_tok_s": tokens / elapsed,
+    return {"started_unix_s": started_unix, "finished_unix_s": time.time(),
+            "wall_time_s": elapsed, "output_tokens": tokens, "throughput_tok_s": tokens / elapsed,
             "requests": len(results), "concurrency": concurrency, "max_new_tokens": max_tokens,
             "request_latency_mean_s": statistics.mean(times), "request_latency_p95_s": times[int(.95*(len(times)-1))],
             "results": results}
@@ -123,7 +125,7 @@ def main():
     save(args.output / "config.json", {"args": vars(args) | {k: str(v) for k,v in vars(args).items() if isinstance(v, Path)},
          "models": models, "extension": extension, "workload_sha256": sha(args.output / "workload.json"),
          "git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
-         "scope": "Actual HTTP serving: prompt prefill + all autoregressive speculative cycles + scheduler + allocator + tokenization/detokenization + client wall time. Input tokenization performed before timer. Greedy, natural EOS, no cache reuse, max512 unless overridden. Not decode-only throughput.",
+         "scope": "Actual HTTP serving: prompt prefill + all autoregressive speculative cycles + scheduler + allocator + detokenization + client wall time. Input tokenization performed before timer. Greedy, natural EOS, no cache reuse, max512 unless overridden. Not decode-only throughput.",
          "gpu": subprocess.check_output(["nvidia-smi", "--query-gpu=name,uuid,memory.total", "--format=csv"], text=True),
          "environment": subprocess.check_output([sys.executable, "-m", "pip", "freeze"], text=True).splitlines()})
     runtime = args.scratch / "cache"
