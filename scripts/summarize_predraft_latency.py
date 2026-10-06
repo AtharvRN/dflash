@@ -43,7 +43,7 @@ def summarize(source):
             field: sum(r['audit'].get('same_candidates_vs_b16', {}).get(field, 0) for r in current_cells)
             for field in ('kept_top1_differences', 'acceptance_differences', 'bonus_differences')
         } if not case.endswith('_redraft') else None
-        if not case.startswith('predraft_'):
+        if not (case.startswith('predraft_') or case == 'raw_confidence'):
             continue
         select = lambda name: sorted((r for r in cells if r['C']==c and r['mode']==mode and r['case']==name), key=lambda r:r['offset'])
         policy, control, base = select(case), select('predraft_hard'), select('fixed16')

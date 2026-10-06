@@ -284,6 +284,17 @@ class PredraftPolicy:
         return frozen_lengths(scores, self.setting['threshold'])
 
 
+class RawConfidencePolicy:
+    def __init__(self, setting):
+        if setting['kind'] != 'candidate_logprob_threshold':
+            raise ValueError('Unknown confidence rule')
+        self.setting = setting
+
+    def lengths(self, candidate_logprobs):
+        # No survival multiplication: stop at the first low-confidence token.
+        return frozen_lengths(candidate_logprobs, self.setting['threshold'])
+
+
 def predraft_fused(snapshot):
     # Charge recomputing fc/norm and the FP16 cache quantization used in training.
     return snapshot.draft.model.project_target_hidden(snapshot.raw_latest).half().float()
@@ -304,9 +315,13 @@ def draft_forward(snapshot, timer, confidence=True, block_size=16):
         stats = None
         if confidence:
             logprob = logits.log_softmax(-1)
-            chosen = logits.gather(1, snapshot.blocks[:, 1:].reshape(-1, 1)).squeeze(1)
-            stats = torch.stack([logprob.gather(1, snapshot.blocks[:, 1:].reshape(-1, 1)).squeeze(1),
-                -(logprob.exp()*logprob).sum(-1), chosen-logits.amax(-1)], -1).reshape(snapshot.n, 15, 3)
+            candidate_logprob = logprob.gather(1, snapshot.blocks[:, 1:].reshape(-1, 1)).squeeze(1)
+            if confidence == 'logprob_only':
+                stats = candidate_logprob.reshape(snapshot.n, 15)
+            else:
+                chosen = logits.gather(1, snapshot.blocks[:, 1:].reshape(-1, 1)).squeeze(1)
+                stats = torch.stack([candidate_logprob,
+                    -(logprob.exp()*logprob).sum(-1), chosen-logits.amax(-1)], -1).reshape(snapshot.n, 15, 3)
     return stats, predictions
 
 
@@ -338,7 +353,8 @@ class Case:
             with timer.phase('predraft_lengths_device_to_host'):
                 front = k_gpu.cpu().numpy()
         draft_size = fixed_width(case) if case.endswith('_redraft') else 16
-        stats, draft_top = draft_forward(s, timer, confidence=not (case.startswith('fixed') or predraft), block_size=draft_size)
+        confidence = 'logprob_only' if case == 'raw_confidence' else not (case.startswith('fixed') or predraft)
+        stats, draft_top = draft_forward(s, timer, confidence=confidence, block_size=draft_size)
         with timer.phase('stage0_probe_and_pack'):
             blocks = s.blocks
             if case.endswith('_redraft'):
@@ -349,6 +365,10 @@ class Case:
                 policy, k_gpu = None, cuda(front, torch.int32)
             elif predraft:
                 policy = None
+            elif case == 'raw_confidence':
+                policy = None
+                k_gpu = self.policies[case].lengths(stats)
+                front = k_gpu.cpu().numpy()
             else:
                 policy = self.policies['cascade' if case == 'cascade' else 'target_free']
                 k_gpu = policy.front(stats)
@@ -465,7 +485,9 @@ def run(worker, config_path):
             from scripts.export_predraft_latency_bundle import verify
             verify(directory)
             bundle = json.loads((directory/'bundle.json').read_text())
-            policies = {name: PredraftPolicy(directory, setting) for name, setting in bundle['policies'].items()}
+            policies = {name: (RawConfidencePolicy(setting) if name == 'raw_confidence'
+                              else PredraftPolicy(directory, setting))
+                        for name, setting in bundle['policies'].items()}
         else:
             policies = {'target_free': Policy(directory, 'candidate_confidence_seed913_r0.99'),
                         'cascade': Policy(directory, 'target_candidate_confidence_seed913_r0.99')}
@@ -492,7 +514,8 @@ def run(worker, config_path):
                     native_audit = {'cached_vs_native_candidate_differences': int((native_ids != cached).sum()),
                         'cached_vs_native_fused': difference(fused, cached_fused),
                         'policies': {name: {'native_lengths': p.lengths(fused).tolist(),
-                                           'cached_lengths': p.lengths(cached_fused).tolist()} for name, p in policies.items()}}
+                                           'cached_lengths': p.lengths(cached_fused).tolist()}
+                                     for name, p in policies.items() if name.startswith('predraft_')}}
                     atomic_json(output/f'predraft_feature_audit_c{concurrency}_offset{offset}.json', native_audit)
                 for mode in config['modes']:
                     cases = {}

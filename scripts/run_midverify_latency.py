@@ -71,7 +71,7 @@ def main():
             raise ValueError('Bundle must be under the read-only mounted data root')
         verify(cache)
         collection = json.loads((cache/'bundle.json').read_text())
-        if collection['schema'] != 'predraft_latency_bundle_v1':
+        if collection['schema'] not in ('predraft_latency_bundle_v1', 'predraft_confidence_replay_bundle_v1'):
             raise ValueError('Wrong bundle schema')
         source = cache/'states.json'
         rows = json.loads(source.read_text())
@@ -120,6 +120,13 @@ def main():
             selection=collection['selection'],
             scope='Same-state native SGLang replay with full B16 drafting for all candidate-preserving cases. Fresh native B16 generated once per snapshot and preserved across trim policies. Fixed8/12_redraft are separately labeled actual shorter-draft controls. Eager drafter, exact-shape target graph; not serving throughput.',
             frozen_policies=collection['policies'])
+        if collection['schema'] == 'predraft_confidence_replay_bundle_v1':
+            raw = collection['policies'].get('raw_confidence', {})
+            if raw.get('kind') != 'candidate_logprob_threshold':
+                raise ValueError('Missing frozen raw-confidence control')
+            config['cases'].append('raw_confidence')
+            config['target'] = collection['calibration_target']
+            config['comparison_scope'] = collection['comparison_scope']
     if a.use_container_gpu:
         config.update(image=os.environ.get('DFLASH_IMAGE_DIGEST', 'not_recorded'),
                       execution='Kubernetes direct process, not workstation Docker image',

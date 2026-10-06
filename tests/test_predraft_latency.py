@@ -109,7 +109,7 @@ def test_predraft_computation_precedes_current_draft_and_no_confidence():
     source = (Path(__file__).resolve().parents[1]/'scripts/midverify_latency_hook/latency_runtime.py').read_text()
     body = source.split('    def run(self, timed=True):',1)[1].split('\ndef correctness',1)[0]
     assert body.index('self.policies[case].lengths(predraft_fused(s))') < body.index('draft_forward(s, timer')
-    assert "confidence=not (case.startswith('fixed') or predraft)" in body
+    assert "confidence = 'logprob_only' if case == 'raw_confidence' else not (case.startswith('fixed') or predraft)" in body
     assert 'max_seconds' in (Path(__file__).resolve().parents[1]/'scripts/run_midverify_latency.py').read_text()
 
 
