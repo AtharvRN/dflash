@@ -38,7 +38,11 @@ def main():
     p.add_argument('--gpu-idle-wait-seconds', type=int, default=0)
     p.add_argument('--diagnostic-offset', type=int,
                    help='Single original-cohort batch; detailed correctness evidence, not a performance result')
+    p.add_argument('--modes', nargs='+', choices=('eager', 'graph'), default=['eager','graph'])
+    p.add_argument('--correctness-reference', choices=('cross-mode','same-mode'), default='cross-mode')
     a = p.parse_args()
+    if len(set(a.modes)) != len(a.modes):
+        raise ValueError('Duplicate execution mode')
     from dflash.predraft_latency import resolve_concurrencies
     concurrencies = resolve_concurrencies(a.concurrencies, smoke=a.smoke)
     if a.diagnostic_offset is not None and (a.smoke or not a.predraft_bundle or len(concurrencies) != 1):
@@ -75,7 +79,7 @@ def main():
             raise ValueError('Bundle must be under the read-only mounted data root')
         verify(cache)
         collection = json.loads((cache/'bundle.json').read_text())
-        if collection['schema'] not in ('predraft_latency_bundle_v1', 'predraft_confidence_replay_bundle_v1'):
+        if collection['schema'] not in ('predraft_latency_bundle_v1', 'predraft_confidence_replay_bundle_v1', 'postdraft_latency_bundle_v1'):
             raise ValueError('Wrong bundle schema')
         source = cache/'states.json'
         rows = json.loads(source.read_text())
@@ -116,7 +120,7 @@ def main():
         'policies': str(policies), 'output': str(a.output), 'smoke': a.smoke,
         'concurrencies': concurrencies, 'seed': 913, 'target': .99,
         'warmups': 2 if a.smoke else 3, 'repeats': 2 if a.smoke else 12,
-        'modes': ['eager', 'graph'], 'max_seconds': a.max_seconds,
+        'modes': a.modes, 'correctness_reference': a.correctness_reference, 'max_seconds': a.max_seconds,
         'cases': ['fixed16', 'fixed16_redraft', 'fixed8_same_candidates', 'fixed8_redraft', 'target_free', 'target_free_split', 'cascade'],
         'selection': 'First eligible state of each distinct assessment prompt, canonical order; same 128 states at every C; seed913 fixed in advance, not best-seed selection.',
         'scope': 'Same-state native SGLang layer/FlashInfer replay, eager or exact-shape manually captured target segments; eager drafter. Not scheduler/HTTP/closed-loop throughput. Saved B16 candidates unchanged except explicitly labeled fixed8_redraft/fixed16_redraft controls; fixed8_same_candidates is post-draft truncation only.',
@@ -137,6 +141,12 @@ def main():
             config['cases'].append('raw_confidence')
             config['target'] = collection['calibration_target']
             config['comparison_scope'] = collection['comparison_scope']
+        elif collection['schema'] == 'postdraft_latency_bundle_v1':
+            config.update(suite='postdraft_verification_trim', target=collection['calibration_target'],
+                cases=['fixed16', 'fixed12_same_candidates', 'fixed8_same_candidates',
+                       'fixed12_redraft', 'fixed8_redraft', 'raw_confidence',
+                       'postdraft_hard', 'postdraft_hard_tv', 'postdraft_hard_margin'],
+                comparison_scope=collection['comparison_scope'])
     if a.use_container_gpu:
         config.update(image=os.environ.get('DFLASH_IMAGE_DIGEST', 'not_recorded'),
                       execution='Kubernetes direct process, not workstation Docker image',

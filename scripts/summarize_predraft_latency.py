@@ -29,7 +29,7 @@ def retention_intervals(a, b, base, prompt_ids, rng, draws=2000):
 
 
 def summarize(source):
-    if source['config'].get('suite') != 'predraft_verification_trim':
+    if source['config'].get('suite') not in ('predraft_verification_trim','postdraft_verification_trim'):
         raise ValueError('Wrong experiment suite')
     cells = source['results']
     totals = aggregate(cells)
@@ -57,10 +57,14 @@ def summarize(source):
             field: sum(r['audit'].get('same_candidates_vs_b16', {}).get(field, 0) for r in current_cells)
             for field in ('kept_top1_differences', 'acceptance_differences', 'bonus_differences')
         } if not case.endswith('_redraft') else None
-        if not (case.startswith('predraft_') or case == 'raw_confidence'):
+        value['cross_mode_diagnostic'] = {
+            field: sum(r['audit'].get('cross_mode_diagnostic', {}).get(field, 0) for r in current_cells)
+            for field in ('top1_differences','acceptance_differences','bonus_differences')}
+        if not (case.startswith(('predraft_', 'postdraft_')) or case == 'raw_confidence'):
             continue
         select = lambda name: sorted((r for r in cells if r['C']==c and r['mode']==mode and r['case']==name), key=lambda r:r['offset'])
-        policy, control, base = select(case), select('predraft_hard'), select('fixed16')
+        control_name = 'postdraft_hard' if source['config']['suite'] == 'postdraft_verification_trim' else 'predraft_hard'
+        policy, control, base = select(case), select(control_name), select('fixed16')
         a, b, a16 = [np.array([x for r in rows for x in r['observations'][0]['accepted']]) for rows in (policy, control, base)]
         prompt_ids = [p for r in policy for p in r['prompt_ids']]
         ci = lambda x: np.quantile(x, [.025, .975]).tolist()

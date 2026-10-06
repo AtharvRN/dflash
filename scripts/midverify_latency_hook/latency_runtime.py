@@ -307,6 +307,26 @@ class RawConfidencePolicy:
         return frozen_lengths(candidate_logprobs, self.setting['threshold'])
 
 
+class PostdraftPolicy:
+    def __init__(self, directory, setting):
+        from scripts.train_soft_supervision import build_model
+        payload = torch.load(directory/setting['checkpoint'], map_location='cpu', weights_only=False)
+        if any(payload[k] != setting[k] for k in ('seed','arm','selected_update')):
+            raise ValueError('Frozen post-draft checkpoint identity mismatch')
+        self.setting = setting
+        self.model = build_model().cuda().eval()
+        self.model.load_state_dict(payload['model'])
+        normalization = payload['config']['normalization']
+        self.mean = cuda(normalization['draft_mean'], torch.float64)
+        self.std = cuda(normalization['draft_std'], torch.float64)
+
+    def lengths(self, stats, ids, weight):
+        from dflash.postdraft_latency import features
+        x = features(weight[ids], stats, self.mean, self.std)
+        scores = self.model(x)[..., 0]
+        return frozen_lengths(scores, self.setting['threshold'])
+
+
 def predraft_fused(snapshot):
     # Charge recomputing fc/norm and the FP16 cache quantization used in training.
     return snapshot.draft.model.project_target_hidden(snapshot.raw_latest).half().float()
@@ -384,6 +404,10 @@ class Case:
             elif case == 'raw_confidence':
                 policy = None
                 k_gpu = self.policies[case].lengths(stats)
+                front = k_gpu.cpu().numpy()
+            elif case.startswith('postdraft_'):
+                policy = None
+                k_gpu = self.policies[case].lengths(stats, s.blocks[:, 1:], s.runner.model.lm_head.weight)
                 front = k_gpu.cpu().numpy()
             else:
                 policy = self.policies['cascade' if case == 'cascade' else 'target_free']
@@ -523,7 +547,7 @@ def detailed_correctness(case, original, graph_h, graph_aux, graph_logits, ref_h
     return report
 
 
-def correctness(case, audit_path=None, detailed=False):
+def correctness(case, audit_path=None, detailed=False, reference_mode='cross-mode'):
     """Independently run all 36 layers on the actual final prefix, same KV state."""
     case.run(False)
     final_h, final_aux = case.last_hidden.clone(), case.last_aux.clone()
@@ -554,6 +578,32 @@ def correctness(case, audit_path=None, detailed=False):
     report['case'], report['mode'] = case.case, case.mode
     report['accepted'], report['reference_accepted'] = original['accepted'], ref_a.tolist()
     report['bonus'], report['reference_bonus'] = original['bonus'], ref_b.tolist()
+    report['reference_mode'] = reference_mode
+    if reference_mode == 'same-mode' and case.mode == 'graph':
+        if len(case.segments) != 1:
+            raise ValueError('Same-mode reference currently supports unsplit verification only')
+        # Cross-mode drift remains visible, but cannot abort this matched-mode
+        # benchmark. Independently execute the graph's exact attention plan
+        # WITHOUT capture, checking hidden states, token decisions, and KV.
+        from sglang.srt.layers.attention.flashinfer_backend import PrefillMetadata
+        report['cross_mode_diagnostic'] = {k:report[k] for k in (
+            'hidden','draft_features','top1_differences','acceptance_differences',
+            'bonus_differences','kv','numerical_guard_exceeded')}
+        segment, backend = case.segments[0], case.s.runner.attn_backend
+        segment.prepare(fb)
+        key = backend._prefill_cuda_graph_metadata_key(segment.fb.batch_size, segment.fb.spec_info)
+        backend.forward_metadata = PrefillMetadata(backend.prefill_cuda_graph_metadata[key], False, False)
+        same = target_range(case.s.runner, segment.fb, 0, 36)
+        dense.reshape(-1)[idx.cpu().numpy()] = same[2].cpu().numpy()
+        same_a, same_b = accepted_from_top1(original['candidate_blocks'], dense, original['end'])
+        report.update(hidden=difference(final_h,same[0]), draft_features=difference(final_aux,same[1]),
+            top1_differences=int((final_top != dense).sum()),
+            acceptance_differences=int((np.array(original['accepted']) != same_a).sum()),
+            bonus_differences=int((np.array(original['bonus']) != same_b).sum()),
+            reference_accepted=same_a.tolist(), reference_bonus=same_b.tolist(),
+            kv={str(i):{'k':difference(k,pool.get_key_buffer(i)[locations]),
+                        'v':difference(v,pool.get_value_buffer(i)[locations])} for i,k,v in kv})
+        report['numerical_guard_exceeded'] = max(report['hidden']['relative_l2'],report['draft_features']['relative_l2']) > .02
     if audit_path is not None and (detailed or report['numerical_guard_exceeded']):
         atomic_json(audit_path, report)
     if detailed:
@@ -568,6 +618,10 @@ def correctness(case, audit_path=None, detailed=False):
                     lambda result: atomic_json(investigation_path, result))
     if report['numerical_guard_exceeded']:
         raise AssertionError('Segmented forward exceeds 2% numerical diagnostic guard')
+    if reference_mode == 'same-mode' and any(report[k] for k in ('top1_differences','acceptance_differences','bonus_differences')):
+        raise AssertionError('Same-mode token decision mismatch')
+    if reference_mode == 'same-mode' and any(not x['bitwise'] for layer in report['kv'].values() for x in layer.values()):
+        raise AssertionError('Same-mode sampled KV mismatch')
     if case.case == 'target_free_split' and case.mode == 'eager' and not report['hidden']['bitwise']:
         raise AssertionError('No-prune same-shape eager split must be bitwise identical')
     if not report['manual_vs_native_aux']['bitwise'] or report['manual_vs_native_top1']:
@@ -589,12 +643,13 @@ def run(worker, config_path):
         torch.backends.cudnn.allow_tf32 = False
         rows = json.loads((output/'states.json').read_text())
         directory = Path(config['policies'])
-        predraft_suite = config.get('suite') == 'predraft_verification_trim'
+        predraft_suite = config.get('suite') in ('predraft_verification_trim','postdraft_verification_trim')
         if predraft_suite:
             from scripts.export_predraft_latency_bundle import verify
             verify(directory)
             bundle = json.loads((directory/'bundle.json').read_text())
             policies = {name: (RawConfidencePolicy(setting) if name == 'raw_confidence'
+                              else PostdraftPolicy(directory, setting) if name.startswith('postdraft_')
                               else PredraftPolicy(directory, setting))
                         for name, setting in bundle['policies'].items()}
         else:
@@ -631,7 +686,8 @@ def run(worker, config_path):
                     for name in config['cases']:
                         current = Case(snapshot, name, mode, policies)
                         audit = correctness(current, output/f'correctness_c{concurrency}_offset{offset}_{mode}_{name}.json',
-                                            detailed=CAPTURE_DIAGNOSTIC_LOGITS)
+                                            detailed=CAPTURE_DIAGNOSTIC_LOGITS,
+                                            reference_mode=config.get('correctness_reference','cross-mode'))
                         if predraft_suite and config['smoke'] and any(audit[k] for k in ('top1_differences', 'acceptance_differences', 'bonus_differences')):
                             raise AssertionError('Small-C correctness smoke failed; full replay forbidden')
                         for _ in range(config['warmups']):
