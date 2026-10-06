@@ -561,6 +561,11 @@ def correctness(case, audit_path=None, detailed=False):
             ref_h, ref_aux, reference[3], fb, idx)
     if audit_path is not None and (detailed or report['numerical_guard_exceeded']):
         atomic_json(audit_path, report)
+    if detailed and report['numerical_guard_exceeded'] and case.mode == 'graph' and len(case.segments) == 1:
+        from scripts.midverify_latency_hook.attention_diagnostic import investigate
+        investigation_path = audit_path.with_name(audit_path.stem + '_attention.json')
+        investigate(case, fb, idx, ref_h, final_h, target_range, difference,
+                    lambda result: atomic_json(investigation_path, result))
     if report['numerical_guard_exceeded']:
         raise AssertionError('Segmented forward exceeds 2% numerical diagnostic guard')
     if case.case == 'target_free_split' and case.mode == 'eager' and not report['hidden']['bitwise']:
