@@ -476,6 +476,22 @@ def detailed_correctness(case, original, graph_h, graph_aux, graph_logits, ref_h
     report['changed_tokens_total'] = len(changed)
     delta = (graph_h.float()-ref_h.float()).norm(dim=-1)/ref_h.float().norm(dim=-1).clamp_min(1e-12)
     report['row_hidden_relative_l2_quantiles'] = torch.quantile(delta, cuda([0,.5,.9,.99,1.])).tolist()
+    dense_indices = idx.long()
+    req = dense_indices // 16
+    position = dense_indices % 16
+    committed_mask = position <= cuda(original['accepted'], torch.long)[req]
+    report['committed_hidden'] = difference(graph_h[committed_mask], ref_h[committed_mask])
+    report['committed_features'] = difference(graph_aux[committed_mask], ref_aux[committed_mask])
+    report['largest_hidden_differences'] = [
+        {'request': int(req[i]), 'source_row': case.s.rows[int(req[i])]['row'],
+         'query_position': int(position[i]), 'accepted': original['accepted'][int(req[i])],
+         'committed_row': bool(committed_mask[i]), 'relative_l2': float(delta[i])}
+        for i in delta.topk(min(10, len(delta))).indices.tolist()]
+    eager_wrapper = backend.forward_metadata.prefill_wrappers[0]
+    metadata_fields = ('_qo_indptr_buf', '_paged_kv_indptr_buf', '_paged_kv_indices_buf', '_paged_kv_last_page_len_buf')
+    logical_sizes = (case.s.n+1, case.s.n+1, int(eager_wrapper._paged_kv_indptr_buf[-1]), case.s.n)
+    eager_metadata = {name: getattr(eager_wrapper, name)[:n].clone() for name,n in zip(metadata_fields,logical_sizes)}
+    report['eager_attention_plan'] = {'backend': eager_wrapper._backend, 'plan_info': list(eager_wrapper._plan_info)}
     case.run(False)
     report['same_mode_repeat_hidden'] = difference(case.last_hidden, graph_h)
     report['same_mode_repeat_features'] = difference(case.last_aux, graph_aux)
@@ -487,7 +503,12 @@ def detailed_correctness(case, original, graph_h, graph_aux, graph_logits, ref_h
         segment.prepare(fb)
         saved_metadata = backend.forward_metadata
         key = backend._prefill_cuda_graph_metadata_key(segment.fb.batch_size, segment.fb.spec_info)
-        backend.forward_metadata = PrefillMetadata(backend.prefill_cuda_graph_metadata[key], False, False)
+        graph_wrappers = backend.prefill_cuda_graph_metadata[key]
+        graph_wrapper = graph_wrappers[0]
+        report['logical_attention_metadata_equal'] = {name: torch.equal(value, getattr(graph_wrapper,name)[:len(value)])
+                                                      for name,value in eager_metadata.items()}
+        report['graph_attention_plan'] = {'backend': graph_wrapper._backend, 'plan_info': list(graph_wrapper._plan_info)}
+        backend.forward_metadata = PrefillMetadata(graph_wrappers, False, False)
         try:
             uncaptured = target_range(runner, segment.fb, 0, 36)
             report['uncaptured_graph_wrapper_vs_graph_hidden'] = difference(uncaptured[0], graph_h)
