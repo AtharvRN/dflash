@@ -27,6 +27,14 @@ def validate_replay_cohort(rows, metadata):
         raise ValueError('Duplicate replay cycle')
 
 
+def replay_offsets(count, concurrency, diagnostic_offset=None):
+    if diagnostic_offset is None:
+        return list(range(0, count, concurrency))
+    if diagnostic_offset < 0 or diagnostic_offset % concurrency or diagnostic_offset >= count:
+        raise ValueError('Diagnostic offset must identify an aligned existing batch')
+    return [diagnostic_offset]
+
+
 def frozen_lengths(scores, threshold):
     import torch
     if scores.ndim != 2 or scores.shape[1] != 15:

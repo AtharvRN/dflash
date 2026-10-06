@@ -36,9 +36,13 @@ def main():
     p.add_argument('--models-config', type=Path)
     p.add_argument('--scratch-dir', type=Path)
     p.add_argument('--gpu-idle-wait-seconds', type=int, default=0)
+    p.add_argument('--diagnostic-offset', type=int,
+                   help='Single original-cohort batch; detailed correctness evidence, not a performance result')
     a = p.parse_args()
     from dflash.predraft_latency import resolve_concurrencies
     concurrencies = resolve_concurrencies(a.concurrencies, smoke=a.smoke)
+    if a.diagnostic_offset is not None and (a.smoke or not a.predraft_bundle or len(concurrencies) != 1):
+        raise ValueError('Diagnostic replay requires a bundle, one concurrency, and no smoke flag')
     if a.output.exists() or not 60 <= a.max_seconds <= 3600:
         raise ValueError('Fresh output and bounded deadline required')
     root = a.data_root.resolve()
@@ -90,6 +94,9 @@ def main():
         rows = select_states(json.loads((cache / 'rows.json').read_text()),
                             json.loads(source.read_text()), 4 if a.smoke else 128)
     models = json.loads((a.models_config or root / 'models.json').read_text())
+    from dflash.predraft_latency import replay_offsets
+    for c in concurrencies:
+        replay_offsets(len(rows), c, a.diagnostic_offset)
     from dflash.predraft_latency import same_model_identity
     if not (same_model_identity(models, collection['models']) if a.predraft_bundle else models == collection['models']):
         raise ValueError('Pinned model mismatch')
@@ -103,6 +110,7 @@ def main():
     atomic_json(a.output / 'states.json', rows)
     config = {'gpu': gpu, 'image': IMAGE, 'models': models, 'cache': str(cache),
         'gpu_idle_wait_seconds': a.gpu_idle_wait_seconds,
+        'diagnostic_offset': a.diagnostic_offset,
         'cohort_rows': len(rows),
         'tail_batch_sizes': {str(c): len(rows) % c for c in concurrencies},
         'policies': str(policies), 'output': str(a.output), 'smoke': a.smoke,
@@ -133,6 +141,8 @@ def main():
         config.update(image=os.environ.get('DFLASH_IMAGE_DIGEST', 'not_recorded'),
                       execution='Kubernetes direct process, not workstation Docker image',
                       environment=command([sys.executable, '-m', 'pip', 'freeze']).splitlines())
+    if a.diagnostic_offset is not None:
+        config.update(repeats=2, scope='Single-batch correctness diagnostic; NOT a performance benchmark')
     atomic_json(a.output / 'config.json', config)
     runtime = scratch / 'runtime_cache'
     runtime.mkdir()

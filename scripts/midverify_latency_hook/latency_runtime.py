@@ -19,7 +19,7 @@ import numpy as np
 import torch
 
 from dflash.midverify_latency import packed_indices, compact_indices, accepted_from_top1
-from dflash.predraft_latency import fixed_width, frozen_lengths
+from dflash.predraft_latency import fixed_width, frozen_lengths, replay_offsets
 from scripts.audit_block_headroom import sha256
 from scripts.profile_sglang_latency import atomic_json, distribution
 from scripts.train_midverify_cascade import build_probe
@@ -28,6 +28,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.speculative.dflash_info import DFlashRaggedVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+CAPTURE_DIAGNOSTIC_LOGITS = False
 
 
 def cuda(x, dtype=None):
@@ -186,7 +188,8 @@ def target_range(runner, fb, begin, end, state=None):
             return (h, residual, *aux)
         hidden, _ = model.norm(h, residual)
         out = runner.model.logits_processor(fb.input_ids, hidden, runner.model.lm_head, fb, aux)
-        return hidden, out.hidden_states, out.next_token_logits.argmax(-1)
+        result = (hidden, out.hidden_states, out.next_token_logits.argmax(-1))
+        return (*result, out.next_token_logits) if CAPTURE_DIAGNOSTIC_LOGITS else result
 
 
 class Segment:
@@ -445,20 +448,74 @@ class Case:
         if getattr(s, 'native_candidate_replay', False) and not case.endswith('_redraft') and self.last['draft_top1_changed_positions']:
             raise AssertionError('Fresh B16 candidates changed within a frozen native replay snapshot')
         self.last_hidden, self.last_aux, self.last_fb = result[0], result[1], final_fb
+        self.last_logits = result[3] if CAPTURE_DIAGNOSTIC_LOGITS else None
         return self.last
 
 
-def correctness(case):
+def detailed_correctness(case, original, graph_h, graph_aux, graph_logits, ref_h, ref_aux, ref_logits, fb, idx):
+    """Diagnostic-only controls; no guard changes and no performance claims."""
+    runner, backend = case.s.runner, case.s.runner.attn_backend
+    backend.init_forward_metadata(fb)
+    repeated = target_range(runner, fb, 0, 36)
+    report = {'eager_repeat_hidden': difference(repeated[0], ref_h),
+              'eager_repeat_features': difference(repeated[1], ref_aux),
+              'eager_repeat_top1_differences': int((repeated[2] != ref_logits.argmax(-1)).sum()),
+              'captured_feature_layers': {str(layer): difference(graph_aux[:,j*2560:(j+1)*2560], ref_aux[:,j*2560:(j+1)*2560])
+                                         for j,layer in enumerate([2,10,18,26,34])}}
+    changed = (graph_logits.argmax(-1) != ref_logits.argmax(-1)).nonzero().flatten()
+    tokens = []
+    for packed in changed[:64].tolist():
+        dense = int(idx[packed]); request, position = divmod(dense,16)
+        g, e = int(graph_logits[packed].argmax()), int(ref_logits[packed].argmax())
+        tokens.append({'request': request, 'source_row': case.s.rows[request]['row'],
+            'prompt_id': case.s.rows[request]['prompt_id'], 'cycle': case.s.rows[request]['cycle'],
+            'query_position': position, 'graph_token': g, 'eager_token': e,
+            'graph_logit_pair': graph_logits[packed, [g,e]].float().tolist(),
+            'eager_logit_pair': ref_logits[packed, [g,e]].float().tolist()})
+    report['changed_tokens'] = tokens
+    report['changed_tokens_total'] = len(changed)
+    delta = (graph_h.float()-ref_h.float()).norm(dim=-1)/ref_h.float().norm(dim=-1).clamp_min(1e-12)
+    report['row_hidden_relative_l2_quantiles'] = torch.quantile(delta, cuda([0,.5,.9,.99,1.])).tolist()
+    case.run(False)
+    report['same_mode_repeat_hidden'] = difference(case.last_hidden, graph_h)
+    report['same_mode_repeat_features'] = difference(case.last_aux, graph_aux)
+    report['same_mode_repeat_top1_differences'] = int((np.array(case.last['top1']) != np.array(original['top1'])).sum())
+    report['same_mode_repeat_acceptance_differences'] = int((np.array(case.last['accepted']) != np.array(original['accepted'])).sum())
+    if case.mode == 'graph' and len(case.segments) == 1:
+        from sglang.srt.layers.attention.flashinfer_backend import PrefillMetadata
+        segment = case.segments[0]
+        segment.prepare(fb)
+        saved_metadata = backend.forward_metadata
+        key = backend._prefill_cuda_graph_metadata_key(segment.fb.batch_size, segment.fb.spec_info)
+        backend.forward_metadata = PrefillMetadata(backend.prefill_cuda_graph_metadata[key], False, False)
+        try:
+            uncaptured = target_range(runner, segment.fb, 0, 36)
+            report['uncaptured_graph_wrapper_vs_graph_hidden'] = difference(uncaptured[0], graph_h)
+            report['uncaptured_graph_wrapper_vs_eager_hidden'] = difference(uncaptured[0], ref_h)
+            report['uncaptured_graph_wrapper_vs_graph_top1_differences'] = int((uncaptured[2] != graph_logits.argmax(-1)).sum())
+        finally:
+            backend.forward_metadata = saved_metadata
+    report['prefix_last_key_fingerprints_unchanged'] = all(torch.equal(case.s.prefix_fingerprint[i],
+        runner.token_to_kv_pool.get_key_buffer(i)[case.s.fingerprint_locs]) for i in range(36))
+    report['prefix_slot_mapping_unchanged'] = all(torch.equal(case.s.pool.req_to_token[case.s.reqs[j], :length],
+        case.s.prefix_slots[j].int()) for j,length in enumerate(case.s.lengths))
+    return report
+
+
+def correctness(case, audit_path=None, detailed=False):
     """Independently run all 36 layers on the actual final prefix, same KV state."""
     case.run(False)
     final_h, final_aux = case.last_hidden.clone(), case.last_aux.clone()
+    original = case.last
+    final_logits = case.last_logits.clone() if detailed else None
     final_top = np.array(case.last['top1'])
     locations = case.last_fb.out_cache_loc
     pool = case.s.runner.token_to_kv_pool
     kv = [(i, pool.get_key_buffer(i)[locations].clone(), pool.get_value_buffer(i)[locations].clone()) for i in (0, 5, 35)]
     fb, idx = case.s.fb(np.asarray(case.last['end'], dtype=np.int32), blocks=cuda(case.last['candidate_blocks'], torch.long))
     case.s.runner.attn_backend.init_forward_metadata(fb)
-    ref_h, ref_aux, ref_top = target_range(case.s.runner, fb, 0, 36)
+    reference = target_range(case.s.runner, fb, 0, 36)
+    ref_h, ref_aux, ref_top = reference[:3]
     dense = np.full((case.s.n, 16), -1, dtype=np.int64)
     dense.reshape(-1)[idx.cpu().numpy()] = ref_top.cpu().numpy()
     ref_a, ref_b = accepted_from_top1(case.last['candidate_blocks'], dense, case.last['end'])
@@ -468,14 +525,25 @@ def correctness(case):
         'bonus_differences': int((np.array(case.last['bonus']) != ref_b).sum()),
         'kv': {str(i): {'k': difference(k, pool.get_key_buffer(i)[locations]),
                         'v': difference(v, pool.get_value_buffer(i)[locations])} for i, k, v in kv}}
-    if max(report['hidden']['relative_l2'], report['draft_features']['relative_l2']) > .02:
-        raise AssertionError('Segmented forward exceeds 2% numerical diagnostic guard')
-    if case.case == 'target_free_split' and case.mode == 'eager' and not report['hidden']['bitwise']:
-        raise AssertionError('No-prune same-shape eager split must be bitwise identical')
     # Verify custom layer traversal agrees with native model dispatch.
     native = case.s.runner.forward(fb).logits_output
     report['manual_vs_native_aux'] = difference(ref_aux, native.hidden_states)
     report['manual_vs_native_top1'] = int((ref_top != native.next_token_logits.argmax(-1)).sum())
+    report['numerical_guard_exceeded'] = max(report['hidden']['relative_l2'], report['draft_features']['relative_l2']) > .02
+    report['case'], report['mode'] = case.case, case.mode
+    report['accepted'], report['reference_accepted'] = original['accepted'], ref_a.tolist()
+    report['bonus'], report['reference_bonus'] = original['bonus'], ref_b.tolist()
+    if audit_path is not None and (detailed or report['numerical_guard_exceeded']):
+        atomic_json(audit_path, report)
+    if detailed:
+        report['details'] = detailed_correctness(case, original, final_h, final_aux, final_logits,
+            ref_h, ref_aux, reference[3], fb, idx)
+    if audit_path is not None and (detailed or report['numerical_guard_exceeded']):
+        atomic_json(audit_path, report)
+    if report['numerical_guard_exceeded']:
+        raise AssertionError('Segmented forward exceeds 2% numerical diagnostic guard')
+    if case.case == 'target_free_split' and case.mode == 'eager' and not report['hidden']['bitwise']:
+        raise AssertionError('No-prune same-shape eager split must be bitwise identical')
     if not report['manual_vs_native_aux']['bitwise'] or report['manual_vs_native_top1']:
         raise AssertionError('Manual traversal differs from native model')
     return report
@@ -483,7 +551,9 @@ def correctness(case):
 
 @torch.no_grad()
 def run(worker, config_path):
+    global CAPTURE_DIAGNOSTIC_LOGITS
     config = json.loads(Path(config_path).read_text())
+    CAPTURE_DIAGNOSTIC_LOGITS = config.get('diagnostic_offset') is not None
     output = Path(config['output'])
     started = time.monotonic()
     snapshot = None
@@ -512,7 +582,7 @@ def run(worker, config_path):
         runner.attn_backend.init_cuda_graph_state(128, 2048)
         results = []
         for concurrency in config['concurrencies']:
-            for offset in range(0, len(rows), concurrency):
+            for offset in replay_offsets(len(rows), concurrency, config.get('diagnostic_offset')):
                 batch = rows[offset:offset+concurrency]
                 snapshot = Snapshot(worker, batch)
                 if predraft_suite:
@@ -534,7 +604,8 @@ def run(worker, config_path):
                     cases = {}
                     for name in config['cases']:
                         current = Case(snapshot, name, mode, policies)
-                        audit = correctness(current)
+                        audit = correctness(current, output/f'correctness_c{concurrency}_offset{offset}_{mode}_{name}.json',
+                                            detailed=CAPTURE_DIAGNOSTIC_LOGITS)
                         if predraft_suite and config['smoke'] and any(audit[k] for k in ('top1_differences', 'acceptance_differences', 'bonus_differences')):
                             raise AssertionError('Small-C correctness smoke failed; full replay forbidden')
                         for _ in range(config['warmups']):
@@ -621,6 +692,7 @@ def run(worker, config_path):
         names = ['config.json', 'states.json', 'summary.json', 'partial.json']
         if predraft_suite:
             names += sorted(p.name for p in output.glob('predraft_feature_audit_*.json'))
+        names += sorted(p.name for p in output.glob('correctness_*.json'))
         atomic_json(output/'COMPLETE.json', {'passed': True,
             'binding': {name: sha256(output/name) for name in names}})
         print('MIDVERIFY_LATENCY_COMPLETE', flush=True)
