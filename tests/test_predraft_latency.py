@@ -80,3 +80,18 @@ def test_predraft_computation_precedes_current_draft_and_no_confidence():
     assert body.index('self.policies[case].lengths(predraft_fused(s))') < body.index('draft_forward(s, timer')
     assert "confidence=not (case.startswith('fixed') or predraft)" in body
     assert 'max_seconds' in (Path(__file__).resolve().parents[1]/'scripts/run_midverify_latency.py').read_text()
+
+
+def test_container_launch_validates_allocation_before_files(monkeypatch, tmp_path):
+    import sys
+    from scripts import gpu_runtime, run_midverify_latency
+    monkeypatch.delenv('SLURM_JOB_ID', raising=False)
+    monkeypatch.setattr(sys, 'argv', ['replay', '--output', str(tmp_path/'out'),
+        '--predraft-bundle', str(tmp_path/'bundle'), '--use-container-gpu'])
+    def check(**kwargs):
+        assert kwargs == {'use_visible_gpu': False, 'use_container_gpu': True, 'require_gpu': True}
+        raise RuntimeError('allocation guard reached')
+    monkeypatch.setattr(gpu_runtime, 'configure_gpu_runtime', check)
+    with pytest.raises(RuntimeError, match='allocation guard reached'):
+        run_midverify_latency.main()
+    assert not (tmp_path/'out').exists()
