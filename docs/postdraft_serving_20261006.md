@@ -154,3 +154,10 @@ checks output counts, and compares against both B16 and the best tested fixed
 control. The later CLI validation guards reject unsupported spec-v1, TP>1 or
 non-FlashInfer configurations; those guards do not change this run's policy or
 worker execution. Historical recovered engine files remain unchanged.
+
+Final regression suite on the remote Torch environment: **16 passed** (4.68 s).
+Includes exact greedy-candidate/logprob preservation by the optimized confidence
+projection and fail-fast checks for unsupported CLI configurations. Local/PVC
+19-file aggregate evidence digests match exactly. All 8,192 timed responses had
+valid stop/length finishes; total KV retractions were zero. The pre-existing edit
+to `docs/DFLASH_RESEARCH_MASTER_RECORD_20260928.md` was left untouched.
