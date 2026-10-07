@@ -37,9 +37,15 @@ def sha(path):
 def workload(args, model):
     if args.workload_file:
         saved = json.loads(args.workload_file.read_text())
-        if len(saved["warmup"]) != args.warmup or len(saved["measurement"]) != args.requests:
-            raise ValueError("Frozen workload size does not match requested experiment")
-        shutil.copy2(args.workload_file, args.output / "workload.json")
+        if len(saved["warmup"]) < args.warmup or len(saved["measurement"]) < args.requests:
+            raise ValueError("Frozen workload is smaller than requested experiment")
+        if len(saved["warmup"]) == args.warmup and len(saved["measurement"]) == args.requests:
+            shutil.copy2(args.workload_file, args.output / "workload.json")
+        else:
+            saved = saved | {"parent_workload_sha256": sha(args.workload_file),
+                            "warmup": saved["warmup"][:args.warmup],
+                            "measurement": saved["measurement"][:args.requests]}
+            save(args.output / "workload.json", saved)
         return saved["warmup"], saved["measurement"]
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
