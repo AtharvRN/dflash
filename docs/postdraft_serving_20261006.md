@@ -287,3 +287,51 @@ At 01:26 UTC the first fixed-B8 C32 workload was actively serving, with 88%
 GPU utilization sampled; no completed timed result yet. Read `progress.json`,
 `COMPLETE.json`/`FAILED.json`, and `summary.json`
 before reporting completion or a speedup. Raw prompts/outputs remain on PVC.
+
+### GSM8K test-set extension launched (October 6 PDT / October 7 UTC)
+
+Dataset: https://huggingface.co/datasets/openai/gsm8k, config `main`, pinned
+revision `740312add88f781978c0658806c59bc2815b9866`. Full test split: 1,319
+questions, seed-934 shuffled order, no test filtering. Warmup: 128 training-split
+questions, excluding exact test-question duplicates and duplicate warmup text.
+Question and reference-answer provenance are saved; only question-derived
+`input_ids` are sent to the server. Workload SHA256:
+`df482fec652749cffdd8aac6de9fe75e761b2e73b6a39de22549cbec852e8877`.
+
+Prompt is the existing repository GSM8K format: question followed by
+"Please reason step by step, and put your final answer within \\boxed{}."
+Zero-shot Qwen chat template, thinking off, greedy, natural EOS, 1,024 output
+token cap for every method. Longest test input is 215 tokens. This is our custom
+chat-serving protocol, **not a standard few-shot lm-evaluation-harness score**;
+GSM8K has historical development use in this project. No threshold fitting.
+
+Main comparison: fixed B8/B12/B16 and raw-confidence adaptive, C32/C16, two
+repeats per method/concurrency, 1,319 measured requests per repeat. Same A100
+40GB/pod/model revisions/precision/backend/memory settings as preceding runs.
+Verification-length logging disabled for all arms. This run measures actual
+HTTP serving throughput and accepted proposals per cycle, not adaptive mean
+verification length. It is not directly comparable to the instruct-mixture TPS.
+
+Added `scripts/prepare_gsm8k_serving.py`, `scripts/score_gsm8k_serving.py`, and
+`scripts/run_gsm8k_serving_nrp.sh`; code commit `b3ddce9`. All 21 regression tests
+passed remotely. Scoring reports strict final-box numeric exact match, parse
+failures, and output-cap fractions; a separately labelled relaxed last-number
+fallback is diagnostic only. Repeated test questions are not independent
+accuracy samples. No target-only AR arm is included; this is not an exactness
+certification. Numeric parsing is unit-tested, not an LLM judge.
+
+Smoke `smoke_r1`: C4, eight test questions, four train warmup questions,
+B8 and raw adaptive. Both completed with 8/8 strict boxed answers correct,
+zero parse failures and zero capped outputs. This small sample validates the
+pipeline and does not establish a comparative speedup or full-test accuracy.
+
+Main launch: 2026-10-07 03:17 UTC, PID 4477, bounded to 7,200 seconds (before
+pod deadline 06:24:57 UTC). Run wrapper automatically saves throughput and
+GSM8K score summaries and stops its run-scoped telemetry/server. No recurring
+monitor created. Full run:
+`/workspace/dflashv2_data/runs/gsm8k_serving_20261007/main_r1`.
+Frozen workload: sibling `workload.json`; launch log and GPU telemetry:
+`main_r1.launch.log`, `main_r1.gpu.csv`. Temporary execution source:
+`/tmp/gsm8k-serving-main-r1`.
+At this note the main sweep is launched, with no completed main results yet.
+Check `COMPLETE.json`, `summary.json`, and `gsm8k_summary.json` before reporting.
