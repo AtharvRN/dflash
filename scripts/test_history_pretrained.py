@@ -37,24 +37,50 @@ def main():
                    'Write a Python function that reverses a list without modifying the input.'):
         ids = tokenizer.apply_chat_template([{'role': 'user', 'content': prompt}],
             enable_thinking=False, add_generation_prompt=True, return_tensors='pt').cuda()
+        ar_logits, block_logits = [], []
+        def capture(destination):
+            def hook(module, inputs, output):
+                values, indices = output.logits[0].float().topk(2, dim=-1)
+                destination.append({'top2_logits': values.tolist(), 'top2_ids': indices.tolist()})
+            return hook
+        handle = target.register_forward_hook(capture(ar_logits))
         with torch.inference_mode():
             ar = target.generate(ids, attention_mask=torch.ones_like(ids), max_new_tokens=96, do_sample=False,
                                  pad_token_id=tokenizer.eos_token_id)
+        handle.remove()
         blocks = tuple(range(2, 17))
         def choose(h, cycle):
             return blocks[cycle % len(blocks)]
         common = dict(blocks=blocks, choose=choose, max_new_tokens=96, stop_token_ids=stops)
+        handle = target.register_forward_hook(capture(block_logits))
         plain = generate_history(draft, target, ids, **common)
+        handle.remove()
         paired = generate_history(draft, target, ids, collect=True, **common)
         fixed = generate_history(draft, target, ids, blocks=(16,), choose=lambda h,c: 16,
                                  max_new_tokens=96, stop_token_ids=stops)
         def suffix(x):
             return x[0, ids.shape[1]:].tolist()
+        mismatch = next((i for i, (a, b) in enumerate(zip(suffix(ar), suffix(plain['output_ids']))) if a != b), None)
+        diagnostic = None
+        if mismatch is not None:
+            diagnostic = {'generated_offset': mismatch, 'ar': ar_logits[mismatch]}
+            position = ids.shape[1] + mismatch
+            if mismatch == 0:
+                diagnostic['block'] = block_logits[0]
+            else:
+                for i, row in enumerate(plain['cycles']):
+                    start = row['prefix_length_including_anchor'] - 1
+                    if start < position <= start + row['selected_accepted'] + 1:
+                        j = position - start - 1
+                        diagnostic['block'] = {k: v[j] for k, v in block_logits[i+1].items()}
+                        diagnostic['block_size'] = row['selected_block']
+                        break
         evidence['tests'].append(dict(prompt=prompt, ar=suffix(ar),
             plain=suffix(plain['output_ids']), paired=suffix(paired['output_ids']),
             exact_ar=torch.equal(ar, plain['output_ids']),
             exact_fixed16_ar=torch.equal(ar, fixed['output_ids']),
             fixed16=suffix(fixed['output_ids']),
+            first_mismatch_logits=diagnostic,
             exact_probe_output=torch.equal(plain['output_ids'], paired['output_ids']),
             exact_probe_history=[r['history'] for r in plain['cycles']] ==
                                 [r['history'] for r in paired['cycles']],
