@@ -14,7 +14,7 @@ from prepare_postdraft_serving import prepare
 def test_extension_restores_and_parses(tmp_path):
     dst = tmp_path / "source"
     manifest = prepare(dst)
-    assert len(manifest["changes"]) == 6
+    assert len(manifest["changes"]) == 9
     for rel in manifest["changes"]:
         ast.parse((dst / "python/sglang/srt" / rel).read_text())
     with pytest.raises(ValueError):
@@ -97,3 +97,31 @@ def test_unsupported_raw_policy_cannot_be_silently_ignored(tmp_path):
     namespace["_is_spec_v2_enabled"] = lambda: False
     with pytest.raises(ValueError, match="spec-v2"):
         namespace[fn.name](SimpleNamespace(**fields))
+
+
+def test_verify_length_audit_excludes_warmup_and_matches_response_cycles(tmp_path):
+    from dflash.serving_verify_audit import make_record
+    from summarize_verify_lengths import summarize
+    dst = tmp_path / "raw"
+    dst.mkdir()
+    def req(rid, finished=False):
+        return SimpleNamespace(rid=rid, is_retracted=False, finished=lambda: finished)
+    rid = "pdv:raw_c4_r0:12"
+    records = [make_record([req("warmup")], [16], [8], 16, 16, True),
+               make_record([req(rid)], [3], [2], 3, 4, True),
+               make_record([req(rid)], [5], [3], 5, 8, True),
+               make_record([req(rid, True)], [2], [1], 2, 2, False)]
+    (dst / "verify_lengths.jsonl").write_text("".join(json.dumps(r)+"\n" for r in records))
+    response = {"case":"raw", "concurrency":4, "repeat":0,
+                "results":[{"prompt_id":"12", "response":{"meta_info":{
+                    "id":rid, "spec_verify_ct":2, "spec_num_correct_drafts":3}}}]}
+    (dst / "c4_r0.json").write_text(json.dumps(response))
+    out = summarize(tmp_path)["phases"]["pdv:raw_c4_r0"]
+    assert out["cycles"] == 2 and out["selected"] == 8
+    assert out["average_verification_length_including_anchor"] == 4
+    assert out["accepted_over_selected_proposals"] == .5
+    assert out["executed_rows_per_counted_cycle"] == 7
+    response["results"][0]["response"]["meta_info"]["spec_verify_ct"] = 3
+    (dst / "c4_r0.json").write_text(json.dumps(response))
+    with pytest.raises(AssertionError):
+        summarize(tmp_path)

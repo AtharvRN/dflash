@@ -79,9 +79,43 @@ def extend(destination):
          '                if self.model_runner.server_args.speculative_dflash_postdraft_logprob_threshold is not None:\n'
          '                    dynamic_buckets.extend(range(1, max_tokens_per_bs + 1))\n\n'
          '                if max_tokens_per_bs not in dynamic_buckets:')
+    edit("speculative/dflash_worker_v2.py",
+         '        raw_threshold = server_args.speculative_dflash_postdraft_logprob_threshold',
+         '        self._dflash_verify_audit = bool(os.getenv("SGLANG_DFLASH_VERIFY_AUDIT_PATH"))\n'
+         '        raw_threshold = server_args.speculative_dflash_postdraft_logprob_threshold')
+    # This exact return belongs only to the post-draft path. Metadata is copied
+    # with the existing result transfer, not via another worker-side GPU sync.
+    edit("speculative/dflash_worker_v2.py",
+         '                speculative_num_draft_tokens_per_req=commit_lens,\n'
+         '                new_seq_lens=new_seq_lens,',
+         '                speculative_num_draft_tokens_per_req=commit_lens,\n'
+         '                dflash_verify_lens=verify_block_lens if self._dflash_verify_audit else None,\n'
+         '                dflash_verify_packed_tokens=int(verify_draft_tokens.numel()),\n'
+         '                dflash_verify_executed_tokens=(int(self.target_worker.model_runner.decode_cuda_graph_runner.bs)\n'
+         '                    * int(graph_num_tokens_per_batch) if can_run_cuda_graph else int(verify_draft_tokens.numel())),\n'
+         '                new_seq_lens=new_seq_lens,')
+    edit("managers/utils.py",
+         '    speculative_num_draft_tokens_per_req: Optional[torch.Tensor] = None',
+         '    speculative_num_draft_tokens_per_req: Optional[torch.Tensor] = None\n'
+         '    dflash_verify_lens: Optional[torch.Tensor] = None\n'
+         '    dflash_verify_packed_tokens: int = 0\n'
+         '    dflash_verify_executed_tokens: int = 0')
+    edit("managers/utils.py", '        if self.accept_lens is not None:',
+         '        if self.dflash_verify_lens is not None:\n'
+         '            self.dflash_verify_lens = self.dflash_verify_lens.to("cpu", non_blocking=True)\n'
+         '        if self.accept_lens is not None:')
+    edit("managers/scheduler_components/batch_result_processor.py",
+         '        accept_lens = result.accept_lens.tolist()',
+         '        accept_lens = result.accept_lens.tolist()\n'
+         '        if result.dflash_verify_lens is not None:\n'
+         '            from sglang.srt.speculative.dflash_verify_audit import record_result\n'
+         '            record_result(batch.reqs, result, accept_lens)')
     target = destination / "python/sglang/srt/speculative/dflash_raw_confidence.py"
     shutil.copy2(ROOT / "dflash/serving_raw_confidence.py", target)
     changes["speculative/dflash_raw_confidence.py"] = {"after_sha256": digest(target)}
+    audit_target = destination / "python/sglang/srt/speculative/dflash_verify_audit.py"
+    shutil.copy2(ROOT / "dflash/serving_verify_audit.py", audit_target)
+    changes["speculative/dflash_verify_audit.py"] = {"after_sha256": digest(audit_target)}
     manifest = {"format": "postdraft_serving_extension_v1", "changes": changes,
                 "extension_sha256": digest(Path(__file__)), "policy_sha256": digest(target)}
     (destination / "POSTDRAFT_EXTENSION.json").write_text(json.dumps(manifest, indent=2) + "\n")

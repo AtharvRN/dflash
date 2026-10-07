@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import random
+import shutil
 import signal
 import statistics
 import subprocess
@@ -34,6 +35,12 @@ def sha(path):
 
 
 def workload(args, model):
+    if args.workload_file:
+        saved = json.loads(args.workload_file.read_text())
+        if len(saved["warmup"]) != args.warmup or len(saved["measurement"]) != args.requests:
+            raise ValueError("Frozen workload size does not match requested experiment")
+        shutil.copy2(args.workload_file, args.output / "workload.json")
+        return saved["warmup"], saved["measurement"]
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
     ids = set(json.loads(args.split.read_text())["val_prompt_ids"])
@@ -72,11 +79,14 @@ def workload(args, model):
     return rows[:args.warmup], rows[args.warmup:]
 
 
-def request_one(base, row, max_tokens):
+def request_one(base, row, max_tokens, phase=None):
     started = time.perf_counter()
-    response = requests.post(base + "/generate", json={"input_ids": row["input_ids"],
+    payload = {"input_ids": row["input_ids"],
         "sampling_params": {"temperature": 0, "top_k": 1, "top_p": 1,
-                            "max_new_tokens": max_tokens}}, timeout=600)
+                            "max_new_tokens": max_tokens}}
+    if phase is not None:
+        payload["rid"] = f"pdv:{phase}:{row['prompt_id']}"
+    response = requests.post(base + "/generate", json=payload, timeout=600)
     response.raise_for_status()
     result = response.json()
     if not isinstance(result, dict) or int(result.get("meta_info", {}).get("completion_tokens", 0)) <= 0:
@@ -85,11 +95,11 @@ def request_one(base, row, max_tokens):
             "response": result}
 
 
-def run_requests(base, rows, concurrency, max_tokens):
+def run_requests(base, rows, concurrency, max_tokens, phase=None):
     started_unix = time.time()
     started = time.perf_counter()
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        results = list(pool.map(lambda row: request_one(base, row, max_tokens), rows))
+        results = list(pool.map(lambda row: request_one(base, row, max_tokens, phase), rows))
     elapsed = time.perf_counter() - started
     tokens = sum(r["response"]["meta_info"]["completion_tokens"] for r in results)
     times = sorted(r["latency_s"] for r in results)
@@ -116,6 +126,10 @@ def main():
     parser.add_argument("--threshold", type=float, default=-0.8720796704292296)
     parser.add_argument("--eager", action="store_true")
     parser.add_argument("--port", type=int, default=22508)
+    parser.add_argument("--verify-length-audit", action="store_true")
+    parser.add_argument("--workload-file", type=Path)
+    parser.add_argument("--mem-fraction-static", type=float, default=.50)
+    parser.add_argument("--max-total-tokens", type=int, default=262144)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     args.scratch.mkdir(parents=True, exist_ok=False)
@@ -145,11 +159,13 @@ def main():
     for case in args.cases:
         case_dir = args.output / case
         case_dir.mkdir()
+        if args.verify_length_audit:
+            env["SGLANG_DFLASH_VERIFY_AUDIT_PATH"] = str(case_dir / "verify_lengths.jsonl")
         block = int(case[5:]) if case.startswith("fixed") else 16
         command = [sys.executable, "-m", "sglang.launch_server", "--model-path", models["target"]["path"],
                    "--host", "127.0.0.1", "--port", str(args.port), "--tp-size", "1", "--dtype", "bfloat16",
-                   "--random-seed", "934", "--attention-backend", "flashinfer", "--mem-fraction-static", "0.50",
-                   "--max-running-requests", str(max(args.concurrencies)), "--max-total-tokens", "262144",
+                   "--random-seed", "934", "--attention-backend", "flashinfer", "--mem-fraction-static", str(args.mem_fraction_static),
+                   "--max-running-requests", str(max(args.concurrencies)), "--max-total-tokens", str(args.max_total_tokens),
                    "--context-length", "4096", "--disable-radix-cache", "--disable-piecewise-cuda-graph"]
         if case != "target_ar":
             command += ["--speculative-algorithm", "DFLASH", "--speculative-draft-model-path", models["draft"]["path"],
@@ -182,9 +198,12 @@ def main():
                 save(case_dir / "server_info.json", requests.get(base + "/get_server_info", timeout=30).json())
                 for concurrency in args.concurrencies:
                     print(f"WARMUP {case} C{concurrency}", flush=True)
-                    run_requests(base, warmup, concurrency, min(64, args.max_new_tokens))
+                    run_requests(base, warmup, concurrency, min(64, args.max_new_tokens),
+                                 f"{case}_c{concurrency}_warmup" if args.verify_length_audit else None)
                     for repeat in range(args.repeats):
-                        result = run_requests(base, measured, concurrency, args.max_new_tokens)
+                        result = run_requests(base, measured, concurrency, args.max_new_tokens,
+                                             f"{case}_c{concurrency}_r{repeat}" if args.verify_length_audit else None)
+                        result["measurement_kind"] = "instrumented_length_audit" if args.verify_length_audit else "throughput"
                         result.update(case=case, repeat=repeat, workload_sha256=sha(args.output / "workload.json"))
                         save(case_dir / f"c{concurrency}_r{repeat}.json", result)
                         brief = {k:v for k,v in result.items() if k != "results"}
