@@ -263,3 +263,27 @@ Full evidence remains at:
 Local aggregate-only evidence:
 `outputs/postdraft_verify_lengths_20261007/c32_c16_verify_length_summary.json`.
 The server exited and run-scoped telemetry was stopped; the GPU was released.
+
+### Matched C32/C16 fixed-width throughput sweep launched
+
+At 2026-10-07 01:24 UTC, launched a separate **uninstrumented** sweep on the
+same idle A100-PCIE-40GB and pod UID as the length audit. Cases, in order:
+`fixed8 fixed12 fixed16 raw`; concurrencies `32 16`; two repeats each,
+512 measured prompts, 128 disjoint warmup prompts, 512 max output tokens with
+natural EOS. All cases use the same frozen workload hash, pinned models,
+runtime/code (`1266bc0`), FlashInfer, CUDA graphs, static memory fraction 0.60,
+and 98,304-token capacity. No verification-length audit logging is enabled.
+The fresh adaptive arm makes the throughput comparison instrumentation-matched;
+do not use the earlier instrumented adaptive timing as its speed baseline.
+
+Launch wrapper: `scripts/run_postdraft_serving_nrp.sh`, bounded to 5,400 seconds,
+with run-scoped GPU telemetry, automatic server cleanup, and final throughput
+summary. This is not a recurring monitor. Launch PID: 3017.
+Durable run:
+`/workspace/dflashv2_data/runs/postdraft_serving_20261007/c32_c16_r1`.
+Launch log and GPU CSV are adjacent (`c32_c16_r1.launch.log`,
+`c32_c16_r1.gpu.csv`). Scratch: `/tmp/postdraft-serving-c32-c16-r1`.
+At 01:26 UTC the first fixed-B8 C32 workload was actively serving, with 88%
+GPU utilization sampled; no completed timed result yet. Read `progress.json`,
+`COMPLETE.json`/`FAILED.json`, and `summary.json`
+before reporting completion or a speedup. Raw prompts/outputs remain on PVC.
