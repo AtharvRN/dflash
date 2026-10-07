@@ -38,8 +38,12 @@ def main():
 
     run('unit', ['-m', 'pytest', '-q', 'tests/test_history_policy.py',
                                'tests/test_policy_granularity.py', 'tests/test_postdraft_serving.py'])
-    run('pretrained', ['scripts/test_history_pretrained.py', '--models', args.models,
-                      '--output', root/'pretrained.json'])
+    # BF16 width-dependent numerical divergence is recorded, never called exact.
+    # Require strict FP32 AR parity as well as probe invariance in both precisions.
+    run('pretrained_bf16', ['scripts/test_history_pretrained.py', '--models', args.models,
+                      '--output', root/'pretrained_bf16.json', '--allow-ar-mismatch'])
+    run('pretrained_fp32', ['scripts/test_history_pretrained.py', '--models', args.models,
+                      '--output', root/'pretrained_fp32.json', '--dtype', 'float32'])
     common = ['--manifest', args.data_root/'manifests/qwen3_4b_instruct_100k_messages.jsonl',
               '--split-dir', args.data_root/'splits/qwen3_4b_instruct100k_full_4a100_manifest_seed0_val5pct_20260719',
               '--pilot-manifest', args.data_root/'runs/prefusion_pilot_20260915/cache/manifest.json',
