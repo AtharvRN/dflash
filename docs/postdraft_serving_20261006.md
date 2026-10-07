@@ -227,3 +227,39 @@ Local aggregate-only evidence:
 The local export of raw prompts/outputs was blocked by approval review and was
 not performed. Raw evidence remains on the PVC. The server and bounded telemetry
 were stopped after completion; no GPU process remained.
+
+### C32/C16 extension (same pod, 2026-10-07 UTC)
+
+Completed `c32_c16_r1`: 512 prompts, 128 disjoint warmup prompts, two repeats at
+each concurrency, unchanged raw-confidence threshold and full B16 drafting.
+Compared configuration records directly: identical workload hash, models,
+environment, code commit (`1266bc0`), GPU and memory settings to `main_r1` above.
+Only output/scratch paths and concurrency arguments differed. The server's
+maximum request count and largest captured request-count bucket were 32
+(rather than 128 in the C64/C128 run); integer length buckets remain 1–16.
+
+| Pooled metric across two repeats | C16 | C32 |
+| --- | ---: | ---: |
+| Counted request-cycles | 106,585 | 106,881 |
+| Selected verification positions | 567,331 | 566,051 |
+| Accepted draft proposals | 323,173 | 322,310 |
+| **Mean selected verification length, anchor included** | **5.322803** | **5.296086** |
+| Mean selected proposals, anchor excluded | 4.322803 | 4.296086 |
+| Mean accepted draft proposals | 3.032068 | 3.015597 |
+| Accepted / selected proposals | 70.1412% | 70.1940% |
+| Packed rows / counted cycle | 5.853310 | 5.846876 |
+| Executed graph rows / counted cycle | 5.927213 | 6.259840 |
+
+All 2,048 responses passed exact per-request cycle/accepted-count checks.
+All recorded verification batches used CUDA graphs; no mixed-phase batches,
+KV retractions, or runtime assertions/errors were found. Selected averages
+exclude warmup and graph padding; physical totals include discarded overlap
+work as in the previous audit. No new fixed-width controls were run, and
+instrumented HTTP timings are not a matched speedup result. Differences of
+this size between concurrency levels do not establish a systematic trend.
+
+Full evidence remains at:
+`/workspace/dflashv2_data/runs/postdraft_verify_lengths_20261007/c32_c16_r1`.
+Local aggregate-only evidence:
+`outputs/postdraft_verify_lengths_20261007/c32_c16_verify_length_summary.json`.
+The server exited and run-scoped telemetry was stopped; the GPU was released.
