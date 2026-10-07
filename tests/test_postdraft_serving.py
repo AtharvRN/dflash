@@ -11,6 +11,28 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from prepare_postdraft_serving import prepare
 
 
+def test_frozen_workload_full_copy_and_disjoint_prefix(tmp_path):
+    from benchmark_postdraft_serving import workload, sha
+    source = tmp_path / "frozen.json"
+    saved = {"warmup": [{"prompt_id": str(i)} for i in range(4)],
+             "measurement": [{"prompt_id": str(i)} for i in range(4, 12)]}
+    source.write_text(json.dumps(saved))
+    full = tmp_path / "full"
+    full.mkdir()
+    args = SimpleNamespace(workload_file=source, output=full, warmup=4, requests=8)
+    assert workload(args, None) == (saved["warmup"], saved["measurement"])
+    assert (full / "workload.json").read_bytes() == source.read_bytes()
+    small = tmp_path / "small"
+    small.mkdir()
+    args.output, args.warmup, args.requests = small, 2, 3
+    warmup, measured = workload(args, None)
+    assert warmup == saved["warmup"][:2] and measured == saved["measurement"][:3]
+    assert json.loads((small / "workload.json").read_text())["parent_workload_sha256"] == sha(source)
+    args.requests = 9
+    with pytest.raises(ValueError):
+        workload(args, None)
+
+
 def test_extension_restores_and_parses(tmp_path):
     dst = tmp_path / "source"
     manifest = prepare(dst)
