@@ -76,4 +76,25 @@ Cluster PVC (`/workspace`, not local Mac):
 - Original frozen workload:
   `/workspace/dflashv2_data/runs/gsm8k_serving_20261007/workload.json`
 
-Results are pending; no adaptive tokens/s claim is made in this note.
+## Launch validation results
+
+- CPU regression run: 41 passed, one CUDA-only test skipped. Subsequently
+  added acceptance-diagnostic unit test also passes.
+- A100 entropy/state/artifact tests: five passed before adding the isolated
+  emitted-token diagnostic.
+- Initial 8-question, 64-output-token smoke completed all three servers.
+  Adaptive matched AR text on 6/8; fixed B8 matched on 8/8. The two adaptive
+  differences are wording changes; their cause is not established by this
+  smoke. Do not claim exact output parity or silently attribute them to BF16.
+- Follow-up 32-question/max128 diagnostic independently recomputed each
+  cycle's first rejection and checked the emitted accepted prefix plus bonus
+  against the actual target logits. **1,184 request-cycles passed across 80
+  batches, including 58 mixed-length batches** (includes health/warmup).
+  This checks acceptance/emission indexing, not full KV-state parity to AR.
+  Root: `/workspace/dflashv2_data/runs/history_serving_20261008_acceptance_check`.
+- Diagnostic hooks are disabled in the full study. Existing SGLang
+  `spec_num_proposed_drafts`/accept-ratio metadata still assumes the configured
+  maximum B and must not be used for adaptive acceptance ratios. Completion
+  token counts and workload wall time are the throughput numerator/denominator.
+
+Full measurement results are pending; no adaptive tokens/s claim is made here.
