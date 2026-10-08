@@ -97,4 +97,20 @@ Cluster PVC (`/workspace`, not local Mac):
   maximum B and must not be used for adaptive acceptance ratios. Completion
   token counts and workload wall time are the throughput numerator/denominator.
 
-Full measurement results are pending; no adaptive tokens/s claim is made here.
+## First actual throughput result (C64, 2026-10-08)
+
+Both adaptive repeats completed the full 1,319-question test workload with
+profiling and the acceptance diagnostic disabled:
+
+| Repeat | Output tokens | Workload wall seconds | Output tokens/s |
+| --- | ---: | ---: | ---: |
+| 0 | 390,406 | 68.42937 | 5,705.24 |
+| 1 | 389,305 | 68.69125 | 5,667.46 |
+| Pooled | 779,711 | 137.12062 | **5,686.31** |
+
+Strict boxed-answer accuracy across repeats: 89.348%; output-cap fraction:
+3.525%. Repeats are the same 1,319 questions, not 2,638 unique questions.
+There is not yet a completed matched fixed-B throughput/accuracy comparison.
+These are **actual HTTP throughput**, not the earlier cost-model proxy.
+Do not compare against the earlier profiled/train-subset wall-clock figures.
+The fixed controls and subsequent concurrency phases remain queued/running.
