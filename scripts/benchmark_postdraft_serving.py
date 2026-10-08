@@ -123,7 +123,7 @@ def main():
     parser.add_argument("--models", type=Path, default=ROOT / "configs/rejected_trace_nrp_models.json")
     parser.add_argument("--manifest", type=Path, default=Path("/workspace/dflashv2_data/manifests/qwen3_4b_instruct_100k_messages.jsonl"))
     parser.add_argument("--split", type=Path, default=Path("/workspace/dflashv2_data/splits/qwen3_4b_instruct100k_full_4a100_manifest_seed0_val5pct_20260719/val_prompt_ids.json"))
-    parser.add_argument("--cases", nargs="+", choices=["fixed16", "fixed12", "fixed8", "raw", "raw_no_trim", "target_ar"], default=["fixed16", "raw", "fixed12", "fixed8"])
+    parser.add_argument("--cases", nargs="+", choices=["fixed16", "fixed12", "fixed8", "fixed4", "raw", "raw_no_trim", "target_ar"], default=["fixed16", "raw", "fixed12", "fixed8"])
     parser.add_argument("--concurrencies", nargs="+", type=int, default=[128, 64])
     parser.add_argument("--requests", type=int, default=512)
     parser.add_argument("--warmup", type=int, default=128)
@@ -133,10 +133,18 @@ def main():
     parser.add_argument("--eager", action="store_true")
     parser.add_argument("--port", type=int, default=22508)
     parser.add_argument("--verify-length-audit", action="store_true")
+    parser.add_argument("--cycle-cost-profile", action="store_true",
+                        help="Separate instrumented fixed-B worker-cycle cost run; NOT clean throughput")
+    parser.add_argument('--runtime-site-packages', nargs='+', default=[],
+                        help='Explicit ordered dependency paths for staged container environments')
     parser.add_argument("--workload-file", type=Path)
     parser.add_argument("--mem-fraction-static", type=float, default=.50)
     parser.add_argument("--max-total-tokens", type=int, default=262144)
     args = parser.parse_args()
+    if any(not Path(path).is_dir() for path in args.runtime_site_packages):
+        raise ValueError('Missing runtime dependency directory')
+    if args.cycle_cost_profile and (args.verify_length_audit or any(not c.startswith('fixed') for c in args.cases)):
+        raise ValueError('Cycle costs require fixed-B cases without another instrumentation mode')
     args.output.mkdir(parents=True, exist_ok=False)
     args.scratch.mkdir(parents=True, exist_ok=False)
     models = json.loads(args.models.read_text())
@@ -151,7 +159,8 @@ def main():
     runtime = args.scratch / "cache"
     runtime.mkdir()
     env = {k:v for k,v in os.environ.items() if not k.startswith(("DFLASH_", "SGLANG_DFLASH_"))}
-    env.update(PYTHONPATH=str(args.scratch / "source/python"), PYTHONDONTWRITEBYTECODE="1",
+    runtime_path = ':'.join([str(args.scratch / 'source/python'), *args.runtime_site_packages])
+    env.update(PYTHONPATH=runtime_path, PYTHONDONTWRITEBYTECODE="1",
                SGLANG_ENABLE_SPEC_V2="1", SGLANG_ENABLE_DFLASH_SPEC_V2="1", SGLANG_DFLASH_TIMING="0",
                NVIDIA_TF32_OVERRIDE="0", HF_HUB_OFFLINE="1", TOKENIZERS_PARALLELISM="false",
                OMP_NUM_THREADS="4", MKL_NUM_THREADS="4", XDG_CACHE_HOME=str(runtime))
@@ -165,6 +174,11 @@ def main():
     for case in args.cases:
         case_dir = args.output / case
         case_dir.mkdir()
+        if args.cycle_cost_profile:
+            profile_dir = case_dir / 'cycle_profile'
+            profile_dir.mkdir()
+            env.update(DFLASH_V2_PROFILE='1', DFLASH_V2_PROFILE_DIR=str(profile_dir),
+                       PYTHONPATH=f'{ROOT}/scripts/sglang_v2_profile_hook:{runtime_path}')
         if args.verify_length_audit:
             env["SGLANG_DFLASH_VERIFY_AUDIT_PATH"] = str(case_dir / "verify_lengths.jsonl")
         block = int(case[5:]) if case.startswith("fixed") else 16
@@ -204,12 +218,18 @@ def main():
                 save(case_dir / "server_info.json", requests.get(base + "/get_server_info", timeout=30).json())
                 for concurrency in args.concurrencies:
                     print(f"WARMUP {case} C{concurrency}", flush=True)
+                    if args.cycle_cost_profile:
+                        save(profile_dir / 'control.json', {'label': f'warmup_b{block}_c{concurrency}'})
                     run_requests(base, warmup, concurrency, min(64, args.max_new_tokens),
                                  f"{case}_c{concurrency}_warmup" if args.verify_length_audit else None)
                     for repeat in range(args.repeats):
+                        if args.cycle_cost_profile:
+                            save(profile_dir / 'control.json', {'label': f'measured_b{block}_c{concurrency}_r{repeat}'})
                         result = run_requests(base, measured, concurrency, args.max_new_tokens,
                                              f"{case}_c{concurrency}_r{repeat}" if args.verify_length_audit else None)
                         result["measurement_kind"] = "instrumented_length_audit" if args.verify_length_audit else "throughput"
+                        if args.cycle_cost_profile:
+                            result['measurement_kind'] = 'instrumented_worker_cycle_cost; not clean throughput'
                         result.update(case=case, repeat=repeat, workload_sha256=sha(args.output / "workload.json"))
                         save(case_dir / f"c{concurrency}_r{repeat}.json", result)
                         brief = {k:v for k,v in result.items() if k != "results"}

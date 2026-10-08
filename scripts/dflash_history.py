@@ -99,6 +99,26 @@ def load_runs(paths):
 
 def selection(args):
     costs = None
+    if getattr(args, "priced_policy", None):
+        from dflash.history_priced import validate_profile
+        frozen = json.loads(args.priced_policy.read_text())
+        if args.mode != "priced" or args.rho is not None or args.history_free:
+            raise ValueError("frozen priced policy requires --mode priced; do not override rho/history-free")
+        if not args.cost_profile or frozen.get("schema_version") != 1 or frozen["bindings"] != {
+            "table_sha256": digest(args.table), "cost_profile_sha256": digest(args.cost_profile)
+        }:
+            raise ValueError("frozen policy table/profile binding mismatch")
+        if args.concurrency != frozen["concurrency"]:
+            raise ValueError("frozen cost-profile concurrency mismatch")
+        profile = json.loads(args.cost_profile.read_text())
+        table = HistoryValueTable(json.loads(args.table.read_text()))
+        costs = validate_profile(profile, table, args.concurrency)
+        for path, expected in profile["source_hashes"].items():
+            if digest(args.cost_profile.parent / path) != expected:
+                raise ValueError("cost measurement source hash mismatch")
+        policy = frozen["policies"][args.policy_name]
+        return dict(mode="priced", costs_ms=costs, rho=policy["rho"],
+                    history_free=policy["history_free"])
     if args.cost_profile:
         profile = json.loads(args.cost_profile.read_text())
         if profile.get("units") != "ms" or profile.get("scope") != "whole_cycle":
@@ -129,6 +149,9 @@ def main():
             c.add_argument("--cost-profile", type=Path)
             c.add_argument("--concurrency", type=int, default=1)
             c.add_argument("--history-free", action="store_true", help="Ablation: use global progress means, ignoring history")
+            c.add_argument("--priced-policy", type=Path,
+                           help="Frozen artifact from calibrate_history_priced.py; requires --mode priced")
+            c.add_argument("--policy-name", choices=("history", "history_free"), default="history")
         if name in ("collect", "rollout"):
             c.add_argument("--manifest", type=Path, required=True)
             c.add_argument("--split-dir", type=Path, required=True)
