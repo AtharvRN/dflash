@@ -34,6 +34,14 @@ def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def backup_cycle_profile(source, destination):
+    """Keep per-cycle control/trace I/O local; persist snapshots after each phase."""
+    destination.mkdir(parents=True, exist_ok=True)
+    for path in source.iterdir():
+        if path.is_file() and path.suffix in ('.json', '.jsonl'):
+            shutil.copy2(path, destination / path.name)
+
+
 def workload(args, model):
     if args.workload_file:
         saved = json.loads(args.workload_file.read_text())
@@ -175,7 +183,7 @@ def main():
         case_dir = args.output / case
         case_dir.mkdir()
         if args.cycle_cost_profile:
-            profile_dir = case_dir / 'cycle_profile'
+            profile_dir = args.scratch / f'{case}_cycle_profile'
             profile_dir.mkdir()
             env.update(DFLASH_V2_PROFILE='1', DFLASH_V2_PROFILE_DIR=str(profile_dir),
                        PYTHONPATH=f'{ROOT}/scripts/sglang_v2_profile_hook:{runtime_path}')
@@ -232,6 +240,8 @@ def main():
                             result['measurement_kind'] = 'instrumented_worker_cycle_cost; not clean throughput'
                         result.update(case=case, repeat=repeat, workload_sha256=sha(args.output / "workload.json"))
                         save(case_dir / f"c{concurrency}_r{repeat}.json", result)
+                        if args.cycle_cost_profile:
+                            backup_cycle_profile(profile_dir, case_dir / 'cycle_profile')
                         brief = {k:v for k,v in result.items() if k != "results"}
                         summaries.append(brief)
                         save(args.output / "progress.json", summaries)
@@ -251,6 +261,8 @@ def main():
                 except ProcessLookupError:
                     pass
                 process = None
+            if args.cycle_cost_profile:
+                backup_cycle_profile(profile_dir, case_dir / 'cycle_profile')
     save(args.output / "COMPLETE.json", summaries)
 
 

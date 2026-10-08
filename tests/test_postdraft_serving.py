@@ -11,6 +11,20 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from prepare_postdraft_serving import prepare
 
 
+def test_cycle_profile_backup_preserves_local_trace(tmp_path):
+    from benchmark_postdraft_serving import backup_cycle_profile
+    source, destination = tmp_path/'scratch', tmp_path/'durable'
+    source.mkdir()
+    (source/'cycles_1.jsonl').write_text('{"cycle":1}\n')
+    (source/'control.json').write_text('{"label":"measured"}')
+    backup_cycle_profile(source, destination)
+    assert (destination/'cycles_1.jsonl').read_bytes() == (source/'cycles_1.jsonl').read_bytes()
+    with (source/'cycles_1.jsonl').open('a') as f:
+        f.write('{"cycle":2}\n')
+    backup_cycle_profile(source, destination)
+    assert len((destination/'cycles_1.jsonl').read_text().splitlines()) == 2
+
+
 def test_frozen_workload_full_copy_and_disjoint_prefix(tmp_path):
     from benchmark_postdraft_serving import workload, sha
     source = tmp_path / "frozen.json"
