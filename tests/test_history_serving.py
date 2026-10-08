@@ -97,3 +97,15 @@ def test_frozen_bindings_fail_closed(modules,tmp_path):
     table.write_text('{}');profile.write_text('{}');frozen.write_text(json.dumps(dict(schema_version=1,bindings={})))
     with pytest.raises(ValueError,match='binding mismatch'):
         mod.load_artifacts(table,profile,frozen)
+
+
+def test_diagnostic_checks_emitted_tokens(modules):
+    torch,mod,hm=modules
+    policy=mod.DFlashHistoryPolicy(table_fixture(hm),{4:1.,8:2.,12:3.,16:4.},.3,capacity=3,device='cpu')
+    logits=torch.eye(4)*10
+    # draft proposal 0 accepted, 3 rejected against target 1; emit [0,1].
+    args=(torch.tensor([4]),torch.tensor([1]),logits,torch.tensor([0,4]),None,
+          torch.tensor([2,0,3,0]))
+    policy.check_emission(*args,torch.tensor([0,1]),True)
+    with pytest.raises(AssertionError,match='Emitted'):
+        policy.check_emission(*args,torch.tensor([0,2]),True)

@@ -7,6 +7,8 @@ correction/bonus distribution). No rejected-prefix distribution enters history.
 import hashlib
 import json
 import math
+import os
+import logging
 from pathlib import Path
 
 import torch
@@ -83,6 +85,8 @@ class DFlashHistoryPolicy:
         self.count = torch.zeros(capacity, dtype=torch.int64, device=device)
         self.previous_block = torch.zeros_like(self.count)
         self.previous_full = torch.zeros_like(self.count)
+        self.check_acceptance = os.getenv('SGLANG_DFLASH_HISTORY_CHECK') == '1'
+        self.checked_rows = 0
 
     def reset(self, indices):
         self.count[indices] = 0
@@ -96,7 +100,11 @@ class DFlashHistoryPolicy:
         bins = torch.bucketize(certainty.contiguous(), self.edges, right=True)
         return self.actions[n, bins, self.previous_block[indices], self.previous_full[indices]]
 
-    def observe(self, indices, blocks, accepted, logits, offsets, real_indices=None):
+    def observe(self, indices, blocks, accepted, logits, offsets, real_indices=None,
+                candidates=None, output_tokens=None, packed=False):
+        if self.check_acceptance:
+            self.check_emission(blocks, accepted, logits, offsets, real_indices,
+                                candidates, output_tokens, packed)
         ent = row_entropy(logits)
         if real_indices is not None:
             ent = ent.index_select(0, real_indices)
@@ -112,3 +120,26 @@ class DFlashHistoryPolicy:
         self.count[indices] = (self.count[indices] + 1).clamp_max(2)
         self.previous_block[indices] = blocks
         self.previous_full[indices] = (accepted == blocks - 1).long()
+
+    def check_emission(self, blocks, accepted, logits, offsets, real_indices,
+                       candidates, output_tokens, packed):
+        """Diagnostic only: independent first-rejection and emitted-token oracle."""
+        pred = logits.argmax(-1)
+        if real_indices is not None:
+            pred = pred[real_indices]
+        candidates = candidates.reshape(-1)
+        emitted = output_tokens.reshape(-1)
+        cursor = 0
+        for i, (b, a, off) in enumerate(zip(blocks.tolist(), accepted.tolist(), offsets[:-1].tolist())):
+            draft, target = candidates[off:off+b], pred[off:off+b]
+            expected_a = int((draft[1:] == target[:-1]).long().cumprod(0).sum().item())
+            if a != expected_a:
+                raise AssertionError(f'First-rejection mismatch: {a} != {expected_a}')
+            expected = torch.cat([draft[1:a+1], target[a:a+1]])
+            start = cursor if packed else off
+            if not torch.equal(emitted[start:start+a+1], expected):
+                raise AssertionError('Emitted tokens do not match verified prefix + correction/bonus')
+            cursor += a+1
+        self.checked_rows += len(blocks)
+        logging.getLogger(__name__).info('HISTORY_ACCEPTANCE_CHECK passed cumulative_rows=%s mixed=%s',
+                                        self.checked_rows, len(set(blocks.tolist())) > 1)

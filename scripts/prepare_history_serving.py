@@ -69,7 +69,8 @@ def prepare(destination):
     edit(worker, '        if need_mamba_verify_commit:\n            assert seq_lens_pre_verify is not None\n            self._update_target_mamba_state_after_verify(\n                batch=model_worker_batch,\n                seq_lens_pre_verify=seq_lens_pre_verify,\n                commit_lens=commit_lens,\n            )\n        new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)',
          '''        if self.history_policy is not None:
             self.history_policy.observe(model_worker_batch.req_pool_indices, block_lens, accept_len,
-                                        next_token_logits, offsets, graph_real_indices)
+                                        next_token_logits, offsets, graph_real_indices,
+                                        candidates=draft_tokens, output_tokens=out_tokens, packed=True)
         if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             self._update_target_mamba_state_after_verify(
@@ -83,7 +84,8 @@ def prepare(destination):
             hist_blocks = torch.full((bs,), int(block_size), device=device, dtype=torch.int64)
             hist_offsets = torch.arange(bs+1, device=device, dtype=torch.int64)*int(block_size)
             self.history_policy.observe(model_worker_batch.req_pool_indices, hist_blocks, accept_len,
-                                        logits_output.next_token_logits, hist_offsets)
+                                        logits_output.next_token_logits, hist_offsets,
+                                        candidates=candidates, output_tokens=out_tokens)
         if new_seq_lens is None:
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)''')
     graph = 'model_executor/runner/decode_cuda_graph_runner.py'

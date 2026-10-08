@@ -134,6 +134,7 @@ def main():
     parser.add_argument("--cases", nargs="+", choices=["fixed16", "fixed12", "fixed8", "fixed4", "raw", "raw_no_trim", "target_ar", "history8", "history16", "history32", "history64"], default=["fixed16", "raw", "fixed12", "fixed8"])
     parser.add_argument('--history-artifacts', type=Path, help='Frozen_cC.json and cost_profile.json directory')
     parser.add_argument('--history-table', type=Path)
+    parser.add_argument('--history-acceptance-check', action='store_true', help='Separate diagnostic only; not clean throughput')
     parser.add_argument("--concurrencies", nargs="+", type=int, default=[128, 64])
     parser.add_argument("--requests", type=int, default=512)
     parser.add_argument("--warmup", type=int, default=128)
@@ -209,6 +210,10 @@ def main():
             env.update(SGLANG_DFLASH_HISTORY_TABLE=str(artifact_dir/'table.json'),
                        SGLANG_DFLASH_HISTORY_PROFILE=str(artifact_dir/'cost_profile.json'),
                        SGLANG_DFLASH_HISTORY_FROZEN=str(artifact_dir/f'frozen_c{case[7:]}.json'))
+            if args.history_acceptance_check:
+                env['SGLANG_DFLASH_HISTORY_CHECK'] = '1'
+        else:
+            env.pop('SGLANG_DFLASH_HISTORY_CHECK', None)
         if args.cycle_cost_profile:
             profile_dir = args.scratch / f'{case}_cycle_profile'
             profile_dir.mkdir()
@@ -269,6 +274,8 @@ def main():
                         result["measurement_kind"] = "instrumented_length_audit" if args.verify_length_audit else "throughput"
                         if args.cycle_cost_profile:
                             result['measurement_kind'] = 'instrumented_worker_cycle_cost; not clean throughput'
+                        if args.history_acceptance_check:
+                            result['measurement_kind'] = 'acceptance correctness diagnostic; not clean throughput'
                         result.update(case=case, repeat=repeat, workload_sha256=sha(args.output / "workload.json"))
                         save(case_dir / f"c{concurrency}_r{repeat}.json", result)
                         shutil.copy2(local_server_log, case_dir/'server.log')
