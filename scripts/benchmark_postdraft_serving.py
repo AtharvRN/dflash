@@ -131,7 +131,9 @@ def main():
     parser.add_argument("--models", type=Path, default=ROOT / "configs/rejected_trace_nrp_models.json")
     parser.add_argument("--manifest", type=Path, default=Path("/workspace/dflashv2_data/manifests/qwen3_4b_instruct_100k_messages.jsonl"))
     parser.add_argument("--split", type=Path, default=Path("/workspace/dflashv2_data/splits/qwen3_4b_instruct100k_full_4a100_manifest_seed0_val5pct_20260719/val_prompt_ids.json"))
-    parser.add_argument("--cases", nargs="+", choices=["fixed16", "fixed12", "fixed8", "fixed4", "raw", "raw_no_trim", "target_ar"], default=["fixed16", "raw", "fixed12", "fixed8"])
+    parser.add_argument("--cases", nargs="+", choices=["fixed16", "fixed12", "fixed8", "fixed4", "raw", "raw_no_trim", "target_ar", "history8", "history16", "history32", "history64"], default=["fixed16", "raw", "fixed12", "fixed8"])
+    parser.add_argument('--history-artifacts', type=Path, help='Frozen_cC.json and cost_profile.json directory')
+    parser.add_argument('--history-table', type=Path)
     parser.add_argument("--concurrencies", nargs="+", type=int, default=[128, 64])
     parser.add_argument("--requests", type=int, default=512)
     parser.add_argument("--warmup", type=int, default=128)
@@ -156,7 +158,26 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     args.scratch.mkdir(parents=True, exist_ok=False)
     models = json.loads(args.models.read_text())
-    extension = prepare(args.scratch / "source")
+    if any(c.startswith('history') for c in args.cases):
+        if args.history_artifacts is None or args.history_table is None:
+            raise ValueError('History serving needs frozen artifacts and table')
+        if any(int(c[7:]) not in args.concurrencies for c in args.cases if c.startswith('history')):
+            raise ValueError('Each history case needs its calibrated concurrency in --concurrencies')
+        from prepare_history_serving import prepare as prepare_history
+        extension = prepare_history(args.scratch / "source")
+        table_identity = json.loads(args.history_table.read_text())['provenance']['model_identity']
+        for role in ('target', 'draft'):
+            if any(models[role][k] != table_identity[role][k] for k in ('repo', 'revision')):
+                raise ValueError('Serving models differ from frozen history table')
+        artifact_dir = args.output/'frozen_history'
+        artifact_dir.mkdir()
+        shutil.copy2(args.history_table, artifact_dir/'table.json')
+        shutil.copy2(args.history_artifacts/'cost_profile.json', artifact_dir/'cost_profile.json')
+        for c in args.cases:
+            if c.startswith('history'):
+                shutil.copy2(args.history_artifacts/f'frozen_c{c[7:]}.json', artifact_dir/f'frozen_c{c[7:]}.json')
+    else:
+        extension = prepare(args.scratch / "source")
     warmup, measured = workload(args, models["target"]["path"])
     save(args.output / "config.json", {"args": vars(args) | {k: str(v) for k,v in vars(args).items() if isinstance(v, Path)},
          "models": models, "extension": extension, "workload_sha256": sha(args.output / "workload.json"),
@@ -182,6 +203,12 @@ def main():
     for case in args.cases:
         case_dir = args.output / case
         case_dir.mkdir()
+        for key in ('SGLANG_DFLASH_HISTORY_TABLE', 'SGLANG_DFLASH_HISTORY_PROFILE', 'SGLANG_DFLASH_HISTORY_FROZEN'):
+            env.pop(key, None)
+        if case.startswith('history'):
+            env.update(SGLANG_DFLASH_HISTORY_TABLE=str(artifact_dir/'table.json'),
+                       SGLANG_DFLASH_HISTORY_PROFILE=str(artifact_dir/'cost_profile.json'),
+                       SGLANG_DFLASH_HISTORY_FROZEN=str(artifact_dir/f'frozen_c{case[7:]}.json'))
         if args.cycle_cost_profile:
             profile_dir = args.scratch / f'{case}_cycle_profile'
             profile_dir.mkdir()
@@ -224,7 +251,8 @@ def main():
                         raise TimeoutError("Server startup exceeded 900s")
                     time.sleep(2)
                 save(case_dir / "server_info.json", requests.get(base + "/get_server_info", timeout=30).json())
-                for concurrency in args.concurrencies:
+                case_concurrencies = [int(case[7:])] if case.startswith('history') else args.concurrencies
+                for concurrency in case_concurrencies:
                     print(f"WARMUP {case} C{concurrency}", flush=True)
                     if args.cycle_cost_profile:
                         save(profile_dir / 'control.json', {'label': f'warmup_b{block}_c{concurrency}'})
