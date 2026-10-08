@@ -25,7 +25,10 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     for name in ('output', 'scratch', 'collection', 'dataset', 'models'):
         p.add_argument('--'+name, type=Path, required=True)
-    p.add_argument('--collector-pid', type=int, required=True)
+    p.add_argument('--collector-pid', type=int,
+                   help='Required only when collection is still running')
+    p.add_argument('--workload-file', type=Path,
+                   help='Reuse the previously frozen train-only tokenized cost workload')
     p.add_argument('--runtime-site-packages', nargs='+', default=[])
     p.add_argument('--deadline-unix', type=float, required=True,
                    help='Hard stop before pod deadline, including child cleanup allowance')
@@ -54,6 +57,8 @@ def main():
     try:
         phase('waiting_for_collection')
         while not (a.collection/'complete.json').exists():
+            if a.collector_pid is None:
+                raise ValueError('Collection is incomplete and no collector PID was supplied')
             proc = Path(f'/proc/{a.collector_pid}/cmdline')
             if not proc.exists() or b'run_gsm8k_history.py' not in proc.read_bytes():
                 raise RuntimeError('Collector ended without completion; preserving partial evidence')
@@ -83,21 +88,27 @@ def main():
             expected[group] = [str(r['manifest_index']) for r in prompts]
             save(a.output/f'{group}_ids.json', expected[group])
             paths[group] = sorted(a.collection.glob(f'{group}_[0-9][0-9][0-9][0-9]'))
-        from transformers import AutoTokenizer
         models = json.loads(a.models.read_text())
-        tokenizer = AutoTokenizer.from_pretrained(models['target']['path'], local_files_only=True)
         cal = select_prompts(a.dataset/'messages.jsonl', a.dataset, 'calibration',
                             a.dataset/'evaluation_groups.json', 512, 1007)
-        prompts = []
-        for row in cal[:320]:
-            ids = tokenizer.apply_chat_template(row['messages'], tokenize=True, return_dict=False,
-                                                add_generation_prompt=True, enable_thinking=False)
-            if not 1 <= len(ids) <= 2048:
-                raise ValueError('Unexpected calibration prompt length')
-            prompts.append(dict(prompt_id=str(row['manifest_index']), input_ids=ids))
-        save(a.output/'workload.json', dict(warmup=prompts[:64], measurement=prompts[64:],
-            selection='First 320 seed1007-selected GSM8K train calibration prompts; first64 warmup, next256 measured; no test questions',
-            messages_sha256=digest(a.dataset/'messages.jsonl')))
+        if a.workload_file:
+            workload = json.loads(a.workload_file.read_text())
+            validate_frozen_workload(workload, cal, digest(a.dataset/'messages.jsonl'))
+            save(a.output/'workload_binding.json', dict(source=str(a.workload_file), sha256=digest(a.workload_file)))
+        else:
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(models['target']['path'], local_files_only=True)
+            prompts = []
+            for row in cal[:320]:
+                ids = tokenizer.apply_chat_template(row['messages'], tokenize=True, return_dict=False,
+                                                    add_generation_prompt=True, enable_thinking=False)
+                if not 1 <= len(ids) <= 2048:
+                    raise ValueError('Unexpected calibration prompt length')
+                prompts.append(dict(prompt_id=str(row['manifest_index']), input_ids=ids))
+            workload = dict(warmup=prompts[:64], measurement=prompts[64:],
+                selection='First 320 seed1007-selected GSM8K train calibration prompts; first64 warmup, next256 measured; no test questions',
+                messages_sha256=digest(a.dataset/'messages.jsonl'))
+        save(a.output/'workload.json', workload)
         phase('profiling_fixed_blocks')
         command = [sys.executable, '-u', 'scripts/benchmark_postdraft_serving.py',
             '--output', str(a.output/'profile'), '--scratch', str(a.scratch), '--models', str(a.models),
@@ -141,6 +152,19 @@ def main():
                 child.wait(timeout=35)
             except subprocess.TimeoutExpired:
                 os.killpg(child.pid, signal.SIGKILL)
+
+
+def validate_frozen_workload(workload, cal, messages_hash):
+    if workload.get('messages_sha256') != messages_hash:
+        raise ValueError('Frozen workload messages binding changed')
+    if len(workload['warmup']) != 64 or len(workload['measurement']) != 256:
+        raise ValueError('Expected exactly 64 warmup and 256 measurement prompts')
+    prompts = workload['warmup'] + workload['measurement']
+    if [r['prompt_id'] for r in prompts] != [str(r['manifest_index']) for r in cal[:320]]:
+        raise ValueError('Frozen cost workload must match the preselected calibration-only prompts')
+    if any(not 1 <= len(r['input_ids']) <= 2048 or
+           any(type(t) is not int or t < 0 for t in r['input_ids']) for r in prompts):
+        raise ValueError('Invalid frozen input tokens')
 
 
 if __name__ == '__main__':

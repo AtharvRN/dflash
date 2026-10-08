@@ -68,3 +68,16 @@ def test_rejects_eager_fallback_and_model_mismatch(tmp_path):
     dump(tmp_path/'draft/config.json', {'changed': True})
     with pytest.raises(ValueError, match='config hash'):
         export(run, table, tmp_path/'profile.json', minimum_cycles=1)
+
+
+def test_reuse_frozen_train_workload_does_not_retokenize():
+    from scripts.run_history_priced_study import validate_frozen_workload
+    cal = [dict(manifest_index=f'train_{i}') for i in range(512)]
+    prompts = [dict(prompt_id=f'train_{i}', input_ids=[1,2,3]) for i in range(320)]
+    workload = dict(warmup=prompts[:64], measurement=prompts[64:], messages_sha256='bound')
+    validate_frozen_workload(workload, cal, 'bound')
+    with pytest.raises(ValueError, match='binding'):
+        validate_frozen_workload(workload, cal, 'changed')
+    workload['measurement'][0]['prompt_id'] = 'test_1'
+    with pytest.raises(ValueError, match='calibration-only'):
+        validate_frozen_workload(workload, cal, 'bound')
