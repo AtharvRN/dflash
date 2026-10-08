@@ -22,7 +22,9 @@ def save(path, value):
     temporary.replace(path)
 
 
-def select_prompts(manifest, split_dir, group, pilot_manifest, limit, seed):
+def select_prompts(manifest, split_dir, group, pilot_manifest, limit, seed, offset=0):
+    if offset < 0:
+        raise ValueError('prompt offset must be nonnegative')
     train = set(map(str, json.loads((split_dir / "train_prompt_ids.json").read_text())["train_prompt_ids"]))
     val = set(map(str, json.loads((split_dir / "val_prompt_ids.json").read_text())["val_prompt_ids"]))
     if train & val:
@@ -67,7 +69,7 @@ def select_prompts(manifest, split_dir, group, pilot_manifest, limit, seed):
             unique.add(h)
             eligible.append(row)
     random.Random(seed).shuffle(eligible)
-    return eligible[:limit]
+    return eligible[offset:offset+limit]
 
 
 def load_runs(paths):
@@ -134,6 +136,7 @@ def main():
             c.add_argument("--models", type=Path, required=True, help="Existing pinned local models.json")
             c.add_argument("--group", choices=("train", "calibration", "assessment"), required=True)
             c.add_argument("--limit-prompts", type=int, default=16)
+            c.add_argument("--prompt-offset", type=int, default=0)
             c.add_argument("--max-new-tokens", type=int, default=256)
             c.add_argument("--max-prompt-tokens", type=int, default=2048)
             c.add_argument("--max-cycles", type=int, default=32)
@@ -175,7 +178,7 @@ def main():
     if args.fixed_block is not None and args.fixed_block not in blocks:
         raise ValueError("fixed block must be one of the candidate sizes")
     prompts = select_prompts(args.manifest, args.split_dir, args.group, args.pilot_manifest,
-                             args.limit_prompts, args.seed)
+                             args.limit_prompts, args.seed, args.prompt_offset)
     if not prompts:
         raise ValueError("no eligible prompts")
     models = json.loads(args.models.read_text())
@@ -233,6 +236,7 @@ def main():
                 enable_thinking=False, tokenize=True, return_tensors="pt").to(args.device)
             if ids.shape[1] > args.max_prompt_tokens:
                 summaries.append({"prompt_id": pid, "skipped": "prompt_length"})
+                save(args.output/"progress.json", summaries)
                 continue
             rng = random.Random(f"{args.seed}:{pid}")
 
