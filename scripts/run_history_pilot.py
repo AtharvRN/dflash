@@ -9,7 +9,14 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.dflash_history import load_runs, save
-from dflash.history_policy import HistoryValueTable, evaluate_rows
+from dflash.history_policy import HistoryValueTable, blocks_checked, evaluate_rows
+
+
+def pilot_blocks(value):
+    blocks = blocks_checked(tuple(map(int, value.split(','))))
+    if blocks[-1] != 16:
+        raise ValueError('this pilot requires B16 as its largest/reference block')
+    return blocks
 
 
 def main():
@@ -17,11 +24,13 @@ def main():
     p.add_argument('--root', type=Path, required=True)
     p.add_argument('--models', type=Path, required=True)
     p.add_argument('--data-root', type=Path, default=Path('/workspace/dflashv2_data'))
+    p.add_argument('--blocks', type=pilot_blocks, default=tuple(range(2, 17)),
+                   help='Allowed collection and policy blocks; e.g. 4,8,12,16. Largest must be 16.')
     args = p.parse_args()
     root = args.root
     root.mkdir(parents=True, exist_ok=False)
     repo = Path(__file__).resolve().parents[1]
-    blocks = tuple(range(2, 17))
+    blocks = args.blocks
     block_text = ','.join(map(str, blocks))
     save(root/'plan.json', dict(blocks=blocks, train_prompts=64, calibration_prompts=16,
         assessment_prompts=32, collection_max_cycles=24, max_new_tokens=256,
@@ -41,9 +50,9 @@ def main():
     # BF16 width-dependent numerical divergence is recorded, never called exact.
     # Require strict FP32 AR parity as well as probe invariance in both precisions.
     run('pretrained_bf16', ['scripts/test_history_pretrained.py', '--models', args.models,
-                      '--output', root/'pretrained_bf16.json', '--allow-ar-mismatch'])
+                      '--output', root/'pretrained_bf16.json', '--allow-ar-mismatch', '--blocks', block_text])
     run('pretrained_fp32', ['scripts/test_history_pretrained.py', '--models', args.models,
-                      '--output', root/'pretrained_fp32.json', '--dtype', 'float32'])
+                      '--output', root/'pretrained_fp32.json', '--dtype', 'float32', '--blocks', block_text])
     common = ['--manifest', args.data_root/'manifests/qwen3_4b_instruct_100k_messages.jsonl',
               '--split-dir', args.data_root/'splits/qwen3_4b_instruct100k_full_4a100_manifest_seed0_val5pct_20260719',
               '--pilot-manifest', args.data_root/'runs/prefusion_pilot_20260915/cache/manifest.json',
@@ -81,7 +90,7 @@ def main():
     jobs = []
     for name, options in selections.items():
         jobs.append((name, ['--alpha', options['alpha']] + (['--history-free'] if options['history_free'] else [])))
-    for b in (4, 8, 12, 16):
+    for b in (b for b in (4, 8, 12, 16) if b in blocks):
         jobs.append((f'fixed{b}', ['--fixed-block', b]))
     def rollout(item):
         name, extra = item

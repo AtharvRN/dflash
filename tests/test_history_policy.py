@@ -10,6 +10,15 @@ import pytest
 from dflash.history_policy import History, HistoryValueTable, evaluate_rows, select_block
 
 
+def test_pilot_configurable_blocks():
+    from scripts.run_history_pilot import pilot_blocks
+    assert pilot_blocks('4,8,12,16') == (4, 8, 12, 16)
+    assert pilot_blocks(','.join(map(str, range(2, 17)))) == tuple(range(2, 17))
+    for invalid in ('4,8,12', '4,8,16,24', '8,4,16', '4,4,16', '1,16'):
+        with pytest.raises(ValueError):
+            pilot_blocks(invalid)
+
+
 def row(pid="1", group="train", accepted=(2, 3), history=None, cycle=0):
     return {"schema_version": 1, "outcome_kind": "actual_redraft", "prompt_id": pid,
             "cycle": cycle, "group": group, "history": history or History().snapshot(),

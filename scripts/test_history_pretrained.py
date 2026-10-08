@@ -12,9 +12,12 @@ def main():
     p.add_argument('--models', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--dtype', choices=('bfloat16', 'float32'), default='bfloat16')
+    p.add_argument('--blocks', default=','.join(map(str, range(2, 17))))
     p.add_argument('--allow-ar-mismatch', action='store_true',
                    help='Record numerical divergence; still require exact probe invariance. Pair with strict FP32 test.')
     args = p.parse_args()
+    from dflash.history_policy import blocks_checked
+    blocks = blocks_checked(tuple(map(int, args.blocks.split(','))))
     if args.output.exists():
         raise ValueError('refusing existing evidence')
     import torch
@@ -32,7 +35,8 @@ def main():
     stops = target.generation_config.eos_token_id
     stops = stops if isinstance(stops, list) else [stops] if stops is not None else []
     evidence = {'scope': 'SDPA pretrained greedy correctness, not throughput',
-                'dtype': args.dtype, 'allow_ar_mismatch': args.allow_ar_mismatch, 'tests': []}
+                'dtype': args.dtype, 'blocks': list(blocks),
+                'allow_ar_mismatch': args.allow_ar_mismatch, 'tests': []}
     for prompt in ('What is 17 times 23? Explain briefly.',
                    'Write a Python function that reverses a list without modifying the input.'):
         ids = tokenizer.apply_chat_template([{'role': 'user', 'content': prompt}],
@@ -48,7 +52,6 @@ def main():
             ar = target.generate(ids, attention_mask=torch.ones_like(ids), max_new_tokens=96, do_sample=False,
                                  pad_token_id=tokenizer.eos_token_id)
         handle.remove()
-        blocks = tuple(range(2, 17))
         def choose(h, cycle):
             return blocks[cycle % len(blocks)]
         common = dict(blocks=blocks, choose=choose, max_new_tokens=96, stop_token_ids=stops)
