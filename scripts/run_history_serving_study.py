@@ -29,8 +29,11 @@ def main():
     workload=json.loads(a.workload.read_text())
     if len(workload['measurement'])!=1319 or workload['measurement_split']!='test':
         raise ValueError('Expected complete frozen GSM8K test workload')
+    from gpu_runtime import wait_gpu_runtime
+    allocation=wait_gpu_runtime(wait_seconds=30,use_container_gpu=True,require_gpu=True)
     a.output.mkdir(parents=True)
     a.scratch.mkdir(parents=True)
+    save(a.output/'allocation.json',allocation)
     repo=Path(__file__).resolve().parents[1]
     save(a.output/'plan.json',dict(concurrencies=a.concurrencies,requests=1319,repeats=2,
         workload_sha256=sha(a.workload),deadline_unix=a.deadline_unix,
