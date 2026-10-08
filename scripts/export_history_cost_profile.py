@@ -13,11 +13,46 @@ from dflash.history_priced import validate_profile
 from scripts.dflash_history import digest, save
 
 
-def export(run, table_path, output, minimum_cycles=20):
+def checked_run(run):
+    config = json.loads((run/'config.json').read_text())
+    args = config['args']
+    completed = json.loads((run/'COMPLETE.json').read_text())
+    expected = {(case, c, r) for case in args['cases'] for c in args['concurrencies']
+                for r in range(args['repeats'])}
+    cells = [(r['case'], r['concurrency'], r['repeat']) for r in completed]
+    if set(cells) != expected or len(cells) != len(expected):
+        raise ValueError('Incomplete or duplicate profiling phases')
+    return config
+
+
+def check_supplement(base, extra, config, other):
+    """Match runtime/workload before pooling repeats; never select by observed cost."""
+    for key in ('models', 'extension', 'gpu', 'environment'):
+        if config.get(key) != other.get(key):
+            raise ValueError(f'Supplement runtime mismatch: {key}')
+    for key in ('cycle_cost_profile', 'eager', 'verify_length_audit', 'requests', 'warmup',
+                'max_new_tokens', 'repeats', 'mem_fraction_static', 'max_total_tokens', 'runtime_site_packages'):
+        if config['args'].get(key) != other['args'].get(key):
+            raise ValueError(f'Supplement settings mismatch: {key}')
+    if (not set(other['args']['cases']) <= set(config['args']['cases']) or
+            not set(other['args']['concurrencies']) <= set(config['args']['concurrencies']) or
+            max(other['args']['concurrencies']) != max(config['args']['concurrencies'])):
+        raise ValueError('Supplement must use existing cases/concurrencies and identical max graph batch size')
+    if digest(base/'workload.json') != digest(extra/'workload.json'):
+        raise ValueError('Supplement workload mismatch')
+
+
+def export(run, table_path, output, minimum_cycles=20, supplements=()):
     if output.exists():
         raise ValueError('Refusing existing profile')
-    config = json.loads((run/'config.json').read_text())
-    completed = json.loads((run/'COMPLETE.json').read_text())
+    run_paths = [run, *supplements]
+    if len({p.resolve() for p in run_paths}) != len(run_paths):
+        raise ValueError('Duplicate supplement run')
+    config = checked_run(run)
+    configs = {run: config}
+    for extra in supplements:
+        configs[extra] = checked_run(extra)
+        check_supplement(run, extra, config, configs[extra])
     args = config['args']
     table = HistoryValueTable(json.loads(table_path.read_text()))
     if not args.get('cycle_cost_profile') or args.get('eager'):
@@ -30,28 +65,34 @@ def export(run, table_path, output, minimum_cycles=20):
             raise ValueError('Pinned model mismatch')
         if digest(Path(model['path'])/'config.json') != expected['config_sha256']:
             raise ValueError('Model config hash mismatch')
-    expected_cells = {(case, c, r) for case in args['cases'] for c in args['concurrencies']
-                      for r in range(args['repeats'])}
-    cells = [(r['case'], r['concurrency'], r['repeat']) for r in completed]
-    if set(cells) != expected_cells or len(cells) != len(expected_cells):
-        raise ValueError('Incomplete or duplicate profiling phases')
-    sources = [run/'config.json', run/'COMPLETE.json', run/'workload.json']
+    sources = [p/name for p in run_paths for name in ('config.json', 'COMPLETE.json', 'workload.json')]
     stats, costs = {}, {}
     for case in args['cases']:
         b = int(case[5:])
-        root = run/case/'cycle_profile'
-        hooks = list(root.glob('hook_*.json'))
-        paths = list(root.glob('cycles_*.jsonl'))
-        if len(hooks) != 1 or len(paths) != 1:
-            raise ValueError('Expected one TP1 profiling worker per case')
-        sources.extend(hooks + paths)
-        records = [json.loads(line) for line in paths[0].read_text().splitlines()]
+        by_run, hook_identity = {}, None
+        for path, cfg in configs.items():
+            if case not in cfg['args']['cases']:
+                continue
+            root = path/case/'cycle_profile'
+            hooks = list(root.glob('hook_*.json'))
+            paths = list(root.glob('cycles_*.jsonl'))
+            if len(hooks) != 1 or len(paths) != 1:
+                raise ValueError('Expected one TP1 profiling worker per case')
+            hook = json.loads(hooks[0].read_text())
+            identity = {k:v for k,v in hook.items() if k != 'source_path'}
+            if hook_identity is not None and identity != hook_identity:
+                raise ValueError('Supplement worker/hook identity mismatch')
+            hook_identity = identity
+            sources.extend(hooks + paths)
+            by_run[path] = [json.loads(line) for line in paths[0].read_text().splitlines()]
         for c in args['concurrencies']:
             samples, prefixes, graphs, host = [], [], [], []
             per_repeat = {}
             for repeat in range(args['repeats']):
-                rows = [r for r in records if r['label'] == f'measured_b{b}_c{c}_r{repeat}'
-                        and r['batch_size'] == c]
+                segments = {str(path): [r for r in records if r['label'] == f'measured_b{b}_c{c}_r{repeat}'
+                                       and r['batch_size'] == c]
+                            for path, records in by_run.items() if c in configs[path]['args']['concurrencies']}
+                rows = [r for segment in segments.values() for r in segment]
                 if len(rows) < minimum_cycles:
                     raise ValueError(f'Insufficient full-batch cycles: B{b} C{c} r{repeat}: {len(rows)}')
                 times = []
@@ -65,7 +106,8 @@ def export(run, table_path, output, minimum_cycles=20):
                     host.append(roots[0]['host_call_ms'])
                     prefixes.extend(row['prefix_lens'])
                     graphs.append(row['target_graph'])
-                per_repeat[str(repeat)] = dict(cycles=len(times), mean_ms=statistics.mean(times))
+                per_repeat[str(repeat)] = dict(cycles=len(times), mean_ms=statistics.mean(times),
+                    segments={path:len(segment) for path,segment in segments.items()})
                 samples.extend(times)
             if not all(graphs):
                 raise ValueError(f'Not all full batches used target graphs: B{b} C{c}')
@@ -88,7 +130,9 @@ def export(run, table_path, output, minimum_cycles=20):
         limitations=['Uniform-B trajectories have different prefix/cycle distributions.',
             'Instrumentation overhead not removed; not clean serving throughput.',
             'Mixed-width cost, controller cost, packing and graph-bucket effects unmeasured.'],
-        statistics=stats, source_hashes={str(p.resolve()): digest(p) for p in sources})
+        statistics=stats, source_hashes={str(p.resolve()): digest(p) for p in sources},
+        supplements=[str(p) for p in supplements], minimum_cycles_per_pooled_repeat=minimum_cycles,
+        pooling='All full-batch cycles from original and supplied matched runs, weighted equally; no timing-based selection')
     for c in args['concurrencies']:
         validate_profile(profile, table, c)
     save(output, profile)
@@ -100,5 +144,6 @@ if __name__ == '__main__':
     p.add_argument('--run', type=Path, required=True)
     p.add_argument('--table', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--supplements', type=Path, nargs='*', default=[])
     a = p.parse_args()
-    export(a.run, a.table, a.output)
+    export(a.run, a.table, a.output, supplements=a.supplements)

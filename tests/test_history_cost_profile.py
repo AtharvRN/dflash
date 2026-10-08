@@ -1,4 +1,5 @@
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -81,3 +82,42 @@ def test_reuse_frozen_train_workload_does_not_retokenize():
     workload['measurement'][0]['prompt_id'] = 'test_1'
     with pytest.raises(ValueError, match='calibration-only'):
         validate_frozen_workload(workload, cal, 'bound')
+
+
+def test_pool_extra_cycles_without_overwriting_original(tmp_path):
+    run, table = fixture(tmp_path)
+    extra = tmp_path/'supplement'
+    shutil.copytree(run, extra)
+    hashes = {str(p):digest(p) for p in run.rglob('*') if p.is_file()}
+    result = export(run, table, tmp_path/'profile.json', minimum_cycles=2, supplements=[extra])
+    assert result['statistics']['B8_C8']['cycles'] == 4
+    assert result['statistics']['B8_C8']['per_repeat']['0']['segments'] == {str(run):1,str(extra):1}
+    assert hashes == {str(p):digest(p) for p in run.rglob('*') if p.is_file()}
+    with pytest.raises(ValueError, match='Duplicate'):
+        export(run, table, tmp_path/'other.json', supplements=[run])
+
+
+@pytest.mark.parametrize('key,value', [('gpu','different'), ('environment',['different']),
+                                       ('extension',{'different':True})])
+def test_reject_incompatible_supplement(tmp_path, key, value):
+    run, table = fixture(tmp_path)
+    extra = tmp_path/'supplement'
+    shutil.copytree(run, extra)
+    config = json.loads((extra/'config.json').read_text())
+    config[key] = value
+    dump(extra/'config.json', config)
+    with pytest.raises(ValueError, match='runtime mismatch'):
+        export(run, table, tmp_path/'profile.json', minimum_cycles=2, supplements=[extra])
+
+
+def test_reject_changed_workload_or_hook(tmp_path):
+    run, table = fixture(tmp_path)
+    extra = tmp_path/'supplement'
+    shutil.copytree(run, extra)
+    dump(extra/'workload.json', {'changed': True})
+    with pytest.raises(ValueError, match='workload mismatch'):
+        export(run, table, tmp_path/'profile.json', minimum_cycles=2, supplements=[extra])
+    shutil.copy2(run/'workload.json', extra/'workload.json')
+    dump(extra/'fixed4/cycle_profile/hook_123.json', {'changed': True})
+    with pytest.raises(ValueError, match='hook identity'):
+        export(run, table, tmp_path/'profile.json', minimum_cycles=2, supplements=[extra])
