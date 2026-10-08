@@ -234,8 +234,10 @@ def main():
             sizes = [n for n in [1, 2, 4, 8, 16, 32, 64, 128] if n <= max(args.concurrencies)]
             command += ["--cuda-graph-bs", *map(str, sizes)]
         save(case_dir / "launch.json", command)
+        # Server logging must not put network-PVC writes on the timed hot path.
+        local_server_log = args.scratch / f'{case}_server.log'
         try:
-            with (case_dir / "server.log").open("x") as log:
+            with local_server_log.open("x") as log:
                 process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
                 started = time.monotonic()
                 while True:
@@ -251,6 +253,7 @@ def main():
                         raise TimeoutError("Server startup exceeded 900s")
                     time.sleep(2)
                 save(case_dir / "server_info.json", requests.get(base + "/get_server_info", timeout=30).json())
+                shutil.copy2(local_server_log, case_dir/'server.log')
                 case_concurrencies = [int(case[7:])] if case.startswith('history') else args.concurrencies
                 for concurrency in case_concurrencies:
                     print(f"WARMUP {case} C{concurrency}", flush=True)
@@ -268,6 +271,7 @@ def main():
                             result['measurement_kind'] = 'instrumented_worker_cycle_cost; not clean throughput'
                         result.update(case=case, repeat=repeat, workload_sha256=sha(args.output / "workload.json"))
                         save(case_dir / f"c{concurrency}_r{repeat}.json", result)
+                        shutil.copy2(local_server_log, case_dir/'server.log')
                         if args.cycle_cost_profile:
                             backup_cycle_profile(profile_dir, case_dir / 'cycle_profile')
                         brief = {k:v for k,v in result.items() if k != "results"}
@@ -289,6 +293,8 @@ def main():
                 except ProcessLookupError:
                     pass
                 process = None
+            if local_server_log.exists():
+                shutil.copy2(local_server_log, case_dir/'server.log')
             if args.cycle_cost_profile:
                 backup_cycle_profile(profile_dir, case_dir / 'cycle_profile')
     save(args.output / "COMPLETE.json", summaries)

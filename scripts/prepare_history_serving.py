@@ -27,6 +27,7 @@ def prepare(destination):
         if os.getenv("SGLANG_DFLASH_HISTORY_FROZEN"):
             from sglang.srt.speculative.dflash_history_policy import DFlashHistoryPolicy, load_artifacts
             if (server_args.tp_size != 1 or server_args.attention_backend != "flashinfer"
+                or not server_args.disable_radix_cache
                 or server_args.speculative_dflash_dynamic_block_size
                 or server_args.speculative_dflash_predraft_entropy_policy_path
                 or server_args.speculative_dflash_postdraft_policy_path

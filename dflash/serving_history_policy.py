@@ -6,6 +6,7 @@ correction/bonus distribution). No rejected-prefix distribution enters history.
 """
 import hashlib
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -27,7 +28,10 @@ def load_artifacts(table_path, profile_path, frozen_path):
     c = frozen['concurrency']
     costs = {int(b): t for b, t in profile['costs_ms'][str(c)].items()}
     policy = frozen['policies']['history']
-    if policy['history_free'] or set(costs) != set(table.blocks):
+    if (policy['history_free'] or set(costs) != set(table.blocks)
+            or table.blocks != (4, 8, 12, 16)
+            or not math.isfinite(policy['rho']) or policy['rho'] < 0
+            or any(not math.isfinite(t) or t <= 0 for t in costs.values())):
         raise ValueError('Expected frozen history-aware policy with all arms')
     return table, costs, policy['rho'], c
 
